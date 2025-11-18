@@ -50,6 +50,19 @@ Our training pipeline leverages **PyTorch** and optimized **CUDA extensions** to
 - **CUDA SDK 11** (or compatible version)
 - **⚠️ Important**: Ensure C++ Compiler and CUDA SDK versions are compatible
 
+### ⚠️ CUDA Version Reference
+
+Our testing environment uses the following CUDA configuration:
+
+| Component                             | Version          |
+|---------------------------------------|------------------|
+| Conda environment CUDA version        | 11.6             |
+| Ubuntu system `nvidia-smi` CUDA       | 12.2             |
+| `nvcc -V` compiler version            | 11.8 (v11.8.89)  |
+
+> **Note**: The Conda CUDA and system CUDA versions may differ. The compiler version (`nvcc`) is what matters for PyTorch extensions compilation (diff-gaussian-rasterization_fastgs).
+
+
 ## 🚀 Quick Start
 
 ### 📥 Clone the Repository
