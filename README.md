@@ -67,6 +67,7 @@ conda activate fast-d3dgs
 
 ### 🗂️ Data Preparation
 In this section, we follow the data processing pipeline of [4DGaussians](https://github.com/hustvl/4DGaussians).
+Our preprocessed data can be obtained from [preprocessed data](https://drive.google.com/file/d/1DmnuXFZIVC5Cn-oZ6Bvo8nU7X23YwoDW/view)
 
 First, download the [Neur3D Dataset](https://github.com/facebookresearch/Neural_3D_Video/releases/tag/v1.0) from the official website.
 ```
