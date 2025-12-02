@@ -34,7 +34,7 @@ except ImportError:
 from utils.fast_utils import compute_gaussian_score_fastgs, sampling_cameras
 
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, websockets):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, websockets, densify_as_fastgs, prune_as_fastgs):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
@@ -139,13 +139,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                     # The multiview consistent densification of fastgs
                     importance_score, pruning_score = compute_gaussian_score_fastgs(camlist, gaussians, pipe, bg, opt, DENSIFY=True)                    
-                    gaussians.densify_and_prune_fastgs(max_screen_size = size_threshold, 
+                    gaussians.densify_and_prune_ablation(max_screen_size = size_threshold, 
                                                 min_opacity = 0.005, 
                                                 extent = scene.cameras_extent, 
                                                 radii=radii,
                                                 args = opt,
                                                 importance_score = importance_score,
-                                                pruning_score = pruning_score)
+                                                pruning_score = pruning_score,
+                                                densify_fastgs=densify_as_fastgs,
+                                                prune_fastgs=prune_as_fastgs)
 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
@@ -261,6 +263,8 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--websockets", action='store_true', default=False)
     parser.add_argument("--benchmark_dir", type=str, default=None)
+    parser.add_argument("--densify_as_fastgs", type=bool, default=True)
+    parser.add_argument("--prune_as_fastgs", type=bool, default=True)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -282,7 +286,9 @@ if __name__ == "__main__":
         args.checkpoint_iterations, 
         args.start_checkpoint, 
         args.debug_from, 
-        args.websockets
+        args.websockets,
+        args.densify_as_fastgs,
+        args.prune_as_fastgs
     )
 
     # All done
