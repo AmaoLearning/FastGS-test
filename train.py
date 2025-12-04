@@ -59,6 +59,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     total_time = 0.0
 
     ema_loss_for_log = 0.0
+    ema_dist_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     bg = torch.rand((3), device="cuda") if opt.random_background else background
