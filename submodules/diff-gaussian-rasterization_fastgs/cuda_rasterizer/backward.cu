@@ -432,7 +432,7 @@ PerGaussianRenderCUDA(
 	float4* __restrict__ dL_dconic2D,
 	float* __restrict__ dL_dopacity,
 	float* __restrict__ dL_dcolors,
-	float* __restrict__ dL_dviewZ,
+	float* __restrict__ dL_dviewZ
 ) {
 	// global_bucket_idx = warp_idx
 	auto block = cg::this_thread_block();
@@ -897,6 +897,7 @@ void BACKWARD::preprocess(
 	const float tan_fovx, float tan_fovy,
 	const glm::vec3* campos,
 	const float4* dL_dmean2D,
+	const float* dL_dviewZ,
 	const float* dL_dconic,
 	glm::vec3* dL_dmean3D,
 	float* dL_dcolor,
@@ -937,10 +938,11 @@ void BACKWARD::preprocess(
 		(glm::vec3*)scales,
 		(glm::vec4*)rotations,
 		scale_modifier,
-		viewmatrix,
 		projmatrix,
+		viewmatrix,
 		campos,
 		(float4*)dL_dmean2D,
+		dL_dviewZ,
 		(glm::vec3*)dL_dmean3D,
 		dL_dcolor,
 		dL_dcov3D,
