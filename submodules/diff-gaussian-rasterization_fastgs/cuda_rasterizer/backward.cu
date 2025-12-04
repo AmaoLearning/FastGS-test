@@ -875,7 +875,7 @@ renderCUDA(
 			atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
 
 			// Update gradients w.r.t. Coord Z Gradient Buffer
-			atomicAdd(&(dL_dviewZ[global_id]), dL_dZ);
+			atomicAdd(&(dL_dviewZ[global_id]), dL_dz);
 		}
 	}
 }
