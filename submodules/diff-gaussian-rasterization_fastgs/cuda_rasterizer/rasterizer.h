@@ -53,6 +53,7 @@ namespace CudaRasterizer
 			const float tan_fovx, float tan_fovy,
 			const bool prefiltered,
 			float* out_color,
+			float* out_dist,
 			int* radii = nullptr,
 			bool debug = false,
 			bool get_flag = false,
@@ -80,6 +81,7 @@ namespace CudaRasterizer
 			char* image_buffer,
 			char* sample_buffer,
 			const float* dL_dpix,
+			const float* dL_ddist,
 			float* dL_dmean2D,
 			float* dL_dconic,
 			float* dL_dopacity,
@@ -90,6 +92,7 @@ namespace CudaRasterizer
 			float* dL_dsh,
 			float* dL_dscale,
 			float* dL_drot,
+			float* dL_dviewZ,
 			bool debug);
 	};
 };

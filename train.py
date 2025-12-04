@@ -104,6 +104,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         Ll1 = l1_loss(image, gt_image)
         ssim_value = fast_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+
+        lambda_dist = opt.lambda_dist if iteration > opt.distortion_from_iter else 0.0
+        render_dist = render_pkg["render_dist"]
+        dist_loss = lambda_dist * (render_dist).mean()
+
+        loss = loss + dist_loss
+
         loss.backward()
 
         iter_end.record()
@@ -111,8 +118,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         with torch.no_grad():
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+            ema_dist_for_log = 0.4 * dist_loss.item() + 0.6 * ema_dist_for_log
+
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{5}f}",
+                                          "distort": f"{ema_dist_for_log:.{5}f}",
+                                          "Points": f"{len(gaussians.get_xyz)}"})
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()

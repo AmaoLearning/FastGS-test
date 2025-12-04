@@ -100,17 +100,17 @@ class _RasterizeGaussians(torch.autograd.Function):
                 print("\nAn error occured in forward. Please forward snapshot_fw.dump for debugging.")
                 raise ex
         else:
-            num_rendered, num_buckets, color, radii, geomBuffer, binningBuffer, imgBuffer, sampleBuffer, accum_metric_counts = _C.rasterize_gaussians(*args)
+            num_rendered, num_buckets, color, depth, radii, geomBuffer, binningBuffer, imgBuffer, sampleBuffer, accum_metric_counts = _C.rasterize_gaussians(*args)
 
         # Keep relevant tensors for backward
         ctx.raster_settings = raster_settings
         ctx.num_rendered = num_rendered
         ctx.num_buckets = num_buckets
         ctx.save_for_backward(colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, dc, sh, geomBuffer, binningBuffer, imgBuffer, sampleBuffer)
-        return color, radii, accum_metric_counts
+        return color, depth, radii, accum_metric_counts
 
     @staticmethod
-    def backward(ctx, grad_out_color, _, g_metric):
+    def backward(ctx, grad_out_color, grad_out_dist, _, g_metric):
 
         # Restore necessary values from context
         num_rendered = ctx.num_rendered
@@ -131,7 +131,8 @@ class _RasterizeGaussians(torch.autograd.Function):
                 raster_settings.projmatrix, 
                 raster_settings.tanfovx, 
                 raster_settings.tanfovy, 
-                grad_out_color, 
+                grad_out_color,
+                grad_out_dist,
                 dc,
                 sh, 
                 raster_settings.sh_degree, 

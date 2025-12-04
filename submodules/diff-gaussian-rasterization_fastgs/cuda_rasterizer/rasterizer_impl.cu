@@ -385,6 +385,7 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 	const float tan_fovx, float tan_fovy,
 	const bool prefiltered,
 	float* out_color,
+	float* out_dist,
 	int* radii,
 	bool debug,
 	bool get_flag,
@@ -526,12 +527,14 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 		geomState.means2D,
 		feature_ptr,
 		geomState.conic_opacity,
+		geomState.depths,
 		imgState.accum_alpha,
 		imgState.n_contrib,
 		imgState.max_contrib,
 		imgState.pixel_colors,
 		background,
 		out_color,
+		out_dist,
 		imgState.contrib_scan,
 		imgState.scan_size,
 		radii,
@@ -566,6 +569,7 @@ void CudaRasterizer::Rasterizer::backward(
 	char* img_buffer,
 	char* sample_buffer,
 	const float* dL_dpix,
+	const float* dL_ddist,
 	float* dL_dmean2D,
 	float* dL_dconic,
 	float* dL_dopacity,
@@ -576,6 +580,7 @@ void CudaRasterizer::Rasterizer::backward(
 	float* dL_dsh,
 	float* dL_dscale,
 	float* dL_drot,
+	float* dL_dviewZ,
 	bool debug)
 {
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
@@ -611,16 +616,19 @@ void CudaRasterizer::Rasterizer::backward(
 		background,
 		geomState.means2D,
 		geomState.conic_opacity,
+		geomState.depths,
 		color_ptr,
 		imgState.accum_alpha,
 		imgState.n_contrib,
 		imgState.max_contrib,
 		imgState.pixel_colors,
 		dL_dpix,
+		dL_ddist,
 		(float4*)dL_dmean2D,
 		(float4*)dL_dconic,
 		dL_dopacity,
-		dL_dcolor), debug)
+		dL_dcolor,
+		dL_dviewZ), debug)
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,
@@ -642,6 +650,7 @@ void CudaRasterizer::Rasterizer::backward(
 		tan_fovx, tan_fovy,
 		(glm::vec3*)campos,
 		(float4*)dL_dmean2D,
+		dL_dviewZ,
 		dL_dconic,
 		(glm::vec3*)dL_dmean3D,
 		dL_dcolor,

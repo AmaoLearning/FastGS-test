@@ -99,6 +99,10 @@ class OptimizationParams(ParamGroup):
         self.densify_prune_ratio = 0.45
         self.after_densify_prune_ratio = 0.01
         
+        # distortion loss (2DGS)
+        self.lambda_dist = 0.0
+        self.distortion_from_iter = 3000
+        
         # fastgs parameters
         self.loss_thresh = 0.1
         self.grad_abs_thresh = 0.0012  

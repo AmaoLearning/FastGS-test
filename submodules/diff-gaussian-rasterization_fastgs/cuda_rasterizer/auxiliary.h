@@ -19,6 +19,15 @@
 #define BLOCK_SIZE (BLOCK_X * BLOCK_Y)
 #define NUM_WARPS (BLOCK_SIZE/32)
 
+// For distortion loss (2DGS)
+#define RENDER_AXUTILITY 1
+#define DETACH_WEIGHT 0
+
+__device__ const float near_n = 0.2;
+__device__ const float far_n = 100.0;
+__device__ const float FilterSize = 0.707106; // sqrt(2) / 2
+__device__ const float FilterInvSquare = 2.0f;
+
 // Spherical harmonics coefficients
 __device__ const float SH_C0 = 0.28209479177387814f;
 __device__ const float SH_C1 = 0.4886025119029199f;

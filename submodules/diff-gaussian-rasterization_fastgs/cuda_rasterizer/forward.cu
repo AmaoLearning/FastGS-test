@@ -280,12 +280,14 @@ renderCUDA(
 	const float2* __restrict__ points_xy_image,
 	const float* __restrict__ features,
 	const float4* __restrict__ conic_opacity,
+	const float* depths,
 	float* __restrict__ final_T,
 	uint32_t* __restrict__ n_contrib,
 	uint32_t* __restrict__ max_contrib,
 	float* __restrict__ pixel_colors,
 	const float* __restrict__ bg_color,
 	float* __restrict__ out_color,
+	float* __restrict__ out_dist,
 	int* __restrict__ radii,
 	const int* __restrict__ metric_map,
 	bool get_flag,
@@ -327,12 +329,19 @@ renderCUDA(
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 	// __shared__ float collected_radius2[BLOCK_SIZE];
+	__shared__ float collected_depth[BLOCK_SIZE];
 
 	// Initialize helper variables
 	float T = 1.0f;
 	uint32_t contributor = 0;
 	uint32_t last_contributor = 0;
 	float C[CHANNELS] = { 0 };
+
+#if RENDER_AXUTILITY
+	float distortion = {0};
+	float M1 = {0};
+	float M2 = {0};
+#endif
 
 	int contribs = 0;
 	// Iterate over batches until all done or range is complete
@@ -352,6 +361,7 @@ renderCUDA(
 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
 			// collected_radius2[block.thread_rank()] = radii[coll_id] * radii[coll_id];
+			collected_depth[block.thread_rank()] = depths[coll_id];
 		}
 		block.sync();
         
@@ -378,6 +388,9 @@ renderCUDA(
 			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
 			if (power > 0.0f)
 				continue;
+			
+			float depth = collected_depth[j];
+			if (depth < near_n) continue;
 
 			// Eq. (2) from 3D Gaussian splatting paper.
 			// Obtain alpha by multiplying with Gaussian opacity
@@ -392,6 +405,15 @@ renderCUDA(
 				done = true;
 				continue;
 			}
+			
+			float w = alpha * T;
+#if RENDER_AXUTILITY
+			float A = 1-T;
+			float m = far_n / (far_n - near_n) * (1 - near_n / depth);
+			distortion += (m * m * A + M2 - 2 * m * M1) * w;
+			M1 += m * w;
+			M2 += m * m * w;
+#endif
 
 			// Eq. (3) from 3D Gaussian splatting paper.
 			for (int ch = 0; ch < CHANNELS; ch++)
@@ -419,6 +441,13 @@ renderCUDA(
 	if (inside)
 	{
 		final_T[pix_id] = T;
+
+#if RENDER_AXUTILITY
+		final_T[pix_id + H * W] = M1;
+		final_T[pix_id + 2 * H * W] = M2;
+		out_dist[pix_id] = distortion;
+#endif
+
 		n_contrib[pix_id] = last_contributor;
 		for (int ch = 0; ch < CHANNELS; ch++)
 		{
@@ -447,12 +476,14 @@ void FORWARD::render(
 	const float2* means2D,
 	const float* colors,
 	const float4* conic_opacity,
+	const float* depths,
 	float* final_T,
 	uint32_t* n_contrib,
 	uint32_t* max_contrib,
 	float* pixel_colors,
 	const float* bg_color,
 	float* out_color,
+	float* out_dist,
 	char* img_contrib_scan,
 	size_t scan_size,
 	int* radii,
@@ -469,12 +500,14 @@ void FORWARD::render(
 		means2D,
 		colors,
 		conic_opacity,
+		depths,
 		final_T,
 		n_contrib,
 		max_contrib,
 		pixel_colors,
 		bg_color,
 		out_color,
+		out_dist,
 		radii,
 		metric_map,
 		get_flag,
