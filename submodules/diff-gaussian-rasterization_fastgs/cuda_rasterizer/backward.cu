@@ -570,8 +570,8 @@ PerGaussianRenderCUDA(
 #if RENDER_AXUTILITY
 			dL_dreg = dL_ddepths[pix_id];
 			// Assuming final_Ts stores [T, M1, M2]
-			final_D = inside ? final_Ts[pix_id + H * W] : 0;
-			final_D2 = inside ? final_Ts[pix_id + 2 * H * W] : 0;
+			final_D = final_Ts[pix_id + H * W]; 
+			final_D2 = final_Ts[pix_id + 2 * H * W];
 #endif
 		}
 
