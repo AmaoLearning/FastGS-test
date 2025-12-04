@@ -297,7 +297,11 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
 CudaRasterizer::ImageState CudaRasterizer::ImageState::fromChunk(char*& chunk, size_t N)
 {
 	ImageState img;
+#if RENDER_AXUTILITY
+	obtain(chunk, img.accum_alpha, 3 * N, 128);
+#else
 	obtain(chunk, img.accum_alpha, N, 128);
+#endif
 	obtain(chunk, img.n_contrib, N, 128);
 	obtain(chunk, img.ranges, N, 128);
 	int* dummy;
