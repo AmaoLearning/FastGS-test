@@ -93,7 +93,7 @@ class OptimizationParams(ParamGroup):
         self.prune_until_iter = 25000
         self.min_weight = 0.7
 
-        self.prune_from_iter = 6000
+        self.prune_from_iter = 15_000
         self.prune_until_iter = 30_000
         self.prune_interval = 3000
         self.densify_prune_ratio = 0.45

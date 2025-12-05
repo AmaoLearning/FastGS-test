@@ -168,16 +168,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
-            # The multiview consistent pruning of fastgs. We do it every 3k iterations after 15k
-            # In this stage, the model converge basically. So we can prune more aggressively without degrading rendering quality.
-            # You can check the rendering results of 20K iterations in arxiv version (https://arxiv.org/abs/2511.04283), the rendering quality is already very good.
-            if iteration % 3000 == 0 and iteration > 15_000 and iteration < 30_000:
-                my_viewpoint_stack = scene.getTrainCameras().copy()
-                camlist = sampling_cameras(my_viewpoint_stack)
+            if prune_as_fastgs: # for ablation study
+                # The multiview consistent pruning of fastgs. We do it every 3k iterations after 15k
+                # In this stage, the model converge basically. So we can prune more aggressively without degrading rendering quality.
+                # You can check the rendering results of 20K iterations in arxiv version (https://arxiv.org/abs/2511.04283), the rendering quality is already very good.
+                if iteration % opt.prune_interval == 0 and iteration > opt.prune_from_iter and iteration < opt.prune_until_iter:
+                    my_viewpoint_stack = scene.getTrainCameras().copy()
+                    camlist = sampling_cameras(my_viewpoint_stack)
 
-                _, pruning_score = compute_gaussian_score_fastgs(camlist, gaussians, pipe, bg, opt)                    
-                gaussians.final_prune_fastgs(min_opacity = 0.1, pruning_score = pruning_score)
-        
+                    _, pruning_score = compute_gaussian_score_fastgs(camlist, gaussians, pipe, bg, opt)                    
+                    gaussians.final_prune_fastgs(min_opacity = 0.1, pruning_score = pruning_score)
+            
             # Optimization step
             if iteration < opt.iterations:
                 if opt.optimizer_type == "default":
