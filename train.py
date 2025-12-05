@@ -33,6 +33,8 @@ except ImportError:
 
 from utils.fast_utils import compute_gaussian_score_fastgs, sampling_cameras
 
+from distutils.util import strtobool
+
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, websockets, densify_as_fastgs, prune_as_fastgs):
     first_iter = 0
@@ -277,8 +279,8 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--websockets", action='store_true', default=False)
     parser.add_argument("--benchmark_dir", type=str, default=None)
-    parser.add_argument("--densify_as_fastgs", type=bool, default=True)
-    parser.add_argument("--prune_as_fastgs", type=bool, default=True)
+    parser.add_argument("--densify_as_fastgs", type=lambda x: bool(strtobool(x)), default=True)
+    parser.add_argument("--prune_as_fastgs", type=lambda x: bool(strtobool(x)), default=True)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
