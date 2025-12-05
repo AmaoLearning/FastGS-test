@@ -106,11 +106,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         ssim_value = fast_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
-        lambda_dist = opt.lambda_dist if iteration > opt.distortion_from_iter else 0.0
-        render_dist = render_pkg["render_dist"]
-        dist_loss = lambda_dist * (render_dist).mean()
+        dist_loss = torch.tensor(0.0, device="cuda")
+        if opt.use_distortion_loss:
+            lambda_dist = opt.lambda_dist if iteration > opt.distortion_from_iter else 0.0
+            render_dist = render_pkg["render_dist"]
+            dist_loss = lambda_dist * (render_dist).mean()
 
-        loss = loss + dist_loss
+            loss = loss + dist_loss
 
         loss.backward()
 

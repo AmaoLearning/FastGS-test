@@ -100,6 +100,7 @@ class OptimizationParams(ParamGroup):
         self.after_densify_prune_ratio = 0.01
         
         # distortion loss (2DGS)
+        self.use_distortion_loss = False
         self.lambda_dist = 0.0
         self.distortion_from_iter = 3000
         
