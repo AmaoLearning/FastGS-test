@@ -564,7 +564,8 @@ class GaussianModel:
         metric_mask = importance_score > 5
 
         if densify_fastgs:
-            self.densify_and_clone_fastgs(metric_mask, all_clones)
+            self.densify_and_clone_modified(grad_vars, metric_mask, all_clones)
+            # self.densify_and_clone_fastgs(metric_mask, all_clones)
             self.densify_and_split_fastgs(metric_mask, all_splits)
         else:
             max_grad = args.densify_grad_threshold
@@ -643,6 +644,22 @@ class GaussianModel:
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
 
+        new_tmp_radii = self.tmp_radii[selected_pts_mask]
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
+    
+    def densify_and_clone_modified(self, grads, metric_mask, filter):
+        selected_pts_mask = torch.logical_and(metric_mask, filter)
+        
+        new_xyz = self._xyz[selected_pts_mask] + grads[selected_pts_mask] * 100
+        new_features_dc = self._features_dc[selected_pts_mask]
+        new_features_rest = self._features_rest[selected_pts_mask]
+        
+        new_opacities = self._opacity[selected_pts_mask] * 0.6
+        self._opacity = self._opacity[selected_pts_mask] * 0.6
+
+        new_scaling = self._scaling[selected_pts_mask]
+        new_rotation = self._rotation[selected_pts_mask]
         new_tmp_radii = self.tmp_radii[selected_pts_mask]
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
