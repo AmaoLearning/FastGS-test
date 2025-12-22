@@ -27,7 +27,7 @@ def kl_divergence(rho, rho_hat):
 
 
 def l2_loss(network_output, gt):
-    return ((network_output - gt) ** 2).mean()
+    return F.mse_loss(network_output, gt)
 
 
 def gaussian(window_size, sigma):

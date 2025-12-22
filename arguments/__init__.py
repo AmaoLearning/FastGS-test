@@ -60,6 +60,9 @@ class ModelParams(ParamGroup):
         self.load2gpu_on_the_fly = False
         self.is_blender = False
         self.is_6dof = False
+
+        # velocity
+        self.use_velocity = False
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -105,6 +108,11 @@ class OptimizationParams(ParamGroup):
         self.grad_thresh = 0.0002
         self.dense = 0.001
         self.mult = 0.5
+
+        # velocity
+        self.velocity_lr = 0.2
+        self.velocity_lr_max_steps = 40_000
+        self.lambda_velocity = 0.01
         super().__init__(parser, "Optimization Parameters")
 
 
