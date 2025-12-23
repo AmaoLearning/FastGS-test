@@ -116,7 +116,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
             ast_noise = 0 if dataset.is_blender else torch.randn(1, 1, device='cuda').expand(N, -1) * time_interval * smooth_term(iteration)
             d_xyz, d_rotation, d_scaling = deform.step(gaussians.get_xyz.detach(), time_input + ast_noise)
             
-            if dataset.use_velocity:
+            if dataset.use_velocity and iteration % opt.velocity_interval:
                 _d_xyz, _, _ = deform.step(gaussians.get_xyz.detach(), time_input + ast_noise + time_interval)
                 current_v = velocity.forward(gaussians.get_xyz.detach(), time_input + ast_noise)
                 velocity_loss = l2_loss(_d_xyz - d_xyz, current_v * time_interval)
@@ -138,7 +138,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss
         
         # 只有在 use_velocity 开启且不在 warm_up 期间时才加入 velocity_loss
-        if dataset.use_velocity and iteration >= opt.warm_up:
+        if dataset.use_velocity and iteration >= opt.warm_up and iteration % opt.velocity_interval:
             loss = loss + opt.lambda_velocity * velocity_loss
         
         loss.backward()

@@ -112,7 +112,8 @@ class OptimizationParams(ParamGroup):
         # velocity
         self.velocity_lr = 0.2
         self.velocity_lr_max_steps = 40_000
-        self.lambda_velocity = 0.01
+        self.lambda_velocity = 100
+        self.velocity_interval = 10
         super().__init__(parser, "Optimization Parameters")
 
 
