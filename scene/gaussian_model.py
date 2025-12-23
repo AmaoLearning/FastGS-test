@@ -43,6 +43,8 @@ class GaussianModel:
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.xyz_gradient_accum_abs = torch.empty(0)
+        self.velocity_loss_accum = torch.empty(0)
+        self.velocity_denom = torch.empty(0)
 
         self.optimizer = None
         self.shoptimizer = None
@@ -124,6 +126,8 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.xyz_gradient_accum_abs = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.velocity_loss_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.velocity_denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
         self.spatial_lr_scale = 5
 
@@ -305,6 +309,8 @@ class GaussianModel:
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
         self.xyz_gradient_accum_abs = self.xyz_gradient_accum_abs[valid_points_mask]
+        self.velocity_loss_accum = self.velocity_loss_accum[valid_points_mask]
+        self.velocity_denom = self.velocity_denom[valid_points_mask]
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
@@ -353,6 +359,8 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.xyz_gradient_accum_abs = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")  # abs
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.velocity_loss_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.velocity_denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
@@ -450,7 +458,7 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
 
-    def densify_and_prune_fastgs(self, max_screen_size, min_opacity, extent, radii, args, importance_score = None, pruning_score = None):
+    def densify_and_prune_fastgs(self, max_screen_size, min_opacity, extent, radii, args, importance_score = None, pruning_score = None, velocity_mask = None):
         
         ''' 
             Densification and Pruning based on FastGS criteria:
@@ -458,6 +466,7 @@ class GaussianModel:
             2.  Then, based on their average metric score (computed over multiple sampled views), they are either densified (cloned) or split.
                 This is our main contribution compared to the vanilla 3DGS.
             3.  Finally, gaussians with low opacity or very large size are pruned.
+            4.  (New) If velocity_mask is provided, only gaussians with accurate velocity prediction are densified.
         '''
         grad_vars = self.xyz_gradient_accum / self.denom
         grad_vars[grad_vars.isnan()] = 0.0
@@ -474,9 +483,23 @@ class GaussianModel:
         all_clones = torch.logical_and(clone_qualifiers, grad_qualifiers)
         all_splits = torch.logical_and(split_qualifiers, grad_qualifiers_abs)
 
+        print(f"Original all_clones: {all_clones.sum().item()}, all_splits: {all_splits.sum().item()}")
+        
+        # 如果提供了 velocity_mask，则与原有掩码做与运算
+        # velocity_mask 为 True 表示该高斯的运动预测准确，可以参与 densification
+        if velocity_mask is not None:
+            all_clones = torch.logical_and(all_clones, velocity_mask)
+            all_splits = torch.logical_and(all_splits, velocity_mask)
+
+            print(f"With velocity_mask: {velocity_mask.sum().item()}, all_clones: {all_clones.sum().item()}, all_splits: {all_splits.sum().item()}")
+
         # This is our multi-view consisent metric for densification
         # We use this metric to further filter the candidates for densification, which is similar to taming 3dgs.
         metric_mask = importance_score > 5
+
+        _all_clones = torch.logical_and(metric_mask, all_clones)
+        _all_splits = torch.logical_and(metric_mask, all_splits)
+        print(f"With metric_mask: {metric_mask.sum().item()}, all_clones: {_all_clones.sum().item()}, all_splits: {_all_splits.sum().item()}")
 
         self.densify_and_clone_fastgs(metric_mask, all_clones)
         self.densify_and_split_fastgs(metric_mask, all_splits)
@@ -524,3 +547,42 @@ class GaussianModel:
                                                              keepdim=True)
         self.xyz_gradient_accum_abs[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter, 2:], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+
+    def add_velocity_loss_stats(self, per_gaussian_velocity_loss, update_filter):
+        """累积每个高斯的 velocity loss
+        Args:
+            per_gaussian_velocity_loss: shape [N, 1], 每个高斯点的 velocity loss
+            update_filter: 可见性掩码
+        """
+        self.velocity_loss_accum[update_filter] += per_gaussian_velocity_loss[update_filter]
+        self.velocity_denom[update_filter] += 1
+
+    def get_velocity_loss_mask(self, threshold):
+        """基于累积的平均 velocity loss 生成掩码
+        Args:
+            threshold: velocity loss 阈值，高于此值的高斯将被标记
+        Returns:
+            mask: bool tensor, True 表示该高斯的平均 velocity loss 低于阈值（运动预测准确）
+        """
+        avg_velocity_loss = self.velocity_loss_accum / (self.velocity_denom + 1e-7)
+        avg_velocity_loss[avg_velocity_loss.isnan()] = 0.0
+        avg_velocity_loss = avg_velocity_loss.squeeze()
+        
+        # 打印分布统计信息，方便设置阈值
+        valid_mask = self.velocity_denom.squeeze() > 0
+        if valid_mask.sum() > 0:
+            valid_losses = avg_velocity_loss[valid_mask]
+            print(f"\n[Velocity Loss Distribution]")
+            print(f"  Total Gaussians: {avg_velocity_loss.shape[0]}, Valid (with stats): {valid_mask.sum().item()}")
+            print(f"  Min: {valid_losses.min().item():.6f}, Max: {valid_losses.max().item():.6f}")
+            print(f"  Mean: {valid_losses.mean().item():.6f}, Std: {valid_losses.std().item():.6f}")
+            # 打印百分位数
+            percentiles = [25, 50, 75, 90, 95, 99]
+            for p in percentiles:
+                val = torch.quantile(valid_losses, p / 100.0).item()
+                print(f"  {p}th percentile: {val:.6f}")
+            print(f"  Current threshold: {threshold}")
+            below_thresh = (valid_losses < threshold).sum().item()
+            print(f"  Gaussians below threshold: {below_thresh} ({100*below_thresh/valid_losses.shape[0]:.2f}%)\n")
+        
+        return (avg_velocity_loss < threshold)

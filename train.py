@@ -107,6 +107,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
         fid = viewpoint_cam.fid
 
         velocity_loss = None  # 仅在需要时计算
+        per_gaussian_velocity_loss = None  # 每个高斯的 velocity loss
         if iteration < opt.warm_up:
             d_xyz, d_rotation, d_scaling = 0.0, 0.0, 0.0
         else:
@@ -116,10 +117,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
             ast_noise = 0 if dataset.is_blender else torch.randn(1, 1, device='cuda').expand(N, -1) * time_interval * smooth_term(iteration)
             d_xyz, d_rotation, d_scaling = deform.step(gaussians.get_xyz.detach(), time_input + ast_noise)
             
-            if dataset.use_velocity and iteration % opt.velocity_interval:
+            if dataset.use_velocity and iteration % opt.velocity_interval == 0:
                 _d_xyz, _, _ = deform.step(gaussians.get_xyz.detach(), time_input + ast_noise + time_interval)
                 current_v = velocity.forward(gaussians.get_xyz.detach(), time_input + ast_noise)
-                velocity_loss = l2_loss(_d_xyz - d_xyz, current_v * time_interval)
+                
+                # 计算每个高斯的 velocity loss (用于累积统计)
+                velocity_diff = _d_xyz - d_xyz
+                velocity_pred = current_v * time_interval
+                per_gaussian_velocity_loss = ((velocity_diff - velocity_pred) ** 2).mean(dim=-1, keepdim=True)
+                
+                # 总体 velocity loss (用于反向传播)
+                velocity_loss = per_gaussian_velocity_loss.mean()
 
                 if iteration % 1000 == 0:
                     print(f"[Iter {iteration}] velocity loss = {velocity_loss.item():.6f}")
@@ -138,7 +146,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss
         
         # 只有在 use_velocity 开启且不在 warm_up 期间时才加入 velocity_loss
-        if dataset.use_velocity and iteration >= opt.warm_up and iteration % opt.velocity_interval:
+        if dataset.use_velocity and iteration >= opt.warm_up and velocity_loss is not None:
             loss = loss + opt.lambda_velocity * velocity_loss
         
         loss.backward()
@@ -149,6 +157,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
             viewpoint_cam.load2device('cpu')
 
         with torch.no_grad():
+            # 累积 velocity loss 统计 (用于 densification 掩码)
+            if dataset.use_velocity and per_gaussian_velocity_loss is not None:
+                gaussians.add_velocity_loss_stats(per_gaussian_velocity_loss.detach(), visibility_filter)
+            
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
@@ -187,14 +199,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
                     camlist = sampling_cameras(my_viewpoint_stack)
 
                     # The multiview consistent densification of fastgs
-                    importance_score, pruning_score = compute_gaussian_score_fastgs(camlist, gaussians, pipe, background, opt, d_xyz, d_rotation, d_scaling, dataset.is_6dof, DENSIFY=True)                    
+                    importance_score, pruning_score = compute_gaussian_score_fastgs(camlist, gaussians, pipe, background, opt, d_xyz, d_rotation, d_scaling, dataset.is_6dof, DENSIFY=True)
+                    
+                    # 生成 velocity_loss 掩码并传入 densification
+                    velocity_mask = None
+                    if dataset.use_velocity:
+                        velocity_mask = gaussians.get_velocity_loss_mask(opt.velocity_loss_thresh)
+                    
                     gaussians.densify_and_prune_fastgs(max_screen_size = size_threshold, 
                                                 min_opacity = 0.005, 
                                                 extent = scene.cameras_extent, 
                                                 radii=radii,
                                                 args = opt,
                                                 importance_score = importance_score,
-                                                pruning_score = pruning_score)
+                                                pruning_score = pruning_score,
+                                                velocity_mask = velocity_mask)
 
                 if iteration % opt.opacity_reset_interval == 0 or (
                         dataset.white_background and iteration == opt.densify_from_iter):
