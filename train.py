@@ -44,7 +44,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
 
     # velocity
     if dataset.use_velocity:
-        velocity = VelocityNetwork(is_blender=dataset.is_blender, is_6dof=dataset.is_6dof)
+        velocity = VelocityNetwork(is_blender=dataset.is_blender, is_6dof=dataset.is_6dof).cuda()
         velocity.train_setting(opt)
 
     scene = Scene(dataset, gaussians)
@@ -87,7 +87,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
 
         gaussians.update_learning_rate(iteration)
         deform.update_learning_rate(iteration)
-        velocity.update_learning_rate(iteration)
+        if dataset.use_velocity:
+            velocity.update_learning_rate(iteration)
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
@@ -105,9 +106,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
             viewpoint_cam.load2device()
         fid = viewpoint_cam.fid
 
+        velocity_loss = torch.tensor(0.0, device="cuda")
         if iteration < opt.warm_up:
             d_xyz, d_rotation, d_scaling = 0.0, 0.0, 0.0
-            velocity_loss = 0
         else:
             N = gaussians.get_xyz.shape[0]
             time_input = fid.unsqueeze(0).expand(N, -1)
@@ -116,15 +117,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
             d_xyz, d_rotation, d_scaling = deform.step(gaussians.get_xyz.detach(), time_input + ast_noise)
             
             if dataset.use_velocity:
-                total_frame = len(scene.getTrainCameras())
-                dt = 1 / total_frame
-                _d_xyz, _, _ = deform.step(gaussians.get_xyz.detach(), time_input + ast_noise + dt)
+                _d_xyz, _, _ = deform.step(gaussians.get_xyz.detach(), time_input + ast_noise + time_interval)
                 current_v = velocity.forward(gaussians.get_xyz().detach(), time_input + ast_noise)
-                velocity_loss = l2_loss(_d_xyz - d_xyz, current_v * dt)
+                velocity_loss = l2_loss(_d_xyz - d_xyz, current_v * time_interval)
 
                 if iteration % 1000 == 0:
-                    print(f"[Iter {iteration}] velocity loss = {velocity_loss.cpu().numpy()}")
-                    print(f"[Iter {iteration}] velocity mean = {current_v.mean(dim=0).cpu().numpy()} at time {time_input + ast_noise}")
+                    print(f"[Iter {iteration}] velocity loss = {velocity_loss.item():.6f}")
+                    print(f"[Iter {iteration}] velocity mean = {current_v.mean(dim=0).detach().cpu().numpy()} at time {(time_input + ast_noise)[0].item():.4f}")
 
         # Render
         render_pkg_re = render_fastgs(viewpoint_cam, gaussians, pipe, background, opt.mult, d_xyz, d_rotation, d_scaling, dataset.is_6dof)
@@ -207,6 +206,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
             if iteration < opt.iterations:
                 deform.optimizer.step()
                 deform.optimizer.zero_grad()
+                if dataset.use_velocity:
+                    velocity.optimizer.step()
+                    velocity.optimizer.zero_grad()
                 gaussians.optimizer_step(iteration)
 
             optim_end.record()

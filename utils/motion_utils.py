@@ -71,12 +71,12 @@ class VelocityNetwork(nn.Module):
             w = self.branch_w(h)
             v = self.branch_v(h)
             theta = torch.norm(w, dim=-1, keepdim=True)
-            w = w / theta + 1e-5
-            v = v / theta + 1e-5
+            w = w / (theta + 1e-5)
+            v = v / (theta + 1e-5)
             screw_axis = torch.cat([w, v], dim=-1)
             velocity = exp_se3(screw_axis, theta)
         else:
-            velocity = self.gaussian_warp(h)
+            velocity = self.velocity_head(h)
 
         return velocity
 
