@@ -483,7 +483,7 @@ class GaussianModel:
         all_clones = torch.logical_and(clone_qualifiers, grad_qualifiers)
         all_splits = torch.logical_and(split_qualifiers, grad_qualifiers_abs)
 
-        print(f"Original all_clones: {all_clones.sum().item()}, all_splits: {all_splits.sum().item()}")
+        print(f"\nOriginal all_clones: {all_clones.sum().item()}, all_splits: {all_splits.sum().item()}")
         
         # 如果提供了 velocity_mask，则与原有掩码做与运算
         # velocity_mask 为 True 表示该高斯的运动预测准确，可以参与 densification
@@ -499,7 +499,7 @@ class GaussianModel:
 
         _all_clones = torch.logical_and(metric_mask, all_clones)
         _all_splits = torch.logical_and(metric_mask, all_splits)
-        print(f"With metric_mask: {metric_mask.sum().item()}, all_clones: {_all_clones.sum().item()}, all_splits: {_all_splits.sum().item()}")
+        print(f"With metric_mask: {metric_mask.sum().item()}, all_clones: {_all_clones.sum().item()}, all_splits: {_all_splits.sum().item()}\n")
 
         self.densify_and_clone_fastgs(metric_mask, all_clones)
         self.densify_and_split_fastgs(metric_mask, all_splits)
@@ -557,10 +557,12 @@ class GaussianModel:
         self.velocity_loss_accum[update_filter] += per_gaussian_velocity_loss[update_filter]
         self.velocity_denom[update_filter] += 1
 
-    def get_velocity_loss_mask(self, threshold):
+    def get_velocity_loss_mask(self, threshold, adaptive_percentile=-1):
         """基于累积的平均 velocity loss 生成掩码
         Args:
             threshold: velocity loss 阈值，高于此值的高斯将被标记
+            adaptive_percentile: 自适应阈值百分比，-1表示使用固定阈值，0-100表示使用自适应阈值
+                                 例如: 50 表示取中位数作为阈值，使得约50%的高斯通过筛选
         Returns:
             mask: bool tensor, True 表示该高斯的平均 velocity loss 低于阈值（运动预测准确）
         """
@@ -568,8 +570,18 @@ class GaussianModel:
         avg_velocity_loss[avg_velocity_loss.isnan()] = 0.0
         avg_velocity_loss = avg_velocity_loss.squeeze()
         
-        # 打印分布统计信息，方便设置阈值
+        # 获取有效高斯的掩码
         valid_mask = self.velocity_denom.squeeze() > 0
+        
+        # 如果使用自适应阈值
+        if adaptive_percentile >= 0 and valid_mask.sum() > 0:
+            valid_losses = avg_velocity_loss[valid_mask]
+            # 计算自适应阈值：取指定百分位数
+            adaptive_threshold = torch.quantile(valid_losses, adaptive_percentile / 100.0).item()
+            threshold = adaptive_threshold
+            print(f"  [Adaptive Threshold] Using {adaptive_percentile}th percentile: {threshold:.6f}")
+        
+        # 打印分布统计信息，方便设置阈值
         if valid_mask.sum() > 0:
             valid_losses = avg_velocity_loss[valid_mask]
             print(f"\n[Velocity Loss Distribution]")
@@ -585,4 +597,4 @@ class GaussianModel:
             below_thresh = (valid_losses < threshold).sum().item()
             print(f"  Gaussians below threshold: {below_thresh} ({100*below_thresh/valid_losses.shape[0]:.2f}%)\n")
         
-        return (avg_velocity_loss < threshold)
+        return (avg_velocity_loss > threshold)

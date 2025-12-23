@@ -114,7 +114,8 @@ class OptimizationParams(ParamGroup):
         self.velocity_lr_max_steps = 40_000
         self.lambda_velocity = 100
         self.velocity_interval = 10
-        self.velocity_loss_thresh = 0.01  # velocity loss 阈值，低于此值的高斯才参与 densification
+        self.velocity_loss_thresh = 0.00003  # velocity loss 阈值
+        self.velocity_loss_percentile = 50  # 自适应阈值百分比，-1表示使用固定阈值，0-100表示使用自适应阈值（如50表示取中位数作为阈值）
         super().__init__(parser, "Optimization Parameters")
 
 

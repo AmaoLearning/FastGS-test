@@ -204,7 +204,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
                     # 生成 velocity_loss 掩码并传入 densification
                     velocity_mask = None
                     if dataset.use_velocity:
-                        velocity_mask = gaussians.get_velocity_loss_mask(opt.velocity_loss_thresh)
+                        velocity_mask = gaussians.get_velocity_loss_mask(
+                            opt.velocity_loss_thresh, 
+                            adaptive_percentile=opt.velocity_loss_percentile
+                        )
                     
                     gaussians.densify_and_prune_fastgs(max_screen_size = size_threshold, 
                                                 min_opacity = 0.005, 
