@@ -513,7 +513,7 @@ def readNerfiesInfo(path, eval):
 
 def readCamerasFromNpy(path, npy_file, split, hold_id, num_images):
     cam_infos = []
-    video_paths = sorted(glob(os.path.join(path, 'frames/*')))
+    video_paths = sorted(glob(os.path.join(path, 'cam*', 'images')))
     poses_bounds = np.load(os.path.join(path, npy_file))
 
     poses = poses_bounds[:, :15].reshape(-1, 3, 5)
