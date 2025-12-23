@@ -106,7 +106,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
             viewpoint_cam.load2device()
         fid = viewpoint_cam.fid
 
-        velocity_loss = torch.tensor(0.0, device="cuda")
+        velocity_loss = None  # 仅在需要时计算
         if iteration < opt.warm_up:
             d_xyz, d_rotation, d_scaling = 0.0, 0.0, 0.0
         else:
@@ -118,7 +118,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
             
             if dataset.use_velocity:
                 _d_xyz, _, _ = deform.step(gaussians.get_xyz.detach(), time_input + ast_noise + time_interval)
-                current_v = velocity.forward(gaussians.get_xyz().detach(), time_input + ast_noise)
+                current_v = velocity.forward(gaussians.get_xyz.detach(), time_input + ast_noise)
                 velocity_loss = l2_loss(_d_xyz - d_xyz, current_v * time_interval)
 
                 if iteration % 1000 == 0:
@@ -134,8 +134,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - fast_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))) \
-              + opt.lambda_velocity * velocity_loss
+        ssim_loss = 1.0 - fast_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss
+        
+        # 只有在 use_velocity 开启且不在 warm_up 期间时才加入 velocity_loss
+        if dataset.use_velocity and iteration >= opt.warm_up:
+            loss = loss + opt.lambda_velocity * velocity_loss
         
         loss.backward()
 

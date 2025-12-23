@@ -98,7 +98,7 @@ class VelocityNetwork(nn.Module):
     def save_weights(self, model_path, iteration):
         out_weights_path = os.path.join(model_path, "velocity/iteration_{}".format(iteration))
         os.makedirs(out_weights_path, exist_ok=True)
-        torch.save(self.deform.state_dict(), os.path.join(out_weights_path, 'velocity.pth'))
+        torch.save(self.state_dict(), os.path.join(out_weights_path, 'velocity.pth'))
 
     def load_weights(self, model_path, iteration=-1):
         if iteration == -1:
