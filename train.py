@@ -117,8 +117,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
             ast_noise = 0 if dataset.is_blender else torch.randn(1, 1, device='cuda').expand(N, -1) * time_interval * smooth_term(iteration)
             
             # 如果启用动态掩码，只对动态高斯计算 deform
-            if opt.use_dynamic_mask and iteration > opt.densify_from_iter:
-                dynamic_mask = gaussians.get_dynamic_mask(opt.dynamic_thresh, opt.grad_abs_thresh, iteration)
+            if opt.use_dynamic_mask and iteration % opt.velocity_interval != 0:
+                dynamic_mask = gaussians.get_dynamic_mask(
+                    opt.dynamic_thresh, 
+                    opt.grad_abs_thresh, 
+                    iteration,
+                    adaptive_percentile=opt.dynamic_thresh_percentile
+                )
                 # 初始化为零
                 d_xyz = torch.zeros((N, 3), device="cuda")
                 d_rotation = torch.zeros((N, 4), device="cuda")
@@ -182,9 +187,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
             viewpoint_cam.load2device('cpu')
 
         with torch.no_grad():
-            # 累积 velocity loss 统计 (用于 densification 掩码)
-            if dataset.use_velocity and per_gaussian_velocity_loss is not None:
-                gaussians.add_velocity_loss_stats(per_gaussian_velocity_loss.detach(), visibility_filter)
+            gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
             
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
@@ -216,7 +219,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
             # Densification
             optim_start.record()
             if iteration < opt.densify_until_iter:
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                # 累积 velocity loss 统计 (用于 densification 掩码)
+                if dataset.use_velocity and per_gaussian_velocity_loss is not None:
+                    gaussians.add_velocity_loss_stats(per_gaussian_velocity_loss.detach(), visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
@@ -246,6 +251,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
                 if iteration % opt.opacity_reset_interval == 0 or (
                         dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
+            else:
+                if iteration % opt.densification_interval == 0:
+                    gaussians.zero_accums()
 
             if iteration % 3000 == 0 and iteration > 15_000 and iteration < 30_000:
                 my_viewpoint_stack = scene.getTrainCameras().copy()

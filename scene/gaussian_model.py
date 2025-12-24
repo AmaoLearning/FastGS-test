@@ -343,7 +343,7 @@ class GaussianModel:
         return optimizable_tensors
 
     def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
-                              new_rotation):
+                              new_rotation, new_dynamic_metrics=None):
         d = {"xyz": new_xyz,
              "f_dc": new_features_dc,
              "f_rest": new_features_rest,
@@ -359,12 +359,25 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
+        # Extend dynamic_metrics for new gaussians
+        if new_dynamic_metrics is not None:
+            self.dynamic_metrics = torch.cat([self.dynamic_metrics, new_dynamic_metrics], dim=0)
+        else:
+            # Default: new gaussians start with zero dynamic_metrics
+            num_new = new_xyz.shape[0]
+            self.dynamic_metrics = torch.cat([
+                self.dynamic_metrics, 
+                torch.zeros((num_new, 3), device="cuda")
+            ], dim=0)
+
+        self.zero_accums()
+
+    def zero_accums(self):
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.xyz_gradient_accum_abs = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")  # abs
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.velocity_loss_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.velocity_denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.dynamic_metrics = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
@@ -387,8 +400,10 @@ class GaussianModel:
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N, 1, 1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N, 1, 1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N, 1)
+        # Inherit parent's dynamic_metrics
+        new_dynamic_metrics = self.dynamic_metrics[selected_pts_mask].repeat(N, 1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_dynamic_metrics)
 
         prune_filter = torch.cat(
             (selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
@@ -407,9 +422,11 @@ class GaussianModel:
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
+        # Inherit parent's dynamic_metrics
+        new_dynamic_metrics = self.dynamic_metrics[selected_pts_mask]
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
-                                   new_rotation)
+                                   new_rotation, new_dynamic_metrics)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom
@@ -444,8 +461,10 @@ class GaussianModel:
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
+        # Inherit parent's dynamic_metrics
+        new_dynamic_metrics = self.dynamic_metrics[selected_pts_mask].repeat(N, 1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_dynamic_metrics)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -459,8 +478,10 @@ class GaussianModel:
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
+        # Inherit parent's dynamic_metrics
+        new_dynamic_metrics = self.dynamic_metrics[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_dynamic_metrics)
 
     def densify_and_prune_fastgs(self, max_screen_size, min_opacity, extent, radii, args, importance_score = None, pruning_score = None, velocity_mask = None):
         
@@ -613,22 +634,33 @@ class GaussianModel:
         current_v_abs = current_v.abs()
         self.dynamic_metrics = torch.max(current_v_abs, self.dynamic_metrics * decay)
     
-    def get_dynamic_mask(self, dynamic_thresh, grad_abs_thresh, iteration=None):
+    def get_dynamic_mask(self, dynamic_thresh, grad_abs_thresh, iteration=None, adaptive_percentile=-1):
         """生成动态掩码：只有动态且梯度足够大的高斯才需要计算 deform
         Args:
             dynamic_thresh: 动态阈值，速度大于此值的高斯被认为是动态的
             grad_abs_thresh: 梯度绝对值阈值
+            iteration: 当前迭代次数，用于控制打印频率
+            adaptive_percentile: 自适应阈值百分比，-1表示使用固定阈值，0-100表示使用自适应阈值
         Returns:
             mask: bool tensor, True 表示该高斯需要计算 deform
         """
         # 计算动态指标的模长
         dynamic_norm = torch.norm(self.dynamic_metrics, dim=-1)  # [N]
+        N = dynamic_norm.shape[0]
+        
+        # 如果使用自适应阈值
+        if adaptive_percentile >= 0:
+            # 计算自适应阈值：取指定百分位数
+            adaptive_threshold = torch.quantile(dynamic_norm, adaptive_percentile / 100.0).item()
+            dynamic_thresh = adaptive_threshold
+            if iteration is not None and iteration % 1000 == 0:
+                print(f"  [Adaptive Dynamic Threshold] Using {adaptive_percentile}th percentile: {dynamic_thresh:.6f}")
         
         # 动态掩码：速度大于阈值
         is_dynamic = dynamic_norm > dynamic_thresh
         
         # 梯度掩码：梯度绝对值大于阈值
-        grads_abs = self.xyz_gradient_accum_abs / (self.denom + 1e-7)
+        grads_abs = self.xyz_gradient_accum_abs / self.denom
         grads_abs[grads_abs.isnan()] = 0.0
         has_grad = grads_abs.squeeze() > grad_abs_thresh
         
@@ -636,8 +668,7 @@ class GaussianModel:
         dynamic_mask = torch.logical_or(is_dynamic, has_grad)
         
         # 打印分布统计信息，方便设置阈值
-        if iteration != None and iteration % 1000 == 0:
-            N = dynamic_norm.shape[0]
+        if iteration is not None and iteration % 1001 == 0:
             print(f"\n[Dynamic Metrics Distribution][Iter {iteration}]")
             print(f"  Total Gaussians: {N}")
             print(f"  Min: {dynamic_norm.min().item():.6f}, Max: {dynamic_norm.max().item():.6f}")
@@ -649,14 +680,13 @@ class GaussianModel:
             
             valid_mask = dynamic_norm > 0
             if valid_mask.sum() > 0:
-                valid_norms = dynamic_norm[valid_mask]
                 # 打印百分位数
                 print(f"  Current dynamic_thresh: {dynamic_thresh}")
                 above_thresh = is_dynamic.sum().item()
                 print(f"  Gaussians above dynamic_thresh: {above_thresh} ({100*above_thresh/N:.2f}%)")
             
             print(f"\n[Mask Statistics][Iter {iteration}]")
-            print(f"  is_dynamic (dynamic_norm > {dynamic_thresh}): {is_dynamic.sum().item()} ({100*is_dynamic.sum().item()/N:.2f}%)")
+            print(f"  is_dynamic (dynamic_norm > {dynamic_thresh:.6f}): {is_dynamic.sum().item()} ({100*is_dynamic.sum().item()/N:.2f}%)")
             print(f"  has_grad (grad_abs > {grad_abs_thresh}): {has_grad.sum().item()} ({100*has_grad.sum().item()/N:.2f}%)")
             print(f"  dynamic_mask (is_dynamic OR has_grad): {dynamic_mask.sum().item()} ({100*dynamic_mask.sum().item()/N:.2f}%)\n")
         
