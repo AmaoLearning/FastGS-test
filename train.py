@@ -115,11 +115,36 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
             time_input = fid.unsqueeze(0).expand(N, -1)
 
             ast_noise = 0 if dataset.is_blender else torch.randn(1, 1, device='cuda').expand(N, -1) * time_interval * smooth_term(iteration)
-            d_xyz, d_rotation, d_scaling = deform.step(gaussians.get_xyz.detach(), time_input + ast_noise)
+            
+            # 如果启用动态掩码，只对动态高斯计算 deform
+            if opt.use_dynamic_mask and iteration > opt.densify_from_iter:
+                dynamic_mask = gaussians.get_dynamic_mask(opt.dynamic_thresh, opt.grad_abs_thresh, iteration)
+                # 初始化为零
+                d_xyz = torch.zeros((N, 3), device="cuda")
+                d_rotation = torch.zeros((N, 4), device="cuda")
+                d_scaling = torch.zeros((N, 3), device="cuda")
+                # 只对动态高斯计算 deform
+                if dynamic_mask.sum() > 0:
+                    d_xyz_masked, d_rotation_masked, d_scaling_masked = deform.step(
+                        gaussians.get_xyz[dynamic_mask].detach(), 
+                        time_input[dynamic_mask] + (ast_noise[dynamic_mask] if torch.is_tensor(ast_noise) else ast_noise)
+                    )
+                    d_xyz[dynamic_mask] = d_xyz_masked
+                    d_rotation[dynamic_mask] = d_rotation_masked
+                    d_scaling[dynamic_mask] = d_scaling_masked
+                
+                if iteration % 1000 == 0:
+                    print(f"[Iter {iteration}] Dynamic mask: {dynamic_mask.sum().item()}/{N} ({100*dynamic_mask.sum().item()/N:.2f}%)")
+            else:
+                d_xyz, d_rotation, d_scaling = deform.step(gaussians.get_xyz.detach(), time_input + ast_noise)
             
             if dataset.use_velocity and iteration % opt.velocity_interval == 0:
                 _d_xyz, _, _ = deform.step(gaussians.get_xyz.detach(), time_input + ast_noise + time_interval)
                 current_v = velocity.forward(gaussians.get_xyz.detach(), time_input + ast_noise)
+                
+                # 更新动态指标 (Leaky Max)
+                with torch.no_grad():
+                    gaussians.update_dynamic_metrics(current_v.detach(), decay=opt.dynamic_decay)
                 
                 # 计算每个高斯的 velocity loss (用于累积统计)
                 velocity_diff = _d_xyz - d_xyz

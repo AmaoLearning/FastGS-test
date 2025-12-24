@@ -45,6 +45,7 @@ class GaussianModel:
         self.xyz_gradient_accum_abs = torch.empty(0)
         self.velocity_loss_accum = torch.empty(0)
         self.velocity_denom = torch.empty(0)
+        self.dynamic_metrics = torch.empty(0)  # 动态指标：历史速度绝对值的 Leaky Max
 
         self.optimizer = None
         self.shoptimizer = None
@@ -128,6 +129,7 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.velocity_loss_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.velocity_denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.dynamic_metrics = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")  # 3维速度的 Leaky Max
 
         self.spatial_lr_scale = 5
 
@@ -311,6 +313,7 @@ class GaussianModel:
         self.xyz_gradient_accum_abs = self.xyz_gradient_accum_abs[valid_points_mask]
         self.velocity_loss_accum = self.velocity_loss_accum[valid_points_mask]
         self.velocity_denom = self.velocity_denom[valid_points_mask]
+        self.dynamic_metrics = self.dynamic_metrics[valid_points_mask]
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
@@ -361,6 +364,7 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.velocity_loss_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.velocity_denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.dynamic_metrics = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
@@ -598,3 +602,61 @@ class GaussianModel:
             print(f"  Gaussians below threshold: {below_thresh} ({100*below_thresh/valid_losses.shape[0]:.2f}%)\n")
         
         return (avg_velocity_loss > threshold)
+
+    def update_dynamic_metrics(self, current_v, decay=0.99):
+        """更新动态指标：使用 Leaky Max (Decaying Peak) 方法
+        Args:
+            current_v: 当前速度 [N, 3]
+            decay: 衰减系数，控制历史峰值的衰减速度
+        """
+        # dynamic_metrics = max(|current_v|, dynamic_metrics * decay)
+        current_v_abs = current_v.abs()
+        self.dynamic_metrics = torch.max(current_v_abs, self.dynamic_metrics * decay)
+    
+    def get_dynamic_mask(self, dynamic_thresh, grad_abs_thresh, iteration=None):
+        """生成动态掩码：只有动态且梯度足够大的高斯才需要计算 deform
+        Args:
+            dynamic_thresh: 动态阈值，速度大于此值的高斯被认为是动态的
+            grad_abs_thresh: 梯度绝对值阈值
+        Returns:
+            mask: bool tensor, True 表示该高斯需要计算 deform
+        """
+        # 计算动态指标的模长
+        dynamic_norm = torch.norm(self.dynamic_metrics, dim=-1)  # [N]
+        
+        # 动态掩码：速度大于阈值
+        is_dynamic = dynamic_norm > dynamic_thresh
+        
+        # 梯度掩码：梯度绝对值大于阈值
+        grads_abs = self.xyz_gradient_accum_abs / (self.denom + 1e-7)
+        grads_abs[grads_abs.isnan()] = 0.0
+        has_grad = grads_abs.squeeze() > grad_abs_thresh
+        
+        # 最终掩码：两者都满足
+        dynamic_mask = torch.logical_or(is_dynamic, has_grad)
+        
+        # 打印分布统计信息，方便设置阈值
+        if iteration != None and iteration % 1000 == 0:
+            N = dynamic_norm.shape[0]
+            valid_mask = dynamic_norm > 0
+            if valid_mask.sum() > 0:
+                valid_norms = dynamic_norm[valid_mask]
+                print(f"\n[Dynamic Metrics Distribution][Iter {iteration}]")
+                print(f"  Total Gaussians: {N}, Non-zero dynamic_norm: {valid_mask.sum().item()}")
+                print(f"  Min: {valid_norms.min().item():.6f}, Max: {valid_norms.max().item():.6f}")
+                print(f"  Mean: {valid_norms.mean().item():.6f}, Std: {valid_norms.std().item():.6f}")
+                # 打印百分位数
+                percentiles = [25, 50, 75, 90, 95, 99]
+                for p in percentiles:
+                    val = torch.quantile(valid_norms, p / 100.0).item()
+                    print(f"  {p}th percentile: {val:.6f}")
+                print(f"  Current dynamic_thresh: {dynamic_thresh}")
+                above_thresh = is_dynamic.sum().item()
+                print(f"  Gaussians above dynamic_thresh: {above_thresh} ({100*above_thresh/N:.2f}%)")
+            
+            print(f"\n[Mask Statistics][Iter {iteration}]")
+            print(f"  is_dynamic (dynamic_norm > {dynamic_thresh}): {is_dynamic.sum().item()} ({100*is_dynamic.sum().item()/N:.2f}%)")
+            print(f"  has_grad (grad_abs > {grad_abs_thresh}): {has_grad.sum().item()} ({100*has_grad.sum().item()/N:.2f}%)")
+            print(f"  dynamic_mask (is_dynamic OR has_grad): {dynamic_mask.sum().item()} ({100*dynamic_mask.sum().item()/N:.2f}%)\n")
+        
+        return dynamic_mask

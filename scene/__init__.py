@@ -103,6 +103,11 @@ class Scene:
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
+        
+        # 额外保存高斯数量到文件
+        num_gaussians = self.gaussians.get_xyz.shape[0]
+        with open(os.path.join(point_cloud_path, "num_gaussians.txt"), 'w') as f:
+            f.write(f"{num_gaussians}\n")
 
     def getTrainCameras(self, scale=1.0):
         return self.train_cameras[scale]

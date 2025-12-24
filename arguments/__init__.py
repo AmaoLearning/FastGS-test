@@ -116,6 +116,11 @@ class OptimizationParams(ParamGroup):
         self.velocity_interval = 10
         self.velocity_loss_thresh = 0.00003  # velocity loss 阈值
         self.velocity_loss_percentile = 50  # 自适应阈值百分比，-1表示使用固定阈值，0-100表示使用自适应阈值（如50表示取中位数作为阈值）
+        
+        # dynamic mask (用于选择性计算 deform)
+        self.use_dynamic_mask = False  # 是否启用动态掩码
+        self.dynamic_decay = 0.99  # Leaky Max 的衰减系数
+        self.dynamic_thresh = 0.001  # 动态阈值，速度大于此值的高斯被认为是动态的
         super().__init__(parser, "Optimization Parameters")
 
 
