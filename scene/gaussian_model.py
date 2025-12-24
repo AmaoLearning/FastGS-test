@@ -638,18 +638,19 @@ class GaussianModel:
         # 打印分布统计信息，方便设置阈值
         if iteration != None and iteration % 1000 == 0:
             N = dynamic_norm.shape[0]
+            print(f"\n[Dynamic Metrics Distribution][Iter {iteration}]")
+            print(f"  Total Gaussians: {N}")
+            print(f"  Min: {dynamic_norm.min().item():.6f}, Max: {dynamic_norm.max().item():.6f}")
+            print(f"  Mean: {dynamic_norm.mean().item():.6f}, Std: {dynamic_norm.std().item():.6f}")
+            percentiles = [25, 50, 75, 90, 95, 99]
+            for p in percentiles:
+                val = torch.quantile(dynamic_norm, p / 100.0).item()
+                print(f"  {p}th percentile: {val:.6f}")
+            
             valid_mask = dynamic_norm > 0
             if valid_mask.sum() > 0:
                 valid_norms = dynamic_norm[valid_mask]
-                print(f"\n[Dynamic Metrics Distribution][Iter {iteration}]")
-                print(f"  Total Gaussians: {N}, Non-zero dynamic_norm: {valid_mask.sum().item()}")
-                print(f"  Min: {valid_norms.min().item():.6f}, Max: {valid_norms.max().item():.6f}")
-                print(f"  Mean: {valid_norms.mean().item():.6f}, Std: {valid_norms.std().item():.6f}")
                 # 打印百分位数
-                percentiles = [25, 50, 75, 90, 95, 99]
-                for p in percentiles:
-                    val = torch.quantile(valid_norms, p / 100.0).item()
-                    print(f"  {p}th percentile: {val:.6f}")
                 print(f"  Current dynamic_thresh: {dynamic_thresh}")
                 above_thresh = is_dynamic.sum().item()
                 print(f"  Gaussians above dynamic_thresh: {above_thresh} ({100*above_thresh/N:.2f}%)")
