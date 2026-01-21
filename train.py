@@ -12,7 +12,7 @@
 import os
 import torch
 from random import randint
-from utils.loss_utils import l1_loss, ssim, kl_divergence, l2_loss
+from utils.loss_utils import l1_loss, ssim, kl_divergence, l2_loss, velocity_temporal_smoothness_loss
 from gaussian_renderer import render_fastgs, network_gui
 import sys
 from scene import Scene, GaussianModel, DeformModel
@@ -33,7 +33,7 @@ except ImportError:
 
 import random
 from utils.fast_utils import compute_gaussian_score_fastgs, sampling_cameras
-from utils.motion_utils import VelocityNetwork
+from utils.motion_utils import VelocityNetwork, VelocityNetworkHash
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations):
@@ -42,9 +42,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
     deform = DeformModel(dataset.is_blender, dataset.is_6dof)
     deform.train_setting(opt)
 
-    # velocity
+    # velocity - 根据配置选择网络类型
     if dataset.use_velocity:
-        velocity = VelocityNetwork(is_blender=dataset.is_blender, is_6dof=dataset.is_6dof).cuda()
+        if dataset.velocity_network_type == "hash":
+            print("[INFO] Using Hash Encoding Velocity Network")
+            velocity = VelocityNetworkHash(is_blender=dataset.is_blender, is_6dof=dataset.is_6dof).cuda()
+        else:
+            print("[INFO] Using MLP Velocity Network")
+            velocity = VelocityNetwork(is_blender=dataset.is_blender, is_6dof=dataset.is_6dof).cuda()
         velocity.train_setting(opt)
 
     scene = Scene(dataset, gaussians)
@@ -175,9 +180,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
         ssim_loss = 1.0 - fast_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss
         
-        # 只有在 use_velocity 开启且不在 warm_up 期间时才加入 velocity_loss
-        if dataset.use_velocity and iteration >= opt.warm_up and velocity_loss is not None:
-            loss = loss + opt.lambda_velocity * velocity_loss
+        # 只有在 use_velocity 开启且不在 warm_up 期间时才加入 velocity_loss 和时间平滑正则化
+        velocity_smooth_loss = None
+        if dataset.use_velocity and iteration >= opt.warm_up:
+            if velocity_loss is not None:
+                loss = loss + opt.lambda_velocity * velocity_loss
+            
+            # 时间平滑正则化损失：约束相邻时间步的速度场保持平滑
+            if opt.lambda_velocity_smooth > 0 and iteration % opt.velocity_interval == 0:
+                N = gaussians.get_xyz.shape[0]
+                time_input = fid.unsqueeze(0).expand(N, -1)
+                velocity_smooth_loss = velocity_temporal_smoothness_loss(
+                    velocity, 
+                    gaussians.get_xyz.detach(), 
+                    time_input, 
+                    dt=opt.velocity_smooth_dt * time_interval
+                )
+                loss = loss + opt.lambda_velocity_smooth * velocity_smooth_loss
+                
+                if iteration % 1000 == 0:
+                    print(f"[Iter {iteration}] velocity smooth loss = {velocity_smooth_loss.item():.6f}")
         
         loss.backward()
 

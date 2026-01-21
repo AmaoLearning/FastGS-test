@@ -30,6 +30,36 @@ def l2_loss(network_output, gt):
     return F.mse_loss(network_output, gt)
 
 
+def velocity_temporal_smoothness_loss(velocity_network, xyz: torch.Tensor, t: torch.Tensor, dt: float = 0.01):
+    """
+    计算速度场的时间平滑正则化损失。
+    
+    通过约束相邻时间步的速度场变化来确保时间上的平滑性，
+    即 ||v(x, t+dt) - v(x, t)||^2 应该较小。
+    
+    Args:
+        velocity_network: 速度场网络
+        xyz: 高斯中心点坐标 [N, 3]
+        t: 当前时间 [N, 1]
+        dt: 时间采样间隔 (默认 0.01)
+    
+    Returns:
+        时间平滑正则化损失 (标量)
+    """
+    # 计算当前时间步的速度
+    v_t = velocity_network(xyz, t)
+    
+    # 计算下一时间步的速度 (t + dt)
+    t_next = t + dt
+    v_t_next = velocity_network(xyz, t_next)
+    
+    # 计算速度变化的 L2 范数
+    # 这鼓励速度场在时间上平滑变化
+    smooth_loss = ((v_t_next - v_t) ** 2).mean()
+    
+    return smooth_loss
+
+
 def gaussian(window_size, sigma):
     gauss = torch.Tensor([exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)])
     return gauss / gauss.sum()
