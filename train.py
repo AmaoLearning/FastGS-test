@@ -36,7 +36,8 @@ from utils.fast_utils import compute_gaussian_score_fastgs, sampling_cameras
 from utils.motion_utils import VelocityNetwork, VelocityNetworkHash
 
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: bool = False):
+    safe_state(quiet) # fix random seeds
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
     deform = DeformModel(dataset.is_blender, dataset.is_6dof)
@@ -401,9 +402,6 @@ if __name__ == "__main__":
     args.save_iterations.append(args.iterations)
 
     print("Optimizing " + args.model_path)
-
-    # Initialize system state (RNG)
-    safe_state(args.quiet)
 
     # Start GUI server, configure and run training
     # network_gui.init(args.ip, args.port)

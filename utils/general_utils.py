@@ -13,6 +13,7 @@ import torch
 import sys
 from datetime import datetime
 import numpy as np
+import os
 import random
 
 
@@ -163,7 +164,7 @@ def build_scaling_rotation(s, r):
     return L
 
 
-def safe_state(silent):
+def safe_state(silent, seed: int = 42, deterministic: bool = False):
     old_f = sys.stdout
 
     class F:
@@ -182,7 +183,19 @@ def safe_state(silent):
 
     sys.stdout = F(silent)
 
-    random.seed(0)
-    np.random.seed(0)
-    torch.manual_seed(0)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        try:
+            torch.use_deterministic_algorithms(True)
+        except Exception:
+            pass
+    
     torch.cuda.set_device(torch.device("cuda:0"))
