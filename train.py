@@ -188,7 +188,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 loss = loss + opt.lambda_velocity * velocity_loss
             
             # 时间平滑正则化损失：约束相邻时间步的速度场保持平滑
-            if opt.lambda_velocity_smooth > 0 and iteration % opt.velocity_interval == 0:
+            if opt.use_velocity_smooth and opt.lambda_velocity_smooth > 0 and iteration % opt.velocity_interval == 0:
                 N = gaussians.get_xyz.shape[0]
                 time_input = fid.unsqueeze(0).expand(N, -1)
                 velocity_smooth_loss = velocity_temporal_smoothness_loss(

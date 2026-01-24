@@ -589,7 +589,7 @@ class GaussianModel:
             adaptive_percentile: 自适应阈值百分比，-1表示使用固定阈值，0-100表示使用自适应阈值
                                  例如: 50 表示取中位数作为阈值，使得约50%的高斯通过筛选
         Returns:
-            mask: bool tensor, True 表示该高斯的平均 velocity loss 低于阈值（运动预测准确）
+            mask: bool tensor, True 表示该高斯的平均 velocity loss 高于阈值（运动预测不准）
         """
         avg_velocity_loss = self.velocity_loss_accum / (self.velocity_denom + 1e-7)
         avg_velocity_loss[avg_velocity_loss.isnan()] = 0.0

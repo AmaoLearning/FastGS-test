@@ -119,8 +119,9 @@ class OptimizationParams(ParamGroup):
         self.velocity_loss_percentile = 30  # 自适应阈值百分比，-1表示使用固定阈值，0-100表示使用自适应阈值（如50表示取中位数作为阈值）
         
         # velocity temporal smoothness
+        self.use_velocity_smooth = False  # 是否启用时间平滑正则化
         self.lambda_velocity_smooth = 0.1  # 时间平滑正则化权重
-        self.velocity_smooth_dt = 0.01  # 时间平滑采样的时间间隔（相对于单帧间隔的比例）
+        self.velocity_smooth_dt = 0.1  # 时间平滑采样的时间间隔（相对于单帧间隔的比例）
         
         # dynamic mask (用于选择性计算 deform)
         self.use_dynamic_mask = False  # 是否启用动态掩码
