@@ -6,6 +6,140 @@ from utils.time_utils import get_embedder
 import os
 from utils.system_utils import searchForMaxIteration
 from utils.general_utils import get_expon_lr_func
+from typing import Tuple, Union
+
+
+# ============================================================================
+# Step 1: 物理量计算工具函数 (散度和旋度)
+# ============================================================================
+
+def compute_velocity_jacobian_quantities(
+    velocity_net: nn.Module,
+    coords: torch.Tensor,
+    times: torch.Tensor,
+    chunk_size: int = 8192
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    高效计算速度场的雅可比矩阵导出量：散度(Divergence)和旋度(Curl)。
+    
+    使用 torch.func.vmap + jacrev 实现向量化的雅可比矩阵计算。
+    此函数仅用于推断物理指标，不保留计算图以节省显存。
+    
+    Args:
+        velocity_net: 速度场网络，输入 (xyz, t)，输出 v [N, 3]
+        coords: 高斯中心点坐标 [N, 3]，应为 detached
+        times: 时间坐标 [N, 1]，应为 detached
+        chunk_size: 分块大小，用于控制显存占用
+    
+    Returns:
+        divergence: 散度 [N, 1]，雅可比矩阵的迹 (∂vx/∂x + ∂vy/∂y + ∂vz/∂z)
+        curl_magnitude: 旋度模长 [N, 1]
+        velocity: 速度向量 [N, 3]
+    
+    物理意义:
+        - 散度 > 0: 膨胀区域（速度场向外发散）
+        - 散度 < 0: 收缩区域（速度场向内汇聚）
+        - 旋度大: 旋转/湍流区域（速度场有强烈的非线性形变）
+    """
+    device = coords.device
+    N = coords.shape[0]
+    
+    # 确保输入是 detached 的
+    coords = coords.detach()
+    times = times.detach()
+    
+    # 初始化输出
+    divergence = torch.zeros(N, 1, device=device)
+    curl_magnitude = torch.zeros(N, 1, device=device)
+    velocity = torch.zeros(N, 3, device=device)
+    
+    # 定义单点速度函数（用于 jacrev）
+    def velocity_fn(xyz: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """单点速度函数，输入 xyz [3], t [1]，输出 v [3]"""
+        return velocity_net(xyz.unsqueeze(0), t.unsqueeze(0)).squeeze(0)
+    
+    # 分块处理以控制显存
+    for start_idx in range(0, N, chunk_size):
+        end_idx = min(start_idx + chunk_size, N)
+        chunk_coords = coords[start_idx:end_idx]  # [chunk, 3]
+        chunk_times = times[start_idx:end_idx]    # [chunk, 1]
+        chunk_size_actual = chunk_coords.shape[0]
+        
+        with torch.no_grad():
+            # 计算速度
+            chunk_velocity = velocity_net(chunk_coords, chunk_times)  # [chunk, 3]
+            velocity[start_idx:end_idx] = chunk_velocity
+            
+            # 使用 vmap + jacrev 计算雅可比矩阵
+            # jacrev 计算 ∂v/∂xyz，返回 [3, 3] 的雅可比矩阵
+            # vmap 将其向量化到整个 batch
+            try:
+                from torch.func import vmap, jacrev
+                
+                # 对 xyz 求雅可比矩阵
+                jacobian_fn = jacrev(velocity_fn, argnums=0)
+                
+                # vmap 向量化
+                batched_jacobian_fn = vmap(jacobian_fn, in_dims=(0, 0))
+                
+                # 计算雅可比矩阵 [chunk, 3, 3]
+                # J[i,j] = ∂v_i / ∂x_j
+                jacobians = batched_jacobian_fn(chunk_coords, chunk_times)
+                
+                # 散度：迹 = ∂vx/∂x + ∂vy/∂y + ∂vz/∂z
+                chunk_div = jacobians[:, 0, 0] + jacobians[:, 1, 1] + jacobians[:, 2, 2]  # [chunk]
+                divergence[start_idx:end_idx] = chunk_div.unsqueeze(-1)
+                
+                # 旋度：curl = (∂vz/∂y - ∂vy/∂z, ∂vx/∂z - ∂vz/∂x, ∂vy/∂x - ∂vx/∂y)
+                curl_x = jacobians[:, 2, 1] - jacobians[:, 1, 2]  # ∂vz/∂y - ∂vy/∂z
+                curl_y = jacobians[:, 0, 2] - jacobians[:, 2, 0]  # ∂vx/∂z - ∂vz/∂x
+                curl_z = jacobians[:, 1, 0] - jacobians[:, 0, 1]  # ∂vy/∂x - ∂vx/∂y
+                
+                # 旋度模长
+                chunk_curl_mag = torch.sqrt(curl_x**2 + curl_y**2 + curl_z**2 + 1e-8)  # [chunk]
+                curl_magnitude[start_idx:end_idx] = chunk_curl_mag.unsqueeze(-1)
+                
+            except ImportError:
+                # Fallback: 使用有限差分近似（torch.func 不可用时）
+                eps = 1e-4
+                chunk_div = torch.zeros(chunk_size_actual, device=device)
+                chunk_curl = torch.zeros(chunk_size_actual, 3, device=device)
+                
+                for dim in range(3):
+                    # 正向扰动
+                    coords_plus = chunk_coords.clone()
+                    coords_plus[:, dim] += eps
+                    v_plus = velocity_net(coords_plus, chunk_times)
+                    
+                    # 负向扰动
+                    coords_minus = chunk_coords.clone()
+                    coords_minus[:, dim] -= eps
+                    v_minus = velocity_net(coords_minus, chunk_times)
+                    
+                    # 中心差分
+                    dv_dx = (v_plus - v_minus) / (2 * eps)  # [chunk, 3]
+                    
+                    # 累加散度
+                    chunk_div += dv_dx[:, dim]
+                    
+                    # 计算旋度分量
+                    # curl_x = ∂vz/∂y - ∂vy/∂z
+                    # curl_y = ∂vx/∂z - ∂vz/∂x
+                    # curl_z = ∂vy/∂x - ∂vx/∂y
+                    if dim == 0:  # ∂/∂x
+                        chunk_curl[:, 2] += dv_dx[:, 1]   # ∂vy/∂x -> curl_z
+                        chunk_curl[:, 1] -= dv_dx[:, 2]   # -∂vz/∂x -> curl_y
+                    elif dim == 1:  # ∂/∂y
+                        chunk_curl[:, 0] += dv_dx[:, 2]   # ∂vz/∂y -> curl_x
+                        chunk_curl[:, 2] -= dv_dx[:, 0]   # -∂vx/∂y -> curl_z
+                    else:  # ∂/∂z
+                        chunk_curl[:, 1] += dv_dx[:, 0]   # ∂vx/∂z -> curl_y
+                        chunk_curl[:, 0] -= dv_dx[:, 1]   # -∂vy/∂z -> curl_x
+                
+                divergence[start_idx:end_idx] = chunk_div.unsqueeze(-1)
+                curl_magnitude[start_idx:end_idx] = torch.norm(chunk_curl, dim=-1, keepdim=True)
+    
+    return divergence, curl_magnitude, velocity
 
 class VelocityNetwork(nn.Module):
     def __init__(self, D=8, W=256, input_ch=3, output_ch=3, multires=10, is_blender=False, is_6dof=False):

@@ -270,6 +270,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                                                 importance_score = importance_score,
                                                 pruning_score = pruning_score,
                                                 velocity_mask = velocity_mask)
+                    
+                    # 物理驱动致密化：基于散度和旋度
+                    if dataset.use_velocity and opt.use_physics_densify:
+                        N = gaussians.get_xyz.shape[0]
+                        time_input = fid.unsqueeze(0).expand(N, -1)
+                        gaussians.physics_densify(
+                            velocity_net=velocity,
+                            times=time_input,
+                            args=opt,
+                            extent=scene.cameras_extent
+                        )
 
                 if iteration % opt.opacity_reset_interval == 0 or (
                         dataset.white_background and iteration == opt.densify_from_iter):

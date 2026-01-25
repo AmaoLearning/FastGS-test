@@ -128,6 +128,13 @@ class OptimizationParams(ParamGroup):
         self.dynamic_decay = 0.95  # Leaky Max 的衰减系数；0.95好于0.99，后者衰减太慢
         self.dynamic_thresh = 0.001  # 动态阈值，速度大于此值的高斯被认为是动态的
         self.dynamic_thresh_percentile = 75  # 自适应阈值百分比，-1表示使用固定阈值，0-100表示使用自适应阈值（如50表示取中位数）
+        
+        # physics-driven densification (物理驱动致密化)
+        self.use_physics_densify = False  # 是否启用物理驱动致密化
+        self.div_percentile = 95  # 散度阈值百分位数，高于此值触发 Clone
+        self.curl_percentile = 95  # 旋度阈值百分位数，高于此值触发 Split
+        self.physics_clone_eta = 0.2  # Clone 时沿速度反方向偏移的系数
+        self.physics_split_scale_factor = 2.0  # Split 时缩放因子
         super().__init__(parser, "Optimization Parameters")
 
 

@@ -691,3 +691,251 @@ class GaussianModel:
             print(f"  dynamic_mask (is_dynamic OR has_grad): {dynamic_mask.sum().item()} ({100*dynamic_mask.sum().item()/N:.2f}%)\n")
         
         return dynamic_mask
+
+
+    # ============================================================================
+    # Step 2 & 3: 物理驱动的致密化 (Physics-Driven Densification)
+    # ============================================================================
+    
+    def compute_physics_densify_masks(
+        self, 
+        divergence: torch.Tensor, 
+        curl_magnitude: torch.Tensor,
+        min_opacity: float = 0.005,
+        div_percentile: float = 95,
+        curl_percentile: float = 95,
+        split_scale_limit_factor: float = 0.01,
+        extent: float = 1.0
+    ):
+        """
+        基于速度场物理量（散度和旋度）计算致密化掩码。
+        
+        Args:
+            divergence: 散度 [N, 1]
+            curl_magnitude: 旋度模长 [N, 1]
+            min_opacity: 最小不透明度阈值
+            div_percentile: 散度阈值百分位数 (0-100)
+            curl_percentile: 旋度阈值百分位数 (0-100)
+            split_scale_limit_factor: Split 时的尺度限制因子
+            extent: 场景范围
+        
+        Returns:
+            clone_mask: 需要克隆的高斯掩码 (高散度 = 膨胀区域)
+            split_mask: 需要分裂的高斯掩码 (高旋度 = 湍流区域)
+        """
+        N = self.get_xyz.shape[0]
+        device = self.get_xyz.device
+        
+        div = divergence.squeeze()  # [N]
+        curl = curl_magnitude.squeeze()  # [N]
+        opacity = self.get_opacity.squeeze()  # [N]
+        max_scale = self.get_scaling.max(dim=1).values  # [N]
+        
+        # 计算动态阈值
+        div_threshold = torch.quantile(div, div_percentile / 100.0).item()
+        curl_threshold = torch.quantile(curl, curl_percentile / 100.0).item()
+        split_scale_limit = split_scale_limit_factor * extent
+        
+        # Clone Mask: 高散度（膨胀区域）+ 不透明度足够
+        # 物理解释：膨胀导致空隙，需要克隆填补
+        high_div = div > div_threshold
+        sufficient_opacity = opacity > min_opacity
+        clone_mask = torch.logical_and(high_div, sufficient_opacity)
+        
+        # Split Mask: 高旋度（湍流区域）+ 高斯足够大
+        # 物理解释：非线性形变导致单一高斯拟合失效，需要分裂细化
+        high_curl = curl > curl_threshold
+        large_enough = max_scale > split_scale_limit
+        split_mask = torch.logical_and(high_curl, large_enough)
+        
+        # 打印统计信息
+        print(f"\n[Physics Densification Masks]")
+        print(f"  Divergence: threshold={div_threshold:.6f} (p{div_percentile}), "
+              f"high_div={high_div.sum().item()} ({100*high_div.sum().item()/N:.2f}%)")
+        print(f"  Curl: threshold={curl_threshold:.6f} (p{curl_percentile}), "
+              f"high_curl={high_curl.sum().item()} ({100*high_curl.sum().item()/N:.2f}%)")
+        print(f"  Clone candidates: {clone_mask.sum().item()}, Split candidates: {split_mask.sum().item()}")
+        
+        return clone_mask, split_mask
+    
+    def physics_driven_clone(
+        self, 
+        clone_mask: torch.Tensor, 
+        velocity: torch.Tensor, 
+        eta: float = 0.2
+    ):
+        """
+        物理驱动的克隆：沿速度反方向偏移，填补物体移动后留下的空缺。
+        
+        针对 Hash Encoding 的特殊处理：
+        - 问题：位置重合会导致速度重合，克隆失效
+        - 解决：向"上游"（速度反方向）偏移，填补物理空缺
+        
+        Args:
+            clone_mask: 需要克隆的高斯掩码 [N]
+            velocity: 速度向量 [N, 3]
+            eta: 偏移系数，控制偏移距离
+        """
+        if clone_mask.sum() == 0:
+            return
+        
+        selected = clone_mask
+        
+        # 获取选中高斯的属性
+        old_xyz = self._xyz[selected]
+        old_velocity = velocity[selected]
+        mean_scale = self.get_scaling[selected].mean(dim=1, keepdim=True)  # [M, 1]
+        
+        # 计算速度单位向量，避免除零
+        v_norm = torch.norm(old_velocity, dim=-1, keepdim=True) + 1e-8  # [M, 1]
+        v_direction = old_velocity / v_norm  # [M, 3]
+        
+        # 新位置：沿速度反方向偏移
+        # new_xyz = old_xyz - eta * mean_scale * v_direction
+        new_xyz = old_xyz - eta * mean_scale * v_direction
+        
+        # 复制其他属性
+        new_features_dc = self._features_dc[selected]
+        new_features_rest = self._features_rest[selected]
+        new_opacities = self._opacity[selected]
+        new_scaling = self._scaling[selected]
+        new_rotation = self._rotation[selected]
+        new_dynamic_metrics = self.dynamic_metrics[selected]
+        
+        # 添加新高斯
+        self.densification_postfix(
+            new_xyz, new_features_dc, new_features_rest, 
+            new_opacities, new_scaling, new_rotation, new_dynamic_metrics
+        )
+        
+        print(f"  [Physics Clone] Added {selected.sum().item()} gaussians with upstream offset")
+    
+    def physics_driven_split(
+        self, 
+        split_mask: torch.Tensor, 
+        scale_factor: float = 2.0,
+        N_split: int = 2
+    ):
+        """
+        物理驱动的分裂：在高旋度区域进行激进的细化。
+        
+        Args:
+            split_mask: 需要分裂的高斯掩码 [N]
+            scale_factor: 缩放因子，新高斯的尺度 = 原尺度 / scale_factor
+            N_split: 每个高斯分裂成的数量
+        """
+        if split_mask.sum() == 0:
+            return
+        
+        n_init_points = self.get_xyz.shape[0]
+        selected_pts_mask = split_mask
+        
+        # 在原高斯内部采样
+        stds = self.get_scaling[selected_pts_mask].repeat(N_split, 1)
+        means = torch.zeros((stds.size(0), 3), device="cuda")
+        samples = torch.normal(mean=means, std=stds)
+        rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N_split, 1, 1)
+        
+        new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + \
+                  self.get_xyz[selected_pts_mask].repeat(N_split, 1)
+        
+        # 更激进的缩放：使用更大的 scale_factor
+        new_scaling = self.scaling_inverse_activation(
+            self.get_scaling[selected_pts_mask].repeat(N_split, 1) / scale_factor
+        )
+        
+        new_rotation = self._rotation[selected_pts_mask].repeat(N_split, 1)
+        new_features_dc = self._features_dc[selected_pts_mask].repeat(N_split, 1, 1)
+        new_features_rest = self._features_rest[selected_pts_mask].repeat(N_split, 1, 1)
+        new_opacity = self._opacity[selected_pts_mask].repeat(N_split, 1)
+        new_dynamic_metrics = self.dynamic_metrics[selected_pts_mask].repeat(N_split, 1)
+        
+        # 添加新高斯
+        self.densification_postfix(
+            new_xyz, new_features_dc, new_features_rest, 
+            new_opacity, new_scaling, new_rotation, new_dynamic_metrics
+        )
+        
+        # 移除原高斯
+        prune_filter = torch.cat((
+            selected_pts_mask, 
+            torch.zeros(N_split * selected_pts_mask.sum(), device="cuda", dtype=bool)
+        ))
+        self.prune_points(prune_filter)
+        
+        print(f"  [Physics Split] Split {selected_pts_mask.sum().item()} gaussians "
+              f"into {N_split * selected_pts_mask.sum().item()} with scale_factor={scale_factor}")
+    
+    def physics_densify(
+        self,
+        velocity_net,
+        times: torch.Tensor,
+        args,
+        extent: float,
+        existing_clone_mask: torch.Tensor = None,
+        existing_split_mask: torch.Tensor = None
+    ):
+        """
+        完整的物理驱动致密化流程。
+        
+        将物理 Mask 与原有的 view_space_grad Mask 进行逻辑或（OR）合并。
+        
+        Args:
+            velocity_net: 速度场网络
+            times: 当前时间 [N, 1]
+            args: 优化参数
+            extent: 场景范围
+            existing_clone_mask: 原有的克隆掩码（来自 view-space gradient）
+            existing_split_mask: 原有的分裂掩码（来自 view-space gradient）
+        """
+        from utils.motion_utils import compute_velocity_jacobian_quantities
+        
+        N = self.get_xyz.shape[0]
+        
+        # Step 1: 计算物理量
+        print(f"\n[Physics Densification] Computing divergence and curl for {N} gaussians...")
+        divergence, curl_magnitude, velocity = compute_velocity_jacobian_quantities(
+            velocity_net, 
+            self.get_xyz.detach(), 
+            times.detach()
+        )
+        
+        # Step 2: 计算物理掩码
+        physics_clone_mask, physics_split_mask = self.compute_physics_densify_masks(
+            divergence, curl_magnitude,
+            min_opacity=0.005,
+            div_percentile=args.div_percentile,
+            curl_percentile=args.curl_percentile,
+            split_scale_limit_factor=args.dense,
+            extent=extent
+        )
+        
+        # Step 3: 与原有掩码合并（OR 操作）
+        if existing_clone_mask is not None:
+            final_clone_mask = torch.logical_or(physics_clone_mask, existing_clone_mask)
+            print(f"  Combined clone mask: physics={physics_clone_mask.sum().item()}, "
+                  f"existing={existing_clone_mask.sum().item()}, final={final_clone_mask.sum().item()}")
+        else:
+            final_clone_mask = physics_clone_mask
+        
+        if existing_split_mask is not None:
+            final_split_mask = torch.logical_or(physics_split_mask, existing_split_mask)
+            print(f"  Combined split mask: physics={physics_split_mask.sum().item()}, "
+                  f"existing={existing_split_mask.sum().item()}, final={final_split_mask.sum().item()}")
+        else:
+            final_split_mask = physics_split_mask
+        
+        # Step 4: 执行物理驱动的致密化
+        # 注意：只对物理触发的点使用特殊初始化策略
+        self.physics_driven_clone(
+            physics_clone_mask, 
+            velocity, 
+            eta=args.physics_clone_eta
+        )
+        self.physics_driven_split(
+            physics_split_mask, 
+            scale_factor=args.physics_split_scale_factor
+        )
+        
+        torch.cuda.empty_cache()
+        print(f"[Physics Densification] Done. New total: {self.get_xyz.shape[0]} gaussians\n")
