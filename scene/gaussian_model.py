@@ -20,6 +20,7 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
+from utils.motion_utils import compute_velocity_jacobian_quantities
 
 
 class GaussianModel:
@@ -828,7 +829,8 @@ class GaussianModel:
             return
         
         n_init_points = self.get_xyz.shape[0]
-        selected_pts_mask = split_mask
+        selected_pts_mask = torch.zeros((n_init_points), dtype=bool, device="cuda")
+        selected_pts_mask[:split_mask.shape[0]] = split_mask
         
         # 在原高斯内部采样
         stds = self.get_scaling[selected_pts_mask].repeat(N_split, 1)
@@ -871,9 +873,7 @@ class GaussianModel:
         velocity_net,
         times: torch.Tensor,
         args,
-        extent: float,
-        existing_clone_mask: torch.Tensor = None,
-        existing_split_mask: torch.Tensor = None
+        extent: float
     ):
         """
         完整的物理驱动致密化流程。
@@ -888,8 +888,6 @@ class GaussianModel:
             existing_clone_mask: 原有的克隆掩码（来自 view-space gradient）
             existing_split_mask: 原有的分裂掩码（来自 view-space gradient）
         """
-        from utils.motion_utils import compute_velocity_jacobian_quantities
-        
         N = self.get_xyz.shape[0]
         
         # Step 1: 计算物理量
@@ -911,19 +909,16 @@ class GaussianModel:
         )
         
         # Step 3: 与原有掩码合并（OR 操作）
-        if existing_clone_mask is not None:
-            final_clone_mask = torch.logical_or(physics_clone_mask, existing_clone_mask)
-            print(f"  Combined clone mask: physics={physics_clone_mask.sum().item()}, "
-                  f"existing={existing_clone_mask.sum().item()}, final={final_clone_mask.sum().item()}")
-        else:
-            final_clone_mask = physics_clone_mask
+        clone_qualifiers = torch.max(self.get_scaling, dim=1).values <= args.dense*extent
+        split_qualifiers = torch.max(self.get_scaling, dim=1).values > args.dense*extent
         
-        if existing_split_mask is not None:
-            final_split_mask = torch.logical_or(physics_split_mask, existing_split_mask)
-            print(f"  Combined split mask: physics={physics_split_mask.sum().item()}, "
-                  f"existing={existing_split_mask.sum().item()}, final={final_split_mask.sum().item()}")
-        else:
-            final_split_mask = physics_split_mask
+        final_clone_mask = torch.logical_and(physics_clone_mask, clone_qualifiers)
+        print(f"  Combined clone mask: div={physics_clone_mask.sum().item()}, "
+                f"larger={clone_qualifiers.sum().item()}, clone={final_clone_mask.sum().item()}")
+        
+        final_split_mask = torch.logical_and(physics_split_mask, split_qualifiers)
+        print(f"  Combined split mask: cur={physics_split_mask.sum().item()}, "
+                f"smaller={split_qualifiers.sum().item()}, split={final_split_mask.sum().item()}")
         
         # Step 4: 执行物理驱动的致密化
         # 注意：只对物理触发的点使用特殊初始化策略

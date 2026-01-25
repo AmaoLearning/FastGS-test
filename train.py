@@ -256,7 +256,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                     
                     # 生成 velocity_loss 掩码并传入 densification
                     velocity_mask = None
-                    if dataset.use_velocity:
+                    if dataset.use_velocity and iteration >= opt.warm_up:
                         velocity_mask = gaussians.get_velocity_loss_mask(
                             opt.velocity_loss_thresh, 
                             adaptive_percentile=opt.velocity_loss_percentile
@@ -272,7 +272,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                                                 velocity_mask = velocity_mask)
                     
                     # 物理驱动致密化：基于散度和旋度
-                    if dataset.use_velocity and opt.use_physics_densify:
+                    if dataset.use_velocity and opt.use_physics_densify and iteration >= opt.warm_up:
                         N = gaussians.get_xyz.shape[0]
                         time_input = fid.unsqueeze(0).expand(N, -1)
                         gaussians.physics_densify(
