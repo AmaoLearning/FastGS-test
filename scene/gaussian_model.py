@@ -484,7 +484,7 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_dynamic_metrics)
 
-    def densify_and_prune_fastgs(self, max_screen_size, min_opacity, extent, radii, args, importance_score = None, pruning_score = None, velocity_mask = None):
+    def densify_and_prune_fastgs(self, max_screen_size, min_opacity, extent, radii, args, importance_score = None, pruning_score = None, velocity_mask = None, physics_clone_mask = None, physics_split_mask = None):
         
         ''' 
             Densification and Pruning based on FastGS criteria:
@@ -518,6 +518,15 @@ class GaussianModel:
             all_splits = torch.logical_and(all_splits, velocity_mask)
 
             print(f"With velocity_mask: {velocity_mask.sum().item()}, all_clones: {all_clones.sum().item()}, all_splits: {all_splits.sum().item()}")
+
+        # 如果提供了 physics masks，则与原有掩码做与运算
+        if physics_clone_mask is not None:
+            all_clones = torch.logical_and(all_clones, physics_clone_mask)
+            print(f"With physics_clone_mask: {physics_clone_mask.sum().item()}, all_clones: {all_clones.sum().item()}")
+
+        if physics_split_mask is not None:
+            all_splits = torch.logical_and(all_splits, physics_split_mask)
+            print(f"With physics_split_mask: {physics_split_mask.sum().item()}, all_splits: {all_splits.sum().item()}")
 
         # This is our multi-view consisent metric for densification
         # We use this metric to further filter the candidates for densification, which is similar to taming 3dgs.
@@ -868,7 +877,7 @@ class GaussianModel:
         print(f"  [Physics Split] Split {selected_pts_mask.sum().item()} gaussians "
               f"into {N_split * selected_pts_mask.sum().item()} with scale_factor={scale_factor}")
     
-    def physics_densify(
+    def get_physics_masks(
         self,
         velocity_net,
         times: torch.Tensor,
@@ -876,29 +885,28 @@ class GaussianModel:
         extent: float
     ):
         """
-        完整的物理驱动致密化流程。
-        
-        将物理 Mask 与原有的 view_space_grad Mask 进行逻辑或（OR）合并。
+        计算物理掩码（散度/旋度），作为 densification 过滤条件。
+        不执行独立的致密化操作。
         
         Args:
             velocity_net: 速度场网络
             times: 当前时间 [N, 1]
             args: 优化参数
             extent: 场景范围
-            existing_clone_mask: 原有的克隆掩码（来自 view-space gradient）
-            existing_split_mask: 原有的分裂掩码（来自 view-space gradient）
+        Returns:
+            physics_clone_mask: bool tensor [N]
+            physics_split_mask: bool tensor [N]
         """
+        from utils.motion_utils import compute_velocity_jacobian_quantities
+
         N = self.get_xyz.shape[0]
-        
-        # Step 1: 计算物理量
         print(f"\n[Physics Densification] Computing divergence and curl for {N} gaussians...")
-        divergence, curl_magnitude, velocity = compute_velocity_jacobian_quantities(
-            velocity_net, 
-            self.get_xyz.detach(), 
+        divergence, curl_magnitude, _ = compute_velocity_jacobian_quantities(
+            velocity_net,
+            self.get_xyz.detach(),
             times.detach()
         )
-        
-        # Step 2: 计算物理掩码
+
         physics_clone_mask, physics_split_mask = self.compute_physics_densify_masks(
             divergence, curl_magnitude,
             min_opacity=0.005,
@@ -907,30 +915,5 @@ class GaussianModel:
             split_scale_limit_factor=args.dense,
             extent=extent
         )
-        
-        # Step 3: 与原有掩码合并（OR 操作）
-        clone_qualifiers = torch.max(self.get_scaling, dim=1).values <= args.dense*extent
-        split_qualifiers = torch.max(self.get_scaling, dim=1).values > args.dense*extent
-        
-        final_clone_mask = torch.logical_and(physics_clone_mask, clone_qualifiers)
-        print(f"  Combined clone mask: div={physics_clone_mask.sum().item()}, "
-                f"larger={clone_qualifiers.sum().item()}, clone={final_clone_mask.sum().item()}")
-        
-        final_split_mask = torch.logical_and(physics_split_mask, split_qualifiers)
-        print(f"  Combined split mask: cur={physics_split_mask.sum().item()}, "
-                f"smaller={split_qualifiers.sum().item()}, split={final_split_mask.sum().item()}")
-        
-        # Step 4: 执行物理驱动的致密化
-        # 注意：只对物理触发的点使用特殊初始化策略
-        self.physics_driven_clone(
-            physics_clone_mask, 
-            velocity, 
-            eta=args.physics_clone_eta
-        )
-        self.physics_driven_split(
-            physics_split_mask, 
-            scale_factor=args.physics_split_scale_factor
-        )
-        
-        torch.cuda.empty_cache()
-        print(f"[Physics Densification] Done. New total: {self.get_xyz.shape[0]} gaussians\n")
+
+        return physics_clone_mask, physics_split_mask

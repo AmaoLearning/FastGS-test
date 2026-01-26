@@ -36,6 +36,17 @@ def readImages(renders_dir, gt_dir):
     return renders, gts, image_names
 
 
+def read_num_gaussians(scene_dir: str, iteration: int = 30000):
+    num_path = Path(scene_dir) / "point_cloud" / f"iteration_{iteration}" / "num_gaussians.txt"
+    try:
+        if num_path.exists():
+            with open(num_path, "r", encoding="utf-8") as f:
+                return int(f.read().strip())
+    except Exception as exc:
+        print(f"Warning: failed to read num_gaussians from {num_path}: {exc}")
+    return None
+
+
 def evaluate(model_paths):
     full_dict = {}
     per_view_dict = {}
@@ -50,6 +61,11 @@ def evaluate(model_paths):
             per_view_dict[scene_dir] = {}
             full_dict_polytopeonly[scene_dir] = {}
             per_view_dict_polytopeonly[scene_dir] = {}
+
+            num_gaussians = read_num_gaussians(scene_dir)
+            if num_gaussians is not None:
+                print(f"  Num Gaussians: {num_gaussians}")
+                full_dict[scene_dir]["num_gaussians"] = num_gaussians
 
             test_dir = Path(scene_dir) / "test"
 
