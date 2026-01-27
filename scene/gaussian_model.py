@@ -714,6 +714,8 @@ class GaussianModel:
         min_opacity: float = 0.005,
         div_percentile: float = 95,
         curl_percentile: float = 95,
+        div_threshold: float = -1,
+        curl_threshold: float = -1,
         split_scale_limit_factor: float = 0.01,
         extent: float = 1.0
     ):
@@ -724,8 +726,10 @@ class GaussianModel:
             divergence: 散度 [N, 1]
             curl_magnitude: 旋度模长 [N, 1]
             min_opacity: 最小不透明度阈值
-            div_percentile: 散度阈值百分位数 (0-100)
-            curl_percentile: 旋度阈值百分位数 (0-100)
+            div_percentile: 散度阈值百分位数 (0-100)，当 div_thresh < 0 时使用
+            curl_percentile: 旋度阈值百分位数 (0-100)，当 curl_thresh < 0 时使用
+            div_thresh: 散度硬阈值，>= 0 时使用硬阈值
+            curl_thresh: 旋度硬阈值，>= 0 时使用硬阈值
             split_scale_limit_factor: Split 时的尺度限制因子
             extent: 场景范围
         
@@ -741,9 +745,32 @@ class GaussianModel:
         opacity = self.get_opacity.squeeze()  # [N]
         max_scale = self.get_scaling.max(dim=1).values  # [N]
         
-        # 计算动态阈值
-        div_threshold = torch.quantile(div, div_percentile / 100.0).item()
-        curl_threshold = torch.quantile(curl, curl_percentile / 100.0).item()
+        # 打印分布统计信息，方便设置硬阈值
+        print(f"\n[Divergence Distribution]")
+        print(f"  Total Gaussians: {N}")
+        print(f"  Min: {div.min().item():.6f}, Max: {div.max().item():.6f}")
+        print(f"  Mean: {div.mean().item():.6f}, Std: {div.std().item():.6f}")
+        percentiles = [25, 50, 75, 90, 95, 99]
+        for p in percentiles:
+            val = torch.quantile(div, p / 100.0).item()
+            print(f"  {p}th percentile: {val:.6f}")
+        
+        print(f"\n[Curl Distribution]")
+        print(f"  Min: {curl.min().item():.6f}, Max: {curl.max().item():.6f}")
+        print(f"  Mean: {curl.mean().item():.6f}, Std: {curl.std().item():.6f}")
+        for p in percentiles:
+            val = torch.quantile(curl, p / 100.0).item()
+            print(f"  {p}th percentile: {val:.6f}")
+        
+        # 计算阈值：优先使用硬阈值，否则使用百分位数
+        if div_percentile >= 0:
+            div_threshold = torch.quantile(div, div_percentile / 100.0).item()
+            print(f"\n  Using percentile div_threshold: {div_threshold:.6f} (p{div_percentile})")
+
+        if curl_percentile >= 0:
+            curl_threshold = torch.quantile(curl, curl_percentile / 100.0).item()
+            print(f"  Using percentile curl_threshold: {curl_threshold:.6f} (p{curl_percentile})")
+        
         split_scale_limit = split_scale_limit_factor * extent
         
         # Clone Mask: 高散度（膨胀区域）+ 不透明度足够
@@ -758,13 +785,12 @@ class GaussianModel:
         large_enough = max_scale > split_scale_limit
         split_mask = torch.logical_and(high_curl, large_enough)
         
-        # 打印统计信息
+        # 打印掩码统计信息
         print(f"\n[Physics Densification Masks]")
-        print(f"  Divergence: threshold={div_threshold:.6f} (p{div_percentile}), "
-              f"high_div={high_div.sum().item()} ({100*high_div.sum().item()/N:.2f}%)")
-        print(f"  Curl: threshold={curl_threshold:.6f} (p{curl_percentile}), "
-              f"high_curl={high_curl.sum().item()} ({100*high_curl.sum().item()/N:.2f}%)")
-        print(f"  Clone candidates: {clone_mask.sum().item()}, Split candidates: {split_mask.sum().item()}")
+        print(f"  high_div (div > {div_threshold:.6f}): {high_div.sum().item()} ({100*high_div.sum().item()/N:.2f}%)")
+        print(f"  high_curl (curl > {curl_threshold:.6f}): {high_curl.sum().item()} ({100*high_curl.sum().item()/N:.2f}%)")
+        print(f"  Clone candidates (high_div AND opacity>{min_opacity}): {clone_mask.sum().item()}")
+        print(f"  Split candidates (high_curl AND scale>{split_scale_limit:.6f}): {split_mask.sum().item()}")
         
         return clone_mask, split_mask
     
@@ -912,6 +938,8 @@ class GaussianModel:
             min_opacity=0.005,
             div_percentile=args.div_percentile,
             curl_percentile=args.curl_percentile,
+            div_thresh=args.div_thresh,
+            curl_thresh=args.curl_thresh,
             split_scale_limit_factor=args.dense,
             extent=extent
         )

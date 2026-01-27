@@ -131,8 +131,10 @@ class OptimizationParams(ParamGroup):
         
         # physics-driven densification (物理驱动致密化)
         self.use_physics_densify = False  # 是否启用物理驱动致密化
-        self.div_percentile = 95  # 散度阈值百分位数，高于此值触发 Clone
-        self.curl_percentile = 95  # 旋度阈值百分位数，高于此值触发 Split
+        self.div_percentile = -1  # 散度阈值百分位数，高于此值触发 Clone
+        self.curl_percentile = -1  # 旋度阈值百分位数，高于此值触发 Split
+        self.div_thresh = 0  # 散度硬阈值，>= 0 时使用硬阈值，< 0 时使用百分位数
+        self.curl_thresh = 0  # 旋度硬阈值，>= 0 时使用硬阈值，< 0 时使用百分位数
         self.physics_clone_eta = 0.2  # Clone 时沿速度反方向偏移的系数
         self.physics_split_scale_factor = 2.0  # Split 时缩放因子
         super().__init__(parser, "Optimization Parameters")
