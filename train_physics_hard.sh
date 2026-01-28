@@ -8,7 +8,7 @@ python train.py -s /root/datasets/Neu3D/flame_salmon_1 -m output_phy/flame_salmo
 
 python render.py -m output_phy/coffee_martini_hard --mode render
 python render.py -m output_phy/cook_spinach_hard --mode render
-python render.py -m output_phy/cut_roasted_beef_hard --mode render
+python render.py -m output_phy/cut_roasted_beef_hard --mode rende   r
 python render.py -m output_phy/flame_steak_hard --mode render
 python render.py -m output_phy/sear_steak_hard --mode render
 python render.py -m output_phy/flame_salmon_1_hard --mode render

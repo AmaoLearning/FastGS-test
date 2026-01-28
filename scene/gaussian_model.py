@@ -938,8 +938,8 @@ class GaussianModel:
             min_opacity=0.005,
             div_percentile=args.div_percentile,
             curl_percentile=args.curl_percentile,
-            div_thresh=args.div_thresh,
-            curl_thresh=args.curl_thresh,
+            div_threshold=args.div_thresh,
+            curl_threshold=args.curl_thresh,
             split_scale_limit_factor=args.dense,
             extent=extent
         )
