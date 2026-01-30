@@ -256,24 +256,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                     
                     # 生成 velocity_loss 掩码并传入 densification
                     velocity_mask = None
-                    if dataset.use_velocity and iteration >= opt.warm_up:
-                        velocity_mask = gaussians.get_velocity_loss_mask(
-                            opt.velocity_loss_thresh, 
-                            adaptive_percentile=opt.velocity_loss_percentile
-                        )
-
                     # 生成物理掩码（散度/旋度）并作为过滤条件
                     physics_clone_mask = None
                     physics_split_mask = None
-                    if dataset.use_velocity and opt.use_physics_densify and iteration >= opt.warm_up:
-                        N = gaussians.get_xyz.shape[0]
-                        time_input = fid.unsqueeze(0).expand(N, -1)
-                        physics_clone_mask, physics_split_mask = gaussians.get_physics_masks(
-                            velocity_net=velocity,
-                            times=time_input,
-                            args=opt,
-                            extent=scene.cameras_extent
-                        )
+                    if dataset.use_velocity and iteration >= opt.warm_up:
+                        # velocity_mask = gaussians.get_velocity_loss_mask(
+                        #     opt.velocity_loss_thresh, 
+                        #     adaptive_percentile=opt.velocity_loss_percentile
+                        # )
+
+                        if opt.use_physics_densify:
+                            N = gaussians.get_xyz.shape[0]
+                            time_input = fid.unsqueeze(0).expand(N, -1)
+                            physics_clone_mask, physics_split_mask = gaussians.get_physics_masks(
+                                velocity_net=velocity,
+                                times=time_input,
+                                args=opt,
+                                extent=scene.cameras_extent
+                            )
                     
                     gaussians.densify_and_prune_fastgs(max_screen_size = size_threshold, 
                                                 min_opacity = 0.005, 

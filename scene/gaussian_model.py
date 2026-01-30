@@ -762,7 +762,7 @@ class GaussianModel:
             val = torch.quantile(curl, p / 100.0).item()
             print(f"  {p}th percentile: {val:.6f}")
         
-        # 计算阈值：优先使用硬阈值，否则使用百分位数
+        # 计算阈值：优先使用百分位数
         if div_percentile >= 0:
             div_threshold = torch.quantile(div, div_percentile / 100.0).item()
             print(f"\n  Using percentile div_threshold: {div_threshold:.6f} (p{div_percentile})")
