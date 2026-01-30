@@ -260,10 +260,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                     physics_clone_mask = None
                     physics_split_mask = None
                     if dataset.use_velocity and iteration >= opt.warm_up:
-                        # velocity_mask = gaussians.get_velocity_loss_mask(
-                        #     opt.velocity_loss_thresh, 
-                        #     adaptive_percentile=opt.velocity_loss_percentile
-                        # )
+                        velocity_mask = gaussians.get_velocity_loss_mask(
+                            opt.velocity_loss_thresh, 
+                            adaptive_percentile=opt.velocity_loss_percentile
+                        )
 
                         if opt.use_physics_densify:
                             N = gaussians.get_xyz.shape[0]
