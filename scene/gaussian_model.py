@@ -530,7 +530,7 @@ class GaussianModel:
 
         # This is our multi-view consisent metric for densification
         # We use this metric to further filter the candidates for densification, which is similar to taming 3dgs.
-        metric_mask = importance_score > 5
+        metric_mask = importance_score > -100
 
         _all_clones = torch.logical_and(metric_mask, all_clones)
         _all_splits = torch.logical_and(metric_mask, all_splits)
