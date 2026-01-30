@@ -912,21 +912,34 @@ class GaussianModel:
     ):
         """
         计算物理掩码（散度/旋度），作为 densification 过滤条件。
-        不执行独立的致密化操作。
+        散度掩码和旋度掩码可通过 args.use_div_mask 和 args.use_curl_mask 独立控制。
         
         Args:
             velocity_net: 速度场网络
             times: 当前时间 [N, 1]
-            args: 优化参数
+            args: 优化参数，需包含:
+                - use_div_mask: 是否使用散度掩码（控制 Clone）
+                - use_curl_mask: 是否使用旋度掩码（控制 Split）
+                - div_percentile, curl_percentile, div_thresh, curl_thresh, dense 等
             extent: 场景范围
         Returns:
-            physics_clone_mask: bool tensor [N]
-            physics_split_mask: bool tensor [N]
+            physics_clone_mask: bool tensor [N]，如果 use_div_mask=False 则返回 None
+            physics_split_mask: bool tensor [N]，如果 use_curl_mask=False 则返回 None
         """
         from utils.motion_utils import compute_velocity_jacobian_quantities
 
+        # 检查是否需要计算任一掩码
+        use_div_mask = getattr(args, 'use_div_mask', True)
+        use_curl_mask = getattr(args, 'use_curl_mask', True)
+        
+        if not use_div_mask and not use_curl_mask:
+            print("\n[Physics Densification] Both div_mask and curl_mask disabled, skipping computation.")
+            return None, None
+
         N = self.get_xyz.shape[0]
         print(f"\n[Physics Densification] Computing divergence and curl for {N} gaussians...")
+        print(f"  use_div_mask={use_div_mask}, use_curl_mask={use_curl_mask}")
+        
         divergence, curl_magnitude, _ = compute_velocity_jacobian_quantities(
             velocity_net,
             self.get_xyz.detach(),
@@ -943,5 +956,13 @@ class GaussianModel:
             split_scale_limit_factor=args.dense,
             extent=extent
         )
+
+        # 根据参数决定是否返回对应掩码
+        if not use_div_mask:
+            physics_clone_mask = None
+            print("  [Info] Divergence mask disabled, clone will not be filtered by physics.")
+        if not use_curl_mask:
+            physics_split_mask = None
+            print("  [Info] Curl mask disabled, split will not be filtered by physics.")
 
         return physics_clone_mask, physics_split_mask

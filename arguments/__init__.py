@@ -131,6 +131,8 @@ class OptimizationParams(ParamGroup):
         
         # physics-driven densification (物理驱动致密化)
         self.use_physics_densify = False  # 是否启用物理驱动致密化
+        self.use_div_mask = False  # 是否使用散度掩码（控制 Clone），需配合 use_physics_densify 使用，store_true
+        self.use_curl_mask = False  # 是否使用旋度掩码（控制 Split），需配合 use_physics_densify 使用，store_true
         self.div_percentile = -1  # 散度阈值百分位数，高于此值触发 Clone
         self.curl_percentile = -1  # 旋度阈值百分位数，高于此值触发 Split
         self.div_thresh = 0  # 散度硬阈值，>= 0 时使用硬阈值，< 0 时使用百分位数
