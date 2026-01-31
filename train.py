@@ -259,6 +259,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                     # 生成物理掩码（散度/旋度）并作为过滤条件
                     physics_clone_mask = None
                     physics_split_mask = None
+                    velocity_net_for_clone = None
+                    time_input = None
                     if dataset.use_velocity and iteration >= opt.warm_up:
                         velocity_mask = gaussians.get_velocity_loss_mask(
                             opt.velocity_loss_thresh, 
@@ -274,6 +276,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                                 args=opt,
                                 extent=scene.cameras_extent
                             )
+                            velocity_net_for_clone = velocity
                     
                     gaussians.densify_and_prune_fastgs(max_screen_size = size_threshold, 
                                                 min_opacity = 0.005, 
@@ -284,7 +287,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                                                 pruning_score = pruning_score,
                                                 velocity_mask = velocity_mask,
                                                 physics_clone_mask = physics_clone_mask,
-                                                physics_split_mask = physics_split_mask)
+                                                physics_split_mask = physics_split_mask,
+                                                velocity_net = velocity_net_for_clone,
+                                                times = time_input)
 
                 if iteration % opt.opacity_reset_interval == 0 or (
                         dataset.white_background and iteration == opt.densify_from_iter):

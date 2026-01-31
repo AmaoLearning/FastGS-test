@@ -470,10 +470,46 @@ class GaussianModel:
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
 
-    def densify_and_clone_fastgs(self, metric_mask, filter):
+    def densify_and_clone_fastgs(self, metric_mask, filter, velocity_net=None, times=None, eta=0.2):
+        """
+        Fast Gaussian Splatting densification with physics-driven cloning.
+        
+        Args:
+            metric_mask: Multi-view consistency mask
+            filter: Additional filter condition (e.g., all_clones)
+            velocity_net: Velocity field network (optional, for physics-driven cloning)
+            times: Time tensor [N, 1] (optional, required when velocity_net is provided)
+            eta: Offset coefficient for physics-driven cloning (default: 0.2)
+        """
         selected_pts_mask = torch.logical_and(metric_mask, filter)
         
-        new_xyz = self._xyz[selected_pts_mask]
+        # 如果提供了速度网络，使用物理驱动的克隆方式
+        if velocity_net is not None and times is not None:
+            if selected_pts_mask.sum() == 0:
+                return
+            
+            # 获取选中高斯的属性
+            old_xyz = self._xyz[selected_pts_mask]
+            
+            # 计算速度
+            with torch.no_grad():
+                velocity = velocity_net(old_xyz.detach(), times[selected_pts_mask].detach())
+            
+            mean_scale = self.get_scaling[selected_pts_mask].mean(dim=1, keepdim=True)  # [M, 1]
+            
+            # 计算速度单位向量，避免除零
+            v_norm = torch.norm(velocity, dim=-1, keepdim=True) + 1e-8  # [M, 1]
+            v_direction = velocity / v_norm  # [M, 3]
+            
+            # 新位置：沿速度反方向偏移，填补物体移动后留下的空缺
+            new_xyz = old_xyz - eta * mean_scale * v_direction
+            
+            print(f"  [Physics-Driven Clone] Cloning {selected_pts_mask.sum().item()} gaussians with upstream offset (eta={eta})")
+        else:
+            # 使用原始克隆方式（直接复制位置）
+            new_xyz = self._xyz[selected_pts_mask]
+        
+        # 复制其他属性
         new_features_dc = self._features_dc[selected_pts_mask]
         new_features_rest = self._features_rest[selected_pts_mask]
         new_opacities = self._opacity[selected_pts_mask]
@@ -484,7 +520,7 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_dynamic_metrics)
 
-    def densify_and_prune_fastgs(self, max_screen_size, min_opacity, extent, radii, args, importance_score = None, pruning_score = None, velocity_mask = None, physics_clone_mask = None, physics_split_mask = None):
+    def densify_and_prune_fastgs(self, max_screen_size, min_opacity, extent, radii, args, importance_score = None, pruning_score = None, velocity_mask = None, physics_clone_mask = None, physics_split_mask = None, velocity_net = None, times = None):
         
         ''' 
             Densification and Pruning based on FastGS criteria:
@@ -536,7 +572,7 @@ class GaussianModel:
         _all_splits = torch.logical_and(metric_mask, all_splits)
         print(f"With metric_mask: {metric_mask.sum().item()}, all_clones: {_all_clones.sum().item()}, all_splits: {_all_splits.sum().item()}\n")
 
-        self.densify_and_clone_fastgs(metric_mask, all_clones)
+        self.densify_and_clone_fastgs(metric_mask, all_clones, velocity_net=velocity_net, times=times, eta=args.clone_eta if hasattr(args, 'clone_eta') else 0.2)
         self.densify_and_split_fastgs(metric_mask, all_splits)
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
