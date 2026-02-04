@@ -668,7 +668,7 @@ class GaussianModel:
             below_thresh = (valid_losses < threshold).sum().item()
             print(f"  Gaussians below threshold: {below_thresh} ({100*below_thresh/valid_losses.shape[0]:.2f}%)\n")
         
-        return (avg_velocity_loss > threshold)
+        return (avg_velocity_loss >= threshold)
 
     def update_dynamic_metrics(self, current_v, decay=0.99):
         """更新动态指标：使用 Leaky Max (Decaying Peak) 方法
@@ -703,7 +703,7 @@ class GaussianModel:
                 print(f"  [Adaptive Dynamic Threshold] Using {adaptive_percentile}th percentile: {dynamic_thresh:.6f}")
         
         # 动态掩码：速度大于阈值
-        is_dynamic = dynamic_norm > dynamic_thresh
+        is_dynamic = dynamic_norm >= dynamic_thresh
         
         # 梯度掩码：梯度绝对值大于阈值
         grads_abs = self.xyz_gradient_accum_abs / self.denom
@@ -811,14 +811,14 @@ class GaussianModel:
         
         # Clone Mask: 高散度（膨胀区域）+ 不透明度足够
         # 物理解释：膨胀导致空隙，需要克隆填补
-        high_div = div > div_threshold
-        sufficient_opacity = opacity > min_opacity
+        high_div = div >= div_threshold
+        sufficient_opacity = opacity >= min_opacity
         clone_mask = torch.logical_and(high_div, sufficient_opacity)
         
         # Split Mask: 高旋度（湍流区域）+ 高斯足够大
         # 物理解释：非线性形变导致单一高斯拟合失效，需要分裂细化
-        high_curl = curl > curl_threshold
-        large_enough = max_scale > split_scale_limit
+        high_curl = curl >= curl_threshold
+        large_enough = max_scale >= split_scale_limit
         split_mask = torch.logical_and(high_curl, large_enough)
         
         # 打印掩码统计信息
