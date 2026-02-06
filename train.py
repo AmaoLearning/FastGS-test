@@ -121,7 +121,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             time_input = fid.unsqueeze(0).expand(N, -1)
 
             ast_noise = 0 if dataset.is_blender else torch.randn(1, 1, device='cuda').expand(N, -1) * time_interval * smooth_term(iteration)
-            
+
             # 如果启用动态掩码，只对动态高斯计算 deform
             if opt.use_dynamic_mask and iteration % opt.velocity_interval != 0:
                 dynamic_mask = gaussians.get_dynamic_mask(
@@ -158,7 +158,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                     gaussians.update_dynamic_metrics(current_v.detach(), decay=opt.dynamic_decay)
                 
                 # 计算每个高斯的 velocity loss (用于累积统计)
-                velocity_diff = _d_xyz - d_xyz
+                # 可选：阻断梯度从 velocity loss 传播到形变场（deform）
+                if opt.detach_velocity_loss_from_deform:
+                    velocity_diff = (_d_xyz - d_xyz).detach()
+                else:
+                    velocity_diff = _d_xyz - d_xyz
                 velocity_pred = current_v * time_interval
                 per_gaussian_velocity_loss = ((velocity_diff - velocity_pred) ** 2).mean(dim=-1, keepdim=True)
                 

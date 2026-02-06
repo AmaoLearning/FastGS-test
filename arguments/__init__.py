@@ -117,6 +117,7 @@ class OptimizationParams(ParamGroup):
         self.velocity_interval = 10
         self.velocity_loss_thresh = 0.00003  # velocity loss 阈值
         self.velocity_loss_percentile = 30  # 自适应阈值百分比，-1表示使用固定阈值，0-100表示使用自适应阈值（如50表示取中位数作为阈值）
+        self.detach_velocity_loss_from_deform = True  # 是否阻断 velocity loss 对形变场的梯度传播
         
         # velocity temporal smoothness
         self.use_velocity_smooth = False  # 是否启用时间平滑正则化
