@@ -123,7 +123,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             ast_noise = 0 if dataset.is_blender else torch.randn(1, 1, device='cuda').expand(N, -1) * time_interval * smooth_term(iteration)
 
             # 如果启用动态掩码，只对动态高斯计算 deform
-            if opt.use_dynamic_mask and iteration % opt.velocity_interval != 0:
+            if opt.use_dynamic_mask and iteration >= 2*opt.warm_up and iteration % opt.velocity_interval != 0:
                 dynamic_mask = gaussians.get_dynamic_mask(
                     opt.dynamic_thresh, 
                     opt.grad_abs_thresh, 
