@@ -253,60 +253,71 @@ __device__ inline uint32_t processTiles(
 	return tiles_count;
 }
 
-__device__ inline void duplicateToTilesTouched(
+__device__ inline uint32_t duplicateToTilesTouched(
     const float2 p, const float4 con_o, const dim3 grid, const float mult,
     uint32_t idx, uint32_t off, float depth,
     uint64_t* gaussian_keys_unsorted,
     uint32_t* gaussian_values_unsorted)
 {
-	float det = (con_o.x * con_o.z - con_o.y * con_o.y);
-	if (det == 0.0f) return;
-
-	float inv_det = 1.0f / det;
-	float a11 = con_o.z * inv_det;
-	float a22 = con_o.x * inv_det;
-	float a12 = -con_o.y * inv_det;
-
-	float threshold = mult * mult;
+	// Calculate discriminant
 	float disc = con_o.y * con_o.y - con_o.x * con_o.z;
-	float t = threshold * det;
 
-	float sx = sqrtf(a11 * threshold);
-	float sy = sqrtf(a22 * threshold);
-
-	float2 bbox_min = {p.x - sx, p.y - sy};
-	float2 bbox_max = {p.x + sx, p.y + sy};
-
-	int2 rect_min = {
-		max((int)0, min((int)grid.x, (int)(bbox_min.x / BLOCK_X))),
-		max((int)0, min((int)grid.y, (int)(bbox_min.y / BLOCK_Y)))
-	};
-	int2 rect_max = {
-		max((int)0, min((int)grid.x, (int)(bbox_max.x / BLOCK_X) + 1)),
-		max((int)0, min((int)grid.y, (int)(bbox_max.y / BLOCK_Y) + 1))
-	};
-
-	float2 bbox_argmin, bbox_argmax;
-	float min_power = 0.0f;
-	float max_power = 0.0f;
-
-	if (disc >= 0) {
-		float sq = sqrtf(disc);
-		float denom_inv = 1.0f / con_o.x;
-		bbox_argmin = {p.x, p.y + (-con_o.y - sq) * denom_inv * 1.0f};
-		bbox_argmax = {p.x, p.y + (-con_o.y + sq) * denom_inv * 1.0f};
-	} else {
-		bbox_argmin = {p.x, p.y};
-		bbox_argmax = {p.x, p.y};
+	// If ill-formed ellipse, return 0
+	if (con_o.x <= 0 || con_o.z <= 0 || disc >= 0) {
+		return 0;
 	}
 
-	bool use_y = (rect_max.x - rect_min.x) <= (rect_max.y - rect_min.y);
+	// Threshold: opacity * Gaussian = 1 / 255
+	float t = 2.0f * log(con_o.w * 255.0f);
+	t = mult * t;
 
-	processTiles(con_o, disc, t, p,
-		bbox_min, bbox_max, bbox_argmin, bbox_argmax,
-		rect_min, rect_max, grid, use_y,
+	float x_term = sqrt(-(con_o.y * con_o.y * t) / (disc * con_o.x));
+	x_term = (con_o.y < 0) ? x_term : -x_term;
+	float y_term = sqrt(-(con_o.y * con_o.y * t) / (disc * con_o.z));
+	y_term = (con_o.y < 0) ? y_term : -y_term;
+
+	float2 bbox_argmin = { p.y - y_term, p.x - x_term };
+	float2 bbox_argmax = { p.y + y_term, p.x + x_term };
+
+	float2 bbox_min = {
+		computeEllipseIntersection(con_o, disc, t, p, true, bbox_argmin.x).x,
+		computeEllipseIntersection(con_o, disc, t, p, false, bbox_argmin.y).x
+	};
+	float2 bbox_max = {
+		computeEllipseIntersection(con_o, disc, t, p, true, bbox_argmax.x).y,
+		computeEllipseIntersection(con_o, disc, t, p, false, bbox_argmax.y).y
+	};
+
+	// Rectangular tile extent of ellipse
+	int2 rect_min = {
+		max(0, min((int)grid.x, (int)(bbox_min.x / BLOCK_X))),
+		max(0, min((int)grid.y, (int)(bbox_min.y / BLOCK_Y)))
+	};
+	int2 rect_max = {
+		max(0, min((int)grid.x, (int)(bbox_max.x / BLOCK_X + 1))),
+		max(0, min((int)grid.y, (int)(bbox_max.y / BLOCK_Y + 1)))
+	};
+
+	int y_span = rect_max.y - rect_min.y;
+	int x_span = rect_max.x - rect_min.x;
+
+	// If no tiles are touched, return 0
+	if (y_span * x_span == 0) {
+		return 0;
+	}
+
+	// If fewer y tiles, loop over y slices else loop over x slices
+	bool isY = y_span < x_span;
+	return processTiles(
+		con_o, disc, t, p,
+		bbox_min, bbox_max,
+		bbox_argmin, bbox_argmax,
+		rect_min, rect_max,
+		grid, isY,
 		idx, off, depth,
-		gaussian_keys_unsorted, gaussian_values_unsorted);
+		gaussian_keys_unsorted,
+		gaussian_values_unsorted
+	);
 }
 
 #define CHECK_CUDA(A, debug) \
