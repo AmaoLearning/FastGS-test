@@ -625,17 +625,27 @@ def readPlenopticVideoDataset(path, eval, num_images, hold_id=[0]):
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
     ply_path = os.path.join(path, 'points3D.ply')
+
+    # 优先使用 COLMAP SfM 点云（比随机点云质量更高）
+    colmap_ply = os.path.join(path, 'sparse', '0', 'points3D.ply')
+    colmap_bin = os.path.join(path, 'sparse', '0', 'points3D.bin')
     if not os.path.exists(ply_path):
-        num_pts = 100_000
-        print(f"Generating random point cloud ({num_pts})...")
-
-        # We create random points inside the bounds of the synthetic Blender scenes
-        xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
-        shs = np.random.random((num_pts, 3)) / 255.0
-        pcd = BasicPointCloud(points=xyz, colors=SH2RGB(
-            shs), normals=np.zeros((num_pts, 3)))
-
-        storePly(ply_path, xyz, SH2RGB(shs) * 255)
+        if os.path.exists(colmap_ply):
+            import shutil
+            shutil.copy2(colmap_ply, ply_path)
+            print(f"[INFO] Using COLMAP point cloud from {colmap_ply}")
+        elif os.path.exists(colmap_bin):
+            print(f"[INFO] Converting COLMAP point cloud from {colmap_bin}")
+            xyz, rgb, _ = read_points3D_binary(colmap_bin)
+            storePly(ply_path, xyz, rgb)
+        else:
+            num_pts = 100_000
+            print(f"Generating random point cloud ({num_pts})...")
+            xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
+            shs = np.random.random((num_pts, 3)) / 255.0
+            pcd = BasicPointCloud(points=xyz, colors=SH2RGB(
+                shs), normals=np.zeros((num_pts, 3)))
+            storePly(ply_path, xyz, SH2RGB(shs) * 255)
 
     try:
         pcd = fetchPly(ply_path)

@@ -42,7 +42,12 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
 
-        if os.path.exists(os.path.join(args.source_path, "sparse")):
+        if os.path.exists(os.path.join(args.source_path, "poses_bounds.npy")):
+            # poses_bounds.npy 是 Neu3D/LLFF 的标志文件，必须优先于 sparse/ 检测
+            # （Neu3D 数据集也包含 sparse/，但那仅用于 SfM 点云初始化，不包含训练帧）
+            print("Found poses_bounds.npy, assuming Neu3D/LLFF data set!")
+            scene_info = sceneLoadTypeCallbacks["plenopticVideo"](args.source_path, args.eval, 24)
+        elif os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
@@ -53,9 +58,6 @@ class Scene:
         elif os.path.exists(os.path.join(args.source_path, "dataset.json")):
             print("Found dataset.json file, assuming Nerfies data set!")
             scene_info = sceneLoadTypeCallbacks["nerfies"](args.source_path, args.eval)
-        elif os.path.exists(os.path.join(args.source_path, "poses_bounds.npy")):
-            print("Found poses_bounds.npy, assuming Neu3D/LLFF data set!")
-            scene_info = sceneLoadTypeCallbacks["plenopticVideo"](args.source_path, args.eval, 24)
         elif os.path.exists(os.path.join(args.source_path, "transforms.json")):
             print("Found calibration_full.json, assuming Dynamic-360 data set!")
             scene_info = sceneLoadTypeCallbacks["dynamic360"](args.source_path)
