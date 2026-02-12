@@ -562,7 +562,7 @@ def readCamerasFromNpy(path, npy_file, split, hold_id, num_images):
             flow_fwd = None
             flow_bwd = None
             if has_flow:
-                id_stem = Path(image_name).stem
+                id_stem = Path(image_name).stem  # e.g. "0000" from "0000.png"
                 flow_cam_dir = os.path.join(flow_root, cam_name)
                 fwd_path = os.path.join(flow_cam_dir, f"of_fwd_{id_stem}.npy")
                 bwd_path = os.path.join(flow_cam_dir, f"of_bwd_{id_stem}.npy")
@@ -570,6 +570,15 @@ def readCamerasFromNpy(path, npy_file, split, hold_id, num_images):
                     flow_fwd = np.load(fwd_path).astype(np.float32)   # [H, W, 2]
                 if os.path.exists(bwd_path):
                     flow_bwd = np.load(bwd_path).astype(np.float32)   # [H, W, 2]
+                # 第一帧的诊断日志
+                if idx == 0 and flow_fwd is None:
+                    print(f"[WARNING] Flow file not found: {fwd_path}")
+                    # 列出实际存在的文件以帮助诊断
+                    if os.path.isdir(flow_cam_dir):
+                        existing = sorted(os.listdir(flow_cam_dir))[:5]
+                        print(f"  Existing files in {flow_cam_dir}: {existing}")
+                    else:
+                        print(f"  Flow camera dir does not exist: {flow_cam_dir}")
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovX=FovX, FovY=FovY,
                                         image=image,

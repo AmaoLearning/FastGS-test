@@ -63,8 +63,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
     flow_loss_fn = None
     if dataset.use_flow_loss and dataset.use_velocity:
         # 检查训练集是否携带光流数据（通过数据集读取器附加在 Camera 对象上）
-        sample_cam = scene.getTrainCameras()[0]
-        if sample_cam.flow_fwd is not None:
+        # 注意：训练集已被 shuffle，第一个相机可能恰好是末帧（无前向光流），
+        # 因此需要检查是否存在任意一个携带光流的相机
+        any_has_flow = any(c.flow_fwd is not None for c in scene.getTrainCameras())
+        if any_has_flow:
             flow_helper = FlowRasterizerHelper(
                 bg_color=torch.zeros(2, device="cuda"),
                 scale_modifier=1.0,
