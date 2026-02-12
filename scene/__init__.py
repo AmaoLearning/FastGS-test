@@ -54,7 +54,7 @@ class Scene:
             print("Found dataset.json file, assuming Nerfies data set!")
             scene_info = sceneLoadTypeCallbacks["nerfies"](args.source_path, args.eval)
         elif os.path.exists(os.path.join(args.source_path, "poses_bounds.npy")):
-            print("Found calibration_full.json, assuming Neu3D data set!")
+            print("Found poses_bounds.npy, assuming Neu3D/LLFF data set!")
             scene_info = sceneLoadTypeCallbacks["plenopticVideo"](args.source_path, args.eval, 24)
         elif os.path.exists(os.path.join(args.source_path, "transforms.json")):
             print("Found calibration_full.json, assuming Dynamic-360 data set!")

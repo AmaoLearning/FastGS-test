@@ -100,9 +100,19 @@ def getNerfppNorm(cam_info):
     return {"translate": translate, "radius": radius}
 
 
-def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
+def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, source_path=None):
     cam_infos = []
     num_frames = len(cam_extrinsics)
+
+    # ── 检测光流目录 ──
+    has_flow = False
+    flow_root = None
+    if source_path is not None:
+        flow_root = os.path.join(source_path, 'optical_flow')
+        has_flow = os.path.isdir(flow_root)
+        if has_flow:
+            print(f"[INFO] Found optical flow at {flow_root}")
+
     for idx, key in enumerate(cam_extrinsics):
         sys.stdout.write('\r')
         # the exact output you're looking for:
@@ -137,8 +147,26 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
 
         # fid = int(image_name) / (num_frames - 1)
         fid = int(''.join(filter(str.isdigit, image_name))) / (num_frames - 1)
+
+        # ── 加载光流（如果存在）──
+        flow_fwd = None
+        flow_bwd = None
+        if has_flow:
+            extr_parts = Path(extr.name).parts
+            cam_name = extr_parts[0]  # "cam00"
+
+            id_stem = Path(extr.name).stem  # "0000"
+            flow_cam_dir = os.path.join(flow_root, cam_name) if cam_name else flow_root
+            fwd_path = os.path.join(flow_cam_dir, f"of_fwd_{id_stem}.npy")
+            bwd_path = os.path.join(flow_cam_dir, f"of_bwd_{id_stem}.npy")
+            if os.path.exists(fwd_path):
+                flow_fwd = np.load(fwd_path).astype(np.float32)   # [H, W, 2]
+            if os.path.exists(bwd_path):
+                flow_bwd = np.load(bwd_path).astype(np.float32)   # [H, W, 2]
+
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                              image_path=image_path, image_name=image_name, width=width, height=height, fid=fid)
+                              image_path=image_path, image_name=image_name, width=width, height=height, fid=fid,
+                              flow_fwd=flow_fwd, flow_bwd=flow_bwd)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos
@@ -186,7 +214,8 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
 
     reading_dir = "images" if images == None else images
     cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics,
-                                           images_folder=os.path.join(path, reading_dir))
+                                           images_folder=os.path.join(path, reading_dir),
+                                           source_path=path)
     cam_infos = sorted(cam_infos_unsorted.copy(), key=lambda x: x.image_name)
 
     if eval:
@@ -570,15 +599,6 @@ def readCamerasFromNpy(path, npy_file, split, hold_id, num_images):
                     flow_fwd = np.load(fwd_path).astype(np.float32)   # [H, W, 2]
                 if os.path.exists(bwd_path):
                     flow_bwd = np.load(bwd_path).astype(np.float32)   # [H, W, 2]
-                # 第一帧的诊断日志
-                if idx == 0 and flow_fwd is None:
-                    print(f"[WARNING] Flow file not found: {fwd_path}")
-                    # 列出实际存在的文件以帮助诊断
-                    if os.path.isdir(flow_cam_dir):
-                        existing = sorted(os.listdir(flow_cam_dir))[:5]
-                        print(f"  Existing files in {flow_cam_dir}: {existing}")
-                    else:
-                        print(f"  Flow camera dir does not exist: {flow_cam_dir}")
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovX=FovX, FovY=FovY,
                                         image=image,
