@@ -13,11 +13,13 @@ import torch
 from torch import nn
 import numpy as np
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix
+from utils.optic_flow_utils import forward_backward_consistency_check
 
 
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask, image_name, uid,
-                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device="cuda", fid=None, depth=None):
+                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device="cuda", fid=None, depth=None,
+                 flow_fwd=None, flow_bwd=None):
         super(Camera, self).__init__()
 
         self.uid = uid
@@ -40,6 +42,25 @@ class Camera(nn.Module):
         self.image_width = self.original_image.shape[2]
         self.image_height = self.original_image.shape[1]
         self.depth = torch.Tensor(depth).to(self.data_device) if depth is not None else None
+
+        # Optical flow: [2, H, W] stored as (u, v) channels-first
+        if flow_fwd is not None:
+            # input: [H, W, 2] numpy → [2, H, W] tensor
+            self.flow_fwd = torch.from_numpy(flow_fwd).permute(2, 0, 1).float().to(self.data_device)
+        else:
+            self.flow_fwd = None
+        if flow_bwd is not None:
+            self.flow_bwd = torch.from_numpy(flow_bwd).permute(2, 0, 1).float().to(self.data_device)
+        else:
+            self.flow_bwd = None
+
+        # Forward-Backward Consistency Mask: [1, H, W], 1.0 = 可信像素
+        if self.flow_fwd is not None and self.flow_bwd is not None:
+            self.flow_mask = forward_backward_consistency_check(
+                self.flow_fwd, self.flow_bwd, alpha1=0.01, alpha2=0.5,
+            )  # [1, H, W]
+        else:
+            self.flow_mask = None
 
         if gt_alpha_mask is not None:
             self.original_image *= gt_alpha_mask.to(self.data_device)
@@ -73,6 +94,12 @@ class Camera(nn.Module):
         self.full_proj_transform = self.full_proj_transform.to(data_device)
         self.camera_center = self.camera_center.to(data_device)
         self.fid = self.fid.to(data_device)
+        if self.flow_fwd is not None:
+            self.flow_fwd = self.flow_fwd.to(data_device)
+        if self.flow_bwd is not None:
+            self.flow_bwd = self.flow_bwd.to(data_device)
+        if self.flow_mask is not None:
+            self.flow_mask = self.flow_mask.to(data_device)
 
 
 class MiniCam:

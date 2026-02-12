@@ -34,6 +34,8 @@ except ImportError:
 import random
 from utils.fast_utils import compute_gaussian_score_fastgs, sampling_cameras
 from utils.motion_utils import VelocityNetwork, VelocityNetworkHash
+from utils.flow_rasterizer import FlowRasterizerHelper, OpticalFlowLoss
+from utils.optic_flow_utils import load_precomputed_flow
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: bool = False):
@@ -55,6 +57,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
 
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt, args)
+
+    # ── Optical Flow Loss Setup ──
+    flow_helper = None
+    flow_loss_fn = None
+    if dataset.use_flow_loss and dataset.use_velocity:
+        # 检查训练集是否携带光流数据（通过数据集读取器附加在 Camera 对象上）
+        sample_cam = scene.getTrainCameras()[0]
+        if sample_cam.flow_fwd is not None:
+            flow_helper = FlowRasterizerHelper(
+                bg_color=torch.zeros(2, device="cuda"),
+                scale_modifier=1.0,
+                mult=opt.mult,
+                debug=False,
+            ).cuda()
+            flow_loss_fn = OpticalFlowLoss(
+                use_tv_loss=opt.use_flow_tv_loss,
+                tv_weight=opt.flow_tv_weight,
+            )
+            n_with_flow = sum(1 for c in scene.getTrainCameras() if c.flow_fwd is not None)
+            print(f"[INFO] Optical flow attached to {n_with_flow}/{len(scene.getTrainCameras())} training cameras")
+        else:
+            print(f"[WARNING] use_flow_loss=True but training cameras have no flow_fwd, disabling flow loss.")
+            dataset.use_flow_loss = False
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -123,7 +148,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             ast_noise = 0 if dataset.is_blender else torch.randn(1, 1, device='cuda').expand(N, -1) * time_interval * smooth_term(iteration)
 
             # 如果启用动态掩码，只对动态高斯计算 deform
-            if opt.use_dynamic_mask and iteration >= 2*opt.warm_up and iteration % opt.velocity_interval != 0:
+            if opt.use_dynamic_mask and iteration % opt.velocity_interval != 0:
                 dynamic_mask = gaussians.get_dynamic_mask(
                     opt.dynamic_thresh, 
                     opt.grad_abs_thresh, 
@@ -184,6 +209,39 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
         Ll1 = l1_loss(image, gt_image)
         ssim_loss = 1.0 - fast_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss
+        
+        # ── Optical Flow Loss ──
+        flow_loss = None
+        if (dataset.use_flow_loss and dataset.use_velocity
+            and flow_helper is not None
+            and iteration >= opt.flow_loss_from_iter
+            and iteration % opt.flow_loss_interval == 0
+            and viewpoint_cam.flow_fwd is not None):
+            flow_gt = viewpoint_cam.flow_fwd  # [2, H, W]
+            # 计算 world-space velocity（当前时刻）
+            N = gaussians.get_xyz.shape[0]
+            time_input = fid.unsqueeze(0).expand(N, -1)
+            velocity3D = velocity.forward(gaussians.get_xyz.detach(), time_input)
+            # 渲染投影光流
+            deformed_means3D = (gaussians.get_xyz + d_xyz) if torch.is_tensor(d_xyz) else gaussians.get_xyz
+            flow_pred, _, _ = flow_helper.render_flow(
+                gaussians=gaussians,
+                velocity3D=velocity3D,
+                viewpoint_camera=viewpoint_cam,
+                override_means3D=deformed_means3D,
+                detach_geometry=opt.detach_flow_geometry,
+            )
+            # 使用 Forward-Backward Consistency Mask 过滤不可信区域
+            flow_mask = viewpoint_cam.flow_mask  # [1, H, W] or None
+            if flow_mask is None:
+                flow_mask = torch.ones(1, flow_gt.shape[1], flow_gt.shape[2], device=flow_gt.device)
+            flow_loss = flow_loss_fn(flow_pred, flow_gt, flow_mask)
+            loss = loss + opt.lambda_flow * flow_loss
+
+            if iteration % 1000 == 0:
+                print(f"[Iter {iteration}] flow loss = {flow_loss.item():.6f}")
+            if tb_writer and iteration % 100 == 0:
+                tb_writer.add_scalar('train_loss_patches/flow_loss', flow_loss.item(), iteration)
         
         # 只有在 use_velocity 开启且不在 warm_up 期间时才加入 velocity_loss 和时间平滑正则化
         velocity_smooth_loss = None

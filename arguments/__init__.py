@@ -64,6 +64,10 @@ class ModelParams(ParamGroup):
         # velocity
         self.use_velocity = False
         self.velocity_network_type = "mlp"  # "mlp" or "hash" - 使用 MLP 或 Hash Encoding
+
+        # optical flow loss
+        self.use_flow_loss = False  # 是否启用投影光流损失
+        # flow_dir 已废弃：光流数据现在由数据集读取器从 optical_flow/ 目录自动加载
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -124,6 +128,14 @@ class OptimizationParams(ParamGroup):
         self.lambda_velocity_smooth = 0.1  # 时间平滑正则化权重
         self.velocity_smooth_dt = 0.1  # 时间平滑采样的时间间隔（相对于单帧间隔的比例）
         
+        # optical flow loss（投影光流监督损失）
+        self.lambda_flow = 0.1  # 光流损失权重
+        self.flow_loss_from_iter = 3000  # 从第几个 iteration 开始使用光流损失
+        self.flow_loss_interval = 10  # 每隔几个 iteration 计算一次光流损失（节省算力）
+        self.use_flow_tv_loss = False  # 是否对光流预测加 TV 正则
+        self.flow_tv_weight = 0.01  # TV 正则权重
+        self.detach_flow_geometry = True  # 是否阻断光流损失对几何（位置/协方差）的梯度传播
+
         # dynamic mask (用于选择性计算 deform)
         self.use_dynamic_mask = False  # 是否启用动态掩码
         self.dynamic_decay = 0.95  # Leaky Max 的衰减系数；0.95好于0.99，后者衰减太慢

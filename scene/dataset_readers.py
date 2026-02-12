@@ -41,6 +41,8 @@ class CameraInfo(NamedTuple):
     height: int
     fid: float
     depth: Optional[np.array] = None
+    flow_fwd: Optional[np.array] = None   # 前向光流 [H, W, 2]，从当前帧到下一帧
+    flow_bwd: Optional[np.array] = None   # 后向光流 [H, W, 2]，从当前帧到上一帧（已 warp 到当前帧）
 
 
 class SceneInfo(NamedTuple):
@@ -531,8 +533,15 @@ def readCamerasFromNpy(path, npy_file, split, hold_id, num_images):
     video_list = i_test if split != 'train' else list(
         set(np.arange(n_cameras)) - set(i_test))
 
+    # 检测光流目录是否存在
+    flow_root = os.path.join(path, 'optical_flow')
+    has_flow = os.path.isdir(flow_root)
+    if has_flow:
+        print(f"[INFO] Found optical flow at {flow_root}")
+
     for i in video_list:
         video_path = video_paths[i]
+        cam_name = os.path.basename(os.path.dirname(video_path))  # e.g. "cam00"
         c2w = poses[i]
         images_names = sorted(os.listdir(video_path))
         n_frames = num_images
@@ -549,10 +558,24 @@ def readCamerasFromNpy(path, npy_file, split, hold_id, num_images):
             FovX = focal2fov(focal, image.size[0])
             FovY = focal2fov(focal, image.size[1])
 
+            # 加载光流（如果存在）
+            flow_fwd = None
+            flow_bwd = None
+            if has_flow:
+                id_stem = Path(image_name).stem
+                flow_cam_dir = os.path.join(flow_root, cam_name)
+                fwd_path = os.path.join(flow_cam_dir, f"of_fwd_{id_stem}.npy")
+                bwd_path = os.path.join(flow_cam_dir, f"of_bwd_{id_stem}.npy")
+                if os.path.exists(fwd_path):
+                    flow_fwd = np.load(fwd_path).astype(np.float32)   # [H, W, 2]
+                if os.path.exists(bwd_path):
+                    flow_bwd = np.load(bwd_path).astype(np.float32)   # [H, W, 2]
+
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovX=FovX, FovY=FovY,
                                         image=image,
                                         image_path=image_path, image_name=image_name,
-                                        width=image.size[0], height=image.size[1], fid=frame_time))
+                                        width=image.size[0], height=image.size[1], fid=frame_time,
+                                        flow_fwd=flow_fwd, flow_bwd=flow_bwd))
 
             idx += 1
     return cam_infos

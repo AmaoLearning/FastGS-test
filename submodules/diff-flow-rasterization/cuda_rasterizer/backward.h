@@ -1,0 +1,63 @@
+/*
+ * diff-flow-rasterization
+ * Backward pass declarations — mirrors diff-gaussian-rasterization_fastgs/backward.h
+ * but replaces SH/color gradients with velocity/flow gradients.
+ */
+
+#ifndef CUDA_FLOW_RASTERIZER_BACKWARD_H_INCLUDED
+#define CUDA_FLOW_RASTERIZER_BACKWARD_H_INCLUDED
+
+#include <cuda.h>
+#include "cuda_runtime.h"
+#include "device_launch_parameters.h"
+#define GLM_FORCE_CUDA
+#include <glm/glm.hpp>
+
+namespace BACKWARD
+{
+	void render(
+		const dim3 grid, dim3 block,
+		const uint2* ranges,
+		const uint32_t* point_list,
+		int W, int H, int R, int B,
+		const uint32_t* per_bucket_tile_offset,
+		const uint32_t* bucket_to_tile,
+		const float* sampled_T, const float* sampled_ar,
+		const float* bg_color,
+		const float2* means2D,
+		const float4* conic_opacity,
+		const float* flow,               // [P, 2]  per-Gaussian 2D flow
+		const float* final_Ts,
+		const uint32_t* n_contrib,
+		const uint32_t* max_contrib,
+		const float* pixel_colors,       // per-pixel accumulated flow
+		const float* dL_dpixels,         // [2, H, W]
+		float4* dL_dmean2D,
+		float4* dL_dconic2D,
+		float* dL_dopacity,
+		float* dL_dflow);                // [P, 2]  gradient on per-Gaussian flow
+
+	void preprocess(
+		int P,
+		const float3* means,
+		const int* radii,
+		const float* velocity3D,         // [P, 3]
+		const glm::vec3* scales,
+		const glm::vec4* rotations,
+		const float scale_modifier,
+		const float* cov3Ds,
+		const float* view,
+		const float* proj,
+		const float focal_x, float focal_y,
+		const float tan_fovx, float tan_fovy,
+		const float4* dL_dmean2D,
+		const float* dL_dconics,
+		const float* dL_dflow,           // [P, 2]  gradient on per-Gaussian flow
+		glm::vec3* dL_dmeans,
+		float* dL_dvelocity3D,           // [P, 3]  output gradient
+		float* dL_dcov3D,
+		glm::vec3* dL_dscale,
+		glm::vec4* dL_drot);
+}
+
+#endif
