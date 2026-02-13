@@ -62,10 +62,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
     flow_helper = None
     flow_loss_fn = None
     if dataset.use_flow_loss and dataset.use_velocity:
-        # 检查训练集是否携带光流数据（通过数据集读取器附加在 Camera 对象上）
-        # 注意：训练集已被 shuffle，第一个相机可能恰好是末帧（无前向光流），
-        # 因此需要检查是否存在任意一个携带光流的相机
-        any_has_flow = any(c.flow_fwd is not None for c in scene.getTrainCameras())
+        # 检查训练集是否有光流文件路径（延迟加载，此时不读取数组）
+        any_has_flow = any(c.has_flow for c in scene.getTrainCameras())
         if any_has_flow:
             flow_helper = FlowRasterizerHelper(
                 bg_color=torch.zeros(2, device="cuda"),
@@ -77,10 +75,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 use_tv_loss=opt.use_flow_tv_loss,
                 tv_weight=opt.flow_tv_weight,
             )
-            n_with_flow = sum(1 for c in scene.getTrainCameras() if c.flow_fwd is not None)
-            print(f"[INFO] Optical flow attached to {n_with_flow}/{len(scene.getTrainCameras())} training cameras")
+            n_with_flow = sum(1 for c in scene.getTrainCameras() if c.has_flow)
+            print(f"[INFO] Optical flow available for {n_with_flow}/{len(scene.getTrainCameras())} training cameras (lazy loading)")
         else:
-            print(f"[WARNING] use_flow_loss=True but training cameras have no flow_fwd, disabling flow loss.")
+            print(f"[WARNING] use_flow_loss=True but no flow files found, disabling flow loss.")
             dataset.use_flow_loss = False
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -218,7 +216,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             and flow_helper is not None
             and iteration >= opt.flow_loss_from_iter
             and iteration % opt.flow_loss_interval == 0
-            and viewpoint_cam.flow_fwd is not None):
+            and viewpoint_cam.has_flow):
+            # 延迟加载：仅在需要时从磁盘读取光流到 GPU
+            viewpoint_cam.load_flow(device='cuda')
             flow_gt = viewpoint_cam.flow_fwd  # [2, H, W]
             # 计算 world-space velocity（当前时刻）
             N = gaussians.get_xyz.shape[0]
@@ -234,10 +234,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 detach_geometry=opt.detach_flow_geometry,
             )
             # 使用 Forward-Backward Consistency Mask 过滤不可信区域
-            flow_mask = viewpoint_cam.flow_mask  # [1, H, W] or None
+            flow_mask = viewpoint_cam.flow_mask  # [1, H, W] bool or None
             if flow_mask is None:
-                flow_mask = torch.ones(1, flow_gt.shape[1], flow_gt.shape[2], device=flow_gt.device)
-            flow_loss = flow_loss_fn(flow_pred, flow_gt, flow_mask)
+                flow_mask = torch.ones(1, flow_gt.shape[1], flow_gt.shape[2],
+                                       dtype=torch.bool, device=flow_gt.device)
+            flow_loss = flow_loss_fn(flow_pred, flow_gt.float(), flow_mask.float())
             loss = loss + opt.lambda_flow * flow_loss
 
             if iteration % 1000 == 0:
@@ -267,6 +268,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                     print(f"[Iter {iteration}] velocity smooth loss = {velocity_smooth_loss.item():.6f}")
         
         loss.backward()
+
+        # 释放光流张量以回收 GPU 显存（每次迭代最多只驻留 1 帧的光流）
+        viewpoint_cam.unload_flow()
 
         iter_end.record()
 

@@ -41,8 +41,8 @@ class CameraInfo(NamedTuple):
     height: int
     fid: float
     depth: Optional[np.array] = None
-    flow_fwd: Optional[np.array] = None   # 前向光流 [H, W, 2]，从当前帧到下一帧
-    flow_bwd: Optional[np.array] = None   # 后向光流 [H, W, 2]，从当前帧到上一帧（已 warp 到当前帧）
+    flow_fwd_path: Optional[str] = None   # 前向光流文件路径（延迟加载）
+    flow_bwd_path: Optional[str] = None   # 后向光流文件路径（延迟加载）
 
 
 class SceneInfo(NamedTuple):
@@ -148,9 +148,9 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, source_path
         # fid = int(image_name) / (num_frames - 1)
         fid = int(''.join(filter(str.isdigit, image_name))) / (num_frames - 1)
 
-        # ── 加载光流（如果存在）──
-        flow_fwd = None
-        flow_bwd = None
+        # ── 记录光流路径（延迟加载）──
+        flow_fwd_path = None
+        flow_bwd_path = None
         if has_flow:
             extr_parts = Path(extr.name).parts
             cam_name = extr_parts[0]  # "cam00"
@@ -160,13 +160,13 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, source_path
             fwd_path = os.path.join(flow_cam_dir, f"of_fwd_{id_stem}.npy")
             bwd_path = os.path.join(flow_cam_dir, f"of_bwd_{id_stem}.npy")
             if os.path.exists(fwd_path):
-                flow_fwd = np.load(fwd_path).astype(np.float32)   # [H, W, 2]
+                flow_fwd_path = fwd_path
             if os.path.exists(bwd_path):
-                flow_bwd = np.load(bwd_path).astype(np.float32)   # [H, W, 2]
+                flow_bwd_path = bwd_path
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                               image_path=image_path, image_name=image_name, width=width, height=height, fid=fid,
-                              flow_fwd=flow_fwd, flow_bwd=flow_bwd)
+                              flow_fwd_path=flow_fwd_path, flow_bwd_path=flow_bwd_path)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos
@@ -589,24 +589,24 @@ def readCamerasFromNpy(path, npy_file, split, hold_id, num_images, load_flow: bo
             FovX = focal2fov(focal, image.size[0])
             FovY = focal2fov(focal, image.size[1])
 
-            # 加载光流（如果存在）
-            flow_fwd = None
-            flow_bwd = None
+            # 记录光流路径（延迟加载，不在此处读取数组）
+            flow_fwd_path = None
+            flow_bwd_path = None
             if has_flow:
                 id_stem = Path(image_name).stem  # e.g. "0000" from "0000.png"
                 flow_cam_dir = os.path.join(flow_root, cam_name)
                 fwd_path = os.path.join(flow_cam_dir, f"of_fwd_{id_stem}.npy")
                 bwd_path = os.path.join(flow_cam_dir, f"of_bwd_{id_stem}.npy")
                 if os.path.exists(fwd_path):
-                    flow_fwd = np.load(fwd_path).astype(np.float32)   # [H, W, 2]
+                    flow_fwd_path = fwd_path
                 if os.path.exists(bwd_path):
-                    flow_bwd = np.load(bwd_path).astype(np.float32)   # [H, W, 2]
+                    flow_bwd_path = bwd_path
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovX=FovX, FovY=FovY,
                                         image=image,
                                         image_path=image_path, image_name=image_name,
                                         width=image.size[0], height=image.size[1], fid=frame_time,
-                                        flow_fwd=flow_fwd, flow_bwd=flow_bwd))
+                                        flow_fwd_path=flow_fwd_path, flow_bwd_path=flow_bwd_path))
 
             idx += 1
     return cam_infos

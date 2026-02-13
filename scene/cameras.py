@@ -9,6 +9,8 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import os
+from typing import Optional
 import torch
 from torch import nn
 import numpy as np
@@ -19,7 +21,7 @@ from utils.optic_flow_utils import forward_backward_consistency_check
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask, image_name, uid,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device="cuda", fid=None, depth=None,
-                 flow_fwd=None, flow_bwd=None):
+                 flow_fwd_path=None, flow_bwd_path=None):
         super(Camera, self).__init__()
 
         self.uid = uid
@@ -43,24 +45,12 @@ class Camera(nn.Module):
         self.image_height = self.original_image.shape[1]
         self.depth = torch.Tensor(depth).to(self.data_device) if depth is not None else None
 
-        # Optical flow: [2, H, W] stored as (u, v) channels-first
-        if flow_fwd is not None:
-            # input: [H, W, 2] numpy → [2, H, W] tensor
-            self.flow_fwd = torch.from_numpy(flow_fwd).permute(2, 0, 1).float().to(self.data_device)
-        else:
-            self.flow_fwd = None
-        if flow_bwd is not None:
-            self.flow_bwd = torch.from_numpy(flow_bwd).permute(2, 0, 1).float().to(self.data_device)
-        else:
-            self.flow_bwd = None
-
-        # Forward-Backward Consistency Mask: [1, H, W], 1.0 = 可信像素
-        if self.flow_fwd is not None and self.flow_bwd is not None:
-            self.flow_mask = forward_backward_consistency_check(
-                self.flow_fwd, self.flow_bwd, alpha1=0.01, alpha2=0.5,
-            )  # [1, H, W]
-        else:
-            self.flow_mask = None
+        # Optical flow: 延迟加载 —— 仅存储路径，训练时按需 load_flow()
+        self.flow_fwd_path: Optional[str] = flow_fwd_path
+        self.flow_bwd_path: Optional[str] = flow_bwd_path
+        self.flow_fwd: Optional[torch.Tensor] = None   # [2, H, W] loaded on demand
+        self.flow_bwd: Optional[torch.Tensor] = None   # [2, H, W] loaded on demand
+        self.flow_mask: Optional[torch.Tensor] = None   # [1, H, W] computed on demand
 
         if gt_alpha_mask is not None:
             self.original_image *= gt_alpha_mask.to(self.data_device)
@@ -94,12 +84,41 @@ class Camera(nn.Module):
         self.full_proj_transform = self.full_proj_transform.to(data_device)
         self.camera_center = self.camera_center.to(data_device)
         self.fid = self.fid.to(data_device)
+        # 注意：flow 由 load_flow/unload_flow 独立管理，不在此处处理
+
+    @property
+    def has_flow(self) -> bool:
+        """该相机是否有光流文件可供加载。"""
+        return self.flow_fwd_path is not None
+
+    def load_flow(self, device: str = 'cuda') -> None:
+        """按需从磁盘加载光流到指定设备，并计算一致性 mask。
+        光流以 float16 存储以节省显存，损失计算时 PyTorch 会自动提升精度。
+        若已加载则跳过（幂等操作）。"""
         if self.flow_fwd is not None:
-            self.flow_fwd = self.flow_fwd.to(data_device)
-        if self.flow_bwd is not None:
-            self.flow_bwd = self.flow_bwd.to(data_device)
-        if self.flow_mask is not None:
-            self.flow_mask = self.flow_mask.to(data_device)
+            return  # 已加载
+        if self.flow_fwd_path is not None and os.path.exists(self.flow_fwd_path):
+            arr = np.load(self.flow_fwd_path)            # [H, W, 2]
+            self.flow_fwd = torch.from_numpy(arr).permute(2, 0, 1).to(
+                dtype=torch.float16, device=device)       # [2, H, W] fp16
+        if self.flow_bwd_path is not None and os.path.exists(self.flow_bwd_path):
+            arr = np.load(self.flow_bwd_path)
+            self.flow_bwd = torch.from_numpy(arr).permute(2, 0, 1).to(
+                dtype=torch.float16, device=device)
+        # 计算 Forward-Backward Consistency Mask（二值化，用 bool 存储最省内存）
+        if self.flow_fwd is not None and self.flow_bwd is not None:
+            # consistency check 内部用 float32 计算，结果转 bool
+            mask_f32 = forward_backward_consistency_check(
+                self.flow_fwd.float(), self.flow_bwd.float(),
+                alpha1=0.01, alpha2=0.5,
+            )  # [1, H, W] float32, 0.0/1.0
+            self.flow_mask = mask_f32.bool()  # [1, H, W] bool, 每像素 1 byte
+
+    def unload_flow(self) -> None:
+        """释放光流张量以回收 GPU/CPU 内存。"""
+        self.flow_fwd = None
+        self.flow_bwd = None
+        self.flow_mask = None
 
 
 class MiniCam:

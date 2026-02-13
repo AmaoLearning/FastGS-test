@@ -46,7 +46,7 @@ class Scene:
 
         if os.path.exists(os.path.join(args.source_path, "poses_bounds.npy")):
             print(f"Found poses_bounds.npy, assuming Neu3D/LLFF data set! (num_t=300, flow={load_flow})")
-            scene_info = sceneLoadTypeCallbacks["plenopticVideo"](args.source_path, args.eval, num_images=300,
+            scene_info = sceneLoadTypeCallbacks["plenopticVideo"](args.source_path, args.eval, num_images=30,
                                                                    load_flow=load_flow)
         elif os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval,
