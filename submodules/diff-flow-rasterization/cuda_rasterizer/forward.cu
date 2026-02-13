@@ -154,8 +154,6 @@ __global__ void preprocessCUDA(
 	const glm::vec4* rotations,
 	const float* opacities,
 	const float* velocity3D,       // [P, 3] world-space velocity
-	const float* cov3D_precomp,
-	const float* flow_precomp,     // [P, 2] optional precomputed flow
 	const float* viewmatrix,
 	const float* projmatrix,
 	const float mult,
@@ -191,17 +189,9 @@ __global__ void preprocessCUDA(
 	float p_w = 1.0f / (p_hom.w + 0.0000001f);
 	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };
 
-	// 3D covariance
-	const float* cov3D;
-	if (cov3D_precomp != nullptr)
-	{
-		cov3D = cov3D_precomp + idx * 6;
-	}
-	else
-	{
-		computeCov3D(scales[idx], scale_modifier, rotations[idx], cov3Ds + idx * 6);
-		cov3D = cov3Ds + idx * 6;
-	}
+	// 3D covariance from scales + rotations (always computed)
+	computeCov3D(scales[idx], scale_modifier, rotations[idx], cov3Ds + idx * 6);
+	const float* cov3D = cov3Ds + idx * 6;
 
 	// 2D covariance
 	float3 cov = computeCov2D(p_orig, focal_x, focal_y, tan_fovx, tan_fovy, cov3D, viewmatrix);
@@ -225,20 +215,16 @@ __global__ void preprocessCUDA(
 	if (tiles_count == 0)
 		return;
 
-	// ── KEY CHANGE: velocity → flow instead of SH → RGB ──────────────
-	if (flow_precomp == nullptr)
-	{
-		float2 f = computeFlowFromVelocity(
-			idx,
-			(const float3*)orig_points,
-			velocity3D,
-			viewmatrix,
-			focal_x, focal_y,
-			tan_fovx, tan_fovy);
-		flow[idx * C + 0] = f.x;
-		flow[idx * C + 1] = f.y;
-	}
-	// (if flow_precomp != nullptr, the caller has already provided it)
+	// ── velocity → flow via Jacobian projection ─────────────────────
+    float2 f = computeFlowFromVelocity(
+        idx,
+        (const float3*)orig_points,
+        velocity3D,
+        viewmatrix,
+        focal_x, focal_y,
+        tan_fovx, tan_fovy);
+    flow[idx * C + 0] = f.x;
+    flow[idx * C + 1] = f.y;
 
 	// Store helpers
 	depths[idx] = p_view.z;
@@ -443,8 +429,6 @@ void FORWARD::preprocess(
 	const glm::vec4* rotations,
 	const float* opacities,
 	const float* velocity3D,
-	const float* cov3D_precomp,
-	const float* flow_precomp,
 	const float* viewmatrix,
 	const float* projmatrix,
 	const float mult,
@@ -469,8 +453,6 @@ void FORWARD::preprocess(
 		rotations,
 		opacities,
 		velocity3D,
-		cov3D_precomp,
-		flow_precomp,
 		viewmatrix,
 		projmatrix,
 		mult,

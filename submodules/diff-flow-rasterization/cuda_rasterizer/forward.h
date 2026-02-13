@@ -29,8 +29,6 @@ namespace FORWARD
 		const glm::vec4* rotations,
 		const float* opacities,
 		const float* velocity3D,        // [P, 3]  world-space velocity
-		const float* cov3D_precomp,
-		const float* flow_precomp,       // [P, 2]  optional precomputed flow
 		const float* viewmatrix,
 		const float* projmatrix,
 		const float mult,

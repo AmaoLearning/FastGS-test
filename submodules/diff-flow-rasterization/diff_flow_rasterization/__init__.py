@@ -3,6 +3,8 @@ diff_flow_rasterization/__init__.py
 Mirrors diff_gaussian_rasterization_fastgs/__init__.py
 Adapted for 2-channel flow rasterization with velocity3D input.
 No SH / dc / campos / metric_map / adamUpdate.
+No flow_precomp / cov3D_precomp — always uses velocity→flow Jacobian
+and scales+rotations→cov3D.
 """
 
 from typing import NamedTuple
@@ -23,22 +25,18 @@ def rasterize_flow(
     means3D,
     means2D,
     velocity3D,
-    flow_precomp,
     opacities,
     scales,
     rotations,
-    cov3Ds_precomp,
     raster_settings,
 ):
     return _RasterizeFlow.apply(
         means3D,
         means2D,
         velocity3D,
-        flow_precomp,
         opacities,
         scales,
         rotations,
-        cov3Ds_precomp,
         raster_settings,
     )
 
@@ -50,23 +48,19 @@ class _RasterizeFlow(torch.autograd.Function):
         means3D,
         means2D,
         velocity3D,
-        flow_precomp,
         opacities,
         scales,
         rotations,
-        cov3Ds_precomp,
         raster_settings,
     ):
         args = (
             raster_settings.bg,
             means3D,
             velocity3D,
-            flow_precomp,
             opacities,
             scales,
             rotations,
             raster_settings.scale_modifier,
-            cov3Ds_precomp,
             raster_settings.viewmatrix,
             raster_settings.projmatrix,
             raster_settings.tanfovx,
@@ -93,8 +87,8 @@ class _RasterizeFlow(torch.autograd.Function):
         ctx.num_rendered = num_rendered
         ctx.num_buckets = num_buckets
         ctx.save_for_backward(
-            velocity3D, flow_precomp, means3D, scales, rotations,
-            cov3Ds_precomp, radii, geomBuffer, binningBuffer, imgBuffer, sampleBuffer
+            velocity3D, means3D, scales, rotations,
+            radii, geomBuffer, binningBuffer, imgBuffer, sampleBuffer
         )
         return flow, radii, depth
 
@@ -103,19 +97,17 @@ class _RasterizeFlow(torch.autograd.Function):
         num_rendered = ctx.num_rendered
         num_buckets = ctx.num_buckets
         raster_settings = ctx.raster_settings
-        (velocity3D, flow_precomp, means3D, scales, rotations,
-         cov3Ds_precomp, radii, geomBuffer, binningBuffer, imgBuffer, sampleBuffer) = ctx.saved_tensors
+        (velocity3D, means3D, scales, rotations,
+         radii, geomBuffer, binningBuffer, imgBuffer, sampleBuffer) = ctx.saved_tensors
 
         args = (
             raster_settings.bg,
             means3D,
             radii,
             velocity3D,
-            flow_precomp,
             scales,
             rotations,
             raster_settings.scale_modifier,
-            cov3Ds_precomp,
             raster_settings.viewmatrix,
             raster_settings.projmatrix,
             raster_settings.tanfovx,
@@ -149,11 +141,9 @@ class _RasterizeFlow(torch.autograd.Function):
             grad_means3D,       # means3D
             grad_means2D,       # means2D
             grad_velocity3D,    # velocity3D
-            grad_flow,          # flow_precomp
             grad_opacities,     # opacities
             grad_scales,        # scales
             grad_rotations,     # rotations
-            None,               # cov3Ds_precomp  (TODO: if needed)
             None,               # raster_settings
         )
 
@@ -194,46 +184,16 @@ class FlowRasterizer(nn.Module):
         means3D: torch.Tensor,
         means2D: torch.Tensor,
         opacities: torch.Tensor,
-        velocity3D: torch.Tensor = None,
-        flow_precomp: torch.Tensor = None,
-        scales: torch.Tensor = None,
-        rotations: torch.Tensor = None,
-        cov3D_precomp: torch.Tensor = None,
+        velocity3D: torch.Tensor,
+        scales: torch.Tensor,
+        rotations: torch.Tensor,
     ):
-        raster_settings = self.raster_settings
-
-        if (velocity3D is None and flow_precomp is None) or \
-           (velocity3D is not None and flow_precomp is not None):
-            raise Exception(
-                "Please provide exactly one of either velocity3D or precomputed flow!"
-            )
-
-        if ((scales is None or rotations is None) and cov3D_precomp is None) or \
-           ((scales is not None or rotations is not None) and cov3D_precomp is not None):
-            raise Exception(
-                "Please provide exactly one of either scale/rotation pair "
-                "or precomputed 3D covariance!"
-            )
-
-        if velocity3D is None:
-            velocity3D = torch.Tensor([])
-        if flow_precomp is None:
-            flow_precomp = torch.Tensor([])
-        if scales is None:
-            scales = torch.Tensor([])
-        if rotations is None:
-            rotations = torch.Tensor([])
-        if cov3D_precomp is None:
-            cov3D_precomp = torch.Tensor([])
-
         return rasterize_flow(
             means3D,
             means2D,
             velocity3D,
-            flow_precomp,
             opacities,
             scales,
             rotations,
-            cov3D_precomp,
-            raster_settings,
+            self.raster_settings,
         )

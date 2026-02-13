@@ -1,11 +1,12 @@
 /*
  * diff-flow-rasterization  —  rasterizer_impl.cu
- * Mirrors diff-gaussian-rasterization_fastgs/rasterizer_impl.cu exactly.
+ * Mirrors diff-gaussian-rasterization_fastgs/rasterizer_impl.cu.
  * Changes:
  *   - CudaFlowRasterizer namespace
  *   - No clamped, no SH, no D/M/dc/shs/cam_pos/colors_precomp
- *   - velocity3D / flow_precomp replaces dc / shs / colors_precomp
+ *   - velocity3D replaces dc / shs / colors_precomp
  *   - FLOW_CHANNELS replaces NUM_CHAFFELS
+ *   - No flow_precomp / cov3D_precomp: always velocity→flow + scale/rot→cov3D
  *   - No metric_map / get_flag / metricCount / contrib_scan / radii in render
  */
 
@@ -267,12 +268,10 @@ std::tuple<int,int> CudaFlowRasterizer::Rasterizer::forward(
 	const int width, int height,
 	const float* means3D,
 	const float* velocity3D,
-	const float* flow_precomp,
 	const float* opacities,
 	const float* scales,
 	const float scale_modifier,
 	const float* rotations,
-	const float* cov3D_precomp,
 	const float* viewmatrix,
 	const float* projmatrix,
 	const float mult,
@@ -311,8 +310,6 @@ std::tuple<int,int> CudaFlowRasterizer::Rasterizer::forward(
 		(glm::vec4*)rotations,
 		opacities,
 		velocity3D,
-		cov3D_precomp,
-		flow_precomp,
 		viewmatrix, projmatrix,
 		mult,
 		width, height,
@@ -382,8 +379,7 @@ std::tuple<int,int> CudaFlowRasterizer::Rasterizer::forward(
 	char* sample_chunkptr = sampleBuffer(sample_chunk_size);
 	SampleState sampleState = SampleState::fromChunk(sample_chunkptr, bucket_sum);
 
-	// Render
-	const float* feature_ptr = flow_precomp != nullptr ? flow_precomp : geomState.flow;
+	// Render — always use velocity-computed flow from geomState
 	CHECK_CUDA(FORWARD::render(
 		tile_grid, block,
 		imgState.ranges,
@@ -392,7 +388,7 @@ std::tuple<int,int> CudaFlowRasterizer::Rasterizer::forward(
 		sampleState.T, sampleState.ar,
 		width, height,
 		geomState.means2D,
-		feature_ptr,
+		geomState.flow,
 		geomState.depths,
 		geomState.conic_opacity,
 		imgState.accum_alpha,
@@ -414,11 +410,9 @@ void CudaFlowRasterizer::Rasterizer::backward(
 	const int width, int height,
 	const float* means3D,
 	const float* velocity3D,
-	const float* flow_precomp,
 	const float* scales,
 	const float scale_modifier,
 	const float* rotations,
-	const float* cov3D_precomp,
 	const float* viewmatrix,
 	const float* projmatrix,
 	const float tan_fovx, float tan_fovy,
@@ -455,7 +449,7 @@ void CudaFlowRasterizer::Rasterizer::backward(
 	const dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
 	const dim3 block(BLOCK_X, BLOCK_Y, 1);
 
-	const float* flow_ptr = (flow_precomp != nullptr) ? flow_precomp : geomState.flow;
+	const float* flow_ptr = geomState.flow;
 	CHECK_CUDA(BACKWARD::render(
 		tile_grid,
 		block,
@@ -480,7 +474,6 @@ void CudaFlowRasterizer::Rasterizer::backward(
 		dL_dopacity,
 		dL_dflow), debug)
 
-	const float* cov3D_ptr = (cov3D_precomp != nullptr) ? cov3D_precomp : geomState.cov3D;
 	CHECK_CUDA(BACKWARD::preprocess(P,
 		(float3*)means3D,
 		radii,
@@ -488,7 +481,7 @@ void CudaFlowRasterizer::Rasterizer::backward(
 		(glm::vec3*)scales,
 		(glm::vec4*)rotations,
 		scale_modifier,
-		cov3D_ptr,
+		geomState.cov3D,
 		viewmatrix,
 		projmatrix,
 		focal_x, focal_y,

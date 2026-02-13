@@ -283,17 +283,16 @@ __global__ void preprocessCUDA(
 	if (idx >= P || !(radii[idx] > 0))
 		return;
 
-	// ── Only compute velocity gradient ──
+	// ── Compute velocity gradient ──
 	// Geometry gradients (mean2D projection, cov3D → scale/rotation) are intentionally
 	// skipped: the flow rasterizer only optimizes velocity3D, geometry is detached
 	// at the Python level.  dL_dmean3D / dL_dcov3D / dL_dscale / dL_drot stay zero.
-	if (velocity3D != nullptr)
-		computeFlowFromVelocityBackward(
-			idx, means, velocity3D, viewmatrix,
-			focal_x, focal_y, tan_fovx, tan_fovy,
-			dL_dflow,
-			nullptr,               // dL_dmeans = nullptr: skip position gradient
-			dL_dvelocity3D);
+	computeFlowFromVelocityBackward(
+		idx, means, velocity3D, viewmatrix,
+		focal_x, focal_y, tan_fovx, tan_fovy,
+		dL_dflow,
+		nullptr,               // dL_dmeans = nullptr: skip position gradient
+		dL_dvelocity3D);
 }
 
 // ---------------------------------------------------------------------------
@@ -453,7 +452,7 @@ void BACKWARD::preprocess(
 	glm::vec3* dL_dscale,
 	glm::vec4* dL_drot)
 {
-	// NOTE: computeCov2DCUDA and computeCov3D are intentionally NOT launched.
+	// NOTE: computeCov2DCUDA and computeCov3D backward are intentionally NOT launched.
 	// The flow rasterizer only optimizes velocity3D; geometry is detached
 	// at the Python level, so dL_dmean3D / dL_dcov3D / dL_dscale / dL_drot stay zero.
 

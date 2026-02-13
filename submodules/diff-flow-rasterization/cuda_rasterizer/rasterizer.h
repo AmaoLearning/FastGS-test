@@ -33,12 +33,10 @@ namespace CudaFlowRasterizer
 			const int width, int height,
 			const float* means3D,
 			const float* velocity3D,         // [P, 3]  world-space velocity
-			const float* flow_precomp,       // [P, 2]  optional precomputed flow
 			const float* opacities,
 			const float* scales,
 			const float scale_modifier,
 			const float* rotations,
-			const float* cov3D_precomp,
 			const float* viewmatrix,
 			const float* projmatrix,
 			const float mult,
@@ -55,11 +53,9 @@ namespace CudaFlowRasterizer
 			const int width, int height,
 			const float* means3D,
 			const float* velocity3D,         // [P, 3]
-			const float* flow_precomp,
 			const float* scales,
 			const float scale_modifier,
 			const float* rotations,
-			const float* cov3D_precomp,
 			const float* viewmatrix,
 			const float* projmatrix,
 			const float tan_fovx, float tan_fovy,
