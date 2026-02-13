@@ -42,11 +42,15 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
 
+        load_flow = getattr(args, 'use_flow_loss', False)
+
         if os.path.exists(os.path.join(args.source_path, "poses_bounds.npy")):
-            print(f"Found poses_bounds.npy, assuming Neu3D/LLFF data set!")
-            scene_info = sceneLoadTypeCallbacks["plenopticVideo"](args.source_path, args.eval, 300)
+            print(f"Found poses_bounds.npy, assuming Neu3D/LLFF data set! (num_t=300, flow={load_flow})")
+            scene_info = sceneLoadTypeCallbacks["plenopticVideo"](args.source_path, args.eval, num_images=300,
+                                                                   load_flow=load_flow)
         elif os.path.exists(os.path.join(args.source_path, "sparse")):
-            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
+            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval,
+                                                          load_flow=load_flow)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)

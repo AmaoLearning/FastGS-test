@@ -100,14 +100,14 @@ def getNerfppNorm(cam_info):
     return {"translate": translate, "radius": radius}
 
 
-def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, source_path=None):
+def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, source_path=None, load_flow: bool = False):
     cam_infos = []
     num_frames = len(cam_extrinsics)
 
-    # ── 检测光流目录 ──
+    # ── 检测光流目录（仅在 load_flow=True 时）──
     has_flow = False
     flow_root = None
-    if source_path is not None:
+    if load_flow and source_path is not None:
         flow_root = os.path.join(source_path, 'optical_flow')
         has_flow = os.path.isdir(flow_root)
         if has_flow:
@@ -200,7 +200,7 @@ def storePly(path, xyz, rgb):
     ply_data.write(path)
 
 
-def readColmapSceneInfo(path, images, eval, llffhold=8):
+def readColmapSceneInfo(path, images, eval, llffhold=8, load_flow: bool = False):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -215,7 +215,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
     reading_dir = "images" if images == None else images
     cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics,
                                            images_folder=os.path.join(path, reading_dir),
-                                           source_path=path)
+                                           source_path=path, load_flow=load_flow)
     cam_infos = sorted(cam_infos_unsorted.copy(), key=lambda x: x.image_name)
 
     if eval:
@@ -542,7 +542,7 @@ def readNerfiesInfo(path, eval):
     return scene_info
 
 
-def readCamerasFromNpy(path, npy_file, split, hold_id, num_images):
+def readCamerasFromNpy(path, npy_file, split, hold_id, num_images, load_flow: bool = False):
     cam_infos = []
     video_paths = sorted(glob(os.path.join(path, 'cam*', 'images')))
     poses_bounds = np.load(os.path.join(path, npy_file))
@@ -562,11 +562,13 @@ def readCamerasFromNpy(path, npy_file, split, hold_id, num_images):
     video_list = i_test if split != 'train' else list(
         set(np.arange(n_cameras)) - set(i_test))
 
-    # 检测光流目录是否存在
+    # 检测光流目录（仅在 load_flow=True 时）
+    has_flow = False
     flow_root = os.path.join(path, 'optical_flow')
-    has_flow = os.path.isdir(flow_root)
-    if has_flow:
-        print(f"[INFO] Found optical flow at {flow_root}")
+    if load_flow:
+        has_flow = os.path.isdir(flow_root)
+        if has_flow:
+            print(f"[INFO] Found optical flow at {flow_root}")
 
     for i in video_list:
         video_path = video_paths[i]
@@ -610,14 +612,14 @@ def readCamerasFromNpy(path, npy_file, split, hold_id, num_images):
     return cam_infos
 
 
-def readPlenopticVideoDataset(path, eval, num_images, hold_id=[0]):
+def readPlenopticVideoDataset(path, eval, num_images, hold_id=[0], load_flow: bool = False):
     print("Reading Training Camera")
     train_cam_infos = readCamerasFromNpy(path, 'poses_bounds.npy', split="train", hold_id=hold_id,
-                                         num_images=num_images)
+                                         num_images=num_images, load_flow=load_flow)
 
     print("Reading Testing Camera")
     test_cam_infos = readCamerasFromNpy(
-        path, 'poses_bounds.npy', split="test", hold_id=hold_id, num_images=num_images)
+        path, 'poses_bounds.npy', split="test", hold_id=hold_id, num_images=num_images, load_flow=load_flow)
 
     if not eval:
         train_cam_infos.extend(test_cam_infos)
