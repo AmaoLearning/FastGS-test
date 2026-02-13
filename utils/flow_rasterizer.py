@@ -110,9 +110,7 @@ class FlowRasterizerHelper(nn.Module):
             opacity = opacity.detach()
 
         # screenspace placeholder (same pattern as RGB rasterizer)
-        screenspace_points = torch.zeros_like(
-            means3D, dtype=means3D.dtype, device=means3D.device, requires_grad=True
-        )
+        screenspace_points = torch.zeros((means3D.shape[0], 4), dtype=means3D.dtype, requires_grad=True, device="cuda") + 0
         try:
             screenspace_points.retain_grad()
         except Exception:
