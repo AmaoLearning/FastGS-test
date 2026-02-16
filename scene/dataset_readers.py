@@ -660,7 +660,7 @@ def readPlenopticVideoDataset(path, eval, num_images, hold_id=[0], load_flow: bo
 def format_infos(dataset,split):
     # loading
     cameras = []
-    image = dataset[0][0]
+    image = dataset[0]
     if split == "train":
         for idx in tqdm(range(len(dataset))):
             image_path = None
@@ -668,10 +668,10 @@ def format_infos(dataset,split):
             time = dataset.image_times[idx]
             # matrix = np.linalg.inv(np.array(pose))
             R,T = dataset.load_pose(idx)
-            FovX = focal2fov(dataset.focal[0], image.shape[1])
-            FovY = focal2fov(dataset.focal[0], image.shape[2])
+            FovX = focal2fov(dataset.focal[0], image.size[0])
+            FovY = focal2fov(dataset.focal[0], image.size[1])
             cameras.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                                image_path=image_path, image_name=image_name, width=image.shape[2], height=image.shape[1],
+                                image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1],
                                 fid = time))
     return cameras
 
@@ -680,7 +680,7 @@ def format_render_poses(poses,data_infos):
     tensor_to_pil = transforms.ToPILImage()
     len_poses = len(poses)
     times = [i/len_poses for i in range(len_poses)]
-    image = data_infos[0][0]
+    image = data_infos[0]
     for idx, p in tqdm(enumerate(poses)):
         # image = None
         image_path = None
@@ -693,10 +693,10 @@ def format_render_poses(poses,data_infos):
         R = - R
         R[:,0] = -R[:,0]
         T = -pose[:3,3].dot(R)
-        FovX = focal2fov(data_infos.focal[0], image.shape[2])
-        FovY = focal2fov(data_infos.focal[0], image.shape[1])
+        FovX = focal2fov(data_infos.focal[0], image.size[0])
+        FovY = focal2fov(data_infos.focal[0], image.size[1])
         cameras.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                            image_path=image_path, image_name=image_name, width=image.shape[2], height=image.shape[1],
+                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1],
                             fid = time))
     return cameras
 
