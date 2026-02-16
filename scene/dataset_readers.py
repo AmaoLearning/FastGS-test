@@ -727,6 +727,10 @@ def readdynerfInfo(datadir,use_bg_points,eval):
     val_cam_infos = format_render_poses(test_dataset.val_poses,test_dataset)
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
+    if not eval:
+        train_cam_infos.extend(val_cam_infos)
+        val_cam_infos = []
+
     # xyz = np.load
     pcd = fetchPly(ply_path)
     print("origin points,",pcd.points.shape[0])
@@ -734,12 +738,10 @@ def readdynerfInfo(datadir,use_bg_points,eval):
     print("after points,",pcd.points.shape[0])
 
     scene_info = SceneInfo(point_cloud=pcd,
-                           train_cameras=train_dataset,
-                           test_cameras=test_dataset,
-                           video_cameras=val_cam_infos,
+                           train_cameras=train_cam_infos,
+                           test_cameras=val_cam_infos,
                            nerf_normalization=nerf_normalization,
                            ply_path=ply_path,
-                           maxtime=300
                            )
     return scene_info
 
