@@ -672,8 +672,7 @@ def format_infos(dataset,split):
             FovY = focal2fov(dataset.focal[0], image.shape[2])
             cameras.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                                 image_path=image_path, image_name=image_name, width=image.shape[2], height=image.shape[1],
-                                time = time, mask=None))
-
+                                fid = time))
     return cameras
 
 def format_render_poses(poses,data_infos):
@@ -698,7 +697,7 @@ def format_render_poses(poses,data_infos):
         FovY = focal2fov(data_infos.focal[0], image.shape[1])
         cameras.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                             image_path=image_path, image_name=image_name, width=image.shape[2], height=image.shape[1],
-                            time = time, mask=None))
+                            fid = time))
     return cameras
 
 def readdynerfInfo(datadir,use_bg_points,eval):
