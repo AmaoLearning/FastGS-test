@@ -26,6 +26,8 @@ from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
 from utils.camera_utils import camera_nerfies_from_JSON
+import torchvision.transforms as transforms
+from tqdm import tqdm
 
 
 class CameraInfo(NamedTuple):
@@ -655,6 +657,93 @@ def readPlenopticVideoDataset(path, eval, num_images, hold_id=[0], load_flow: bo
                            ply_path=ply_path)
     return scene_info
 
+def format_infos(dataset,split):
+    # loading
+    cameras = []
+    image = dataset[0][0]
+    if split == "train":
+        for idx in tqdm(range(len(dataset))):
+            image_path = None
+            image_name = f"{idx}"
+            time = dataset.image_times[idx]
+            # matrix = np.linalg.inv(np.array(pose))
+            R,T = dataset.load_pose(idx)
+            FovX = focal2fov(dataset.focal[0], image.shape[1])
+            FovY = focal2fov(dataset.focal[0], image.shape[2])
+            cameras.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+                                image_path=image_path, image_name=image_name, width=image.shape[2], height=image.shape[1],
+                                time = time, mask=None))
+
+    return cameras
+
+def format_render_poses(poses,data_infos):
+    cameras = []
+    tensor_to_pil = transforms.ToPILImage()
+    len_poses = len(poses)
+    times = [i/len_poses for i in range(len_poses)]
+    image = data_infos[0][0]
+    for idx, p in tqdm(enumerate(poses)):
+        # image = None
+        image_path = None
+        image_name = f"{idx}"
+        time = times[idx]
+        pose = np.eye(4)
+        pose[:3,:] = p[:3,:]
+        # matrix = np.linalg.inv(np.array(pose))
+        R = pose[:3,:3]
+        R = - R
+        R[:,0] = -R[:,0]
+        T = -pose[:3,3].dot(R)
+        FovX = focal2fov(data_infos.focal[0], image.shape[2])
+        FovY = focal2fov(data_infos.focal[0], image.shape[1])
+        cameras.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+                            image_path=image_path, image_name=image_name, width=image.shape[2], height=image.shape[1],
+                            time = time, mask=None))
+    return cameras
+
+def readdynerfInfo(datadir,use_bg_points,eval):
+    # loading all the data follow hexplane format
+    # ply_path = os.path.join(datadir, "points3D_dense.ply")
+    ply_path = os.path.join(datadir, "points3D_downsample2.ply")
+    from scene.neural_3D_dataset_NDC import Neural3D_NDC_Dataset
+    train_dataset = Neural3D_NDC_Dataset(
+    datadir,
+    "train",
+    1.0,
+    time_scale=1,
+    scene_bbox_min=[-2.5, -2.0, -1.0],
+    scene_bbox_max=[2.5, 2.0, 1.0],
+    eval_index=0,
+        )    
+    test_dataset = Neural3D_NDC_Dataset(
+    datadir,
+    "test",
+    1.0,
+    time_scale=1,
+    scene_bbox_min=[-2.5, -2.0, -1.0],
+    scene_bbox_max=[2.5, 2.0, 1.0],
+    eval_index=0,
+        )
+    train_cam_infos = format_infos(train_dataset,"train")
+    val_cam_infos = format_render_poses(test_dataset.val_poses,test_dataset)
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+
+    # xyz = np.load
+    pcd = fetchPly(ply_path)
+    print("origin points,",pcd.points.shape[0])
+    
+    print("after points,",pcd.points.shape[0])
+
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_dataset,
+                           test_cameras=test_dataset,
+                           video_cameras=val_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path,
+                           maxtime=300
+                           )
+    return scene_info
+
 
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,  # colmap dataset reader from official 3D Gaussian [https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/]
@@ -662,4 +751,5 @@ sceneLoadTypeCallbacks = {
     "DTU": readNeuSDTUInfo,  # DTU dataset used in Tensor4D [https://github.com/DSaurus/Tensor4D]
     "nerfies": readNerfiesInfo,  # NeRFies & HyperNeRF dataset proposed by [https://github.com/google/hypernerf/releases/tag/v0.1]
     "plenopticVideo": readPlenopticVideoDataset,  # Neural 3D dataset in [https://github.com/facebookresearch/Neural_3D_Video]
+    "dynerf": readdynerfInfo,  # 4DGS way processing Neural 3D dataset
 }
