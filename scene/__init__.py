@@ -51,9 +51,12 @@ class Scene:
         self._load2gpu_on_the_fly: bool = getattr(args, 'load2gpu_on_the_fly', False)
         self._lazy_data_iter = None
         self._gpu_image_buffer: Optional[torch.Tensor] = None
+        self._gpu_flow_fwd_buffer: Optional[torch.Tensor] = None
+        self._gpu_flow_bwd_buffer: Optional[torch.Tensor] = None
         self._viewpoint_stack: list = []  # for non-lazy random sampling
 
         load_flow = getattr(args, 'use_flow_loss', False)
+        self._load_flow: bool = load_flow
 
         if os.path.exists(os.path.join(args.source_path, "poses_bounds.npy")):
             if getattr(args, 'lazy_load', False):
@@ -152,11 +155,11 @@ class Scene:
         prefetch_factor: int = 4,
         scale: float = 1.0,
     ) -> None:
-        """Initialize the async image prefetch pipeline.
+        """Initialize the async image (+ optional flow) prefetch pipeline.
 
         Call once after ``__init__``.  No-op if ``lazy_load`` is disabled.
-        When all cameras share the same resolution, a persistent GPU buffer
-        is pre-allocated so that training iterations incur **zero**
+        When all cameras share the same resolution, persistent GPU buffers
+        are pre-allocated so that training iterations incur **zero**
         ``cudaMalloc`` / ``cudaFree``.
         """
         from utils.dataload_utils import create_camera_dataloader, InfiniteDataLoader
@@ -170,6 +173,7 @@ class Scene:
             pin_memory=True,
             persistent_workers=True,
             shuffle=True,
+            load_flow=self._load_flow,
         )
         self._lazy_data_iter = InfiniteDataLoader(_dl)
 
@@ -181,9 +185,21 @@ class Scene:
             w, h = resolutions.pop()
             self._gpu_image_buffer = torch.empty(
                 3, h, w, dtype=torch.float32, device="cuda")
+
+            # Flow buffers: fp16 [2, H, W] — allocated only if flow is used.
+            if self._load_flow:
+                self._gpu_flow_fwd_buffer = torch.empty(
+                    2, h, w, dtype=torch.float16, device="cuda")
+                self._gpu_flow_bwd_buffer = torch.empty(
+                    2, h, w, dtype=torch.float16, device="cuda")
+
+            flow_info = ""
+            if self._load_flow:
+                n_with_flow = sum(1 for c in cameras if c.has_flow)
+                flow_info = f", flow={n_with_flow}/{len(cameras)}"
             print(f"[INFO] Lazy DataLoader: {len(cameras)} cameras, "
                   f"{num_workers} workers, prefetch={prefetch_factor}, "
-                  f"GPU buffer={w}x{h} (zero-alloc)")
+                  f"GPU buffer={w}x{h} (zero-alloc){flow_info}")
         else:
             print(f"[INFO] Lazy DataLoader: {len(cameras)} cameras, "
                   f"{num_workers} workers, prefetch={prefetch_factor}, "
@@ -195,6 +211,9 @@ class Scene:
         * **Lazy mode** — pulls from the async DataLoader and copies the
           pre-fetched pinned tensor into the persistent GPU buffer (or
           falls back to ``.to('cuda')`` for mixed-resolution datasets).
+          If ``load_flow`` is enabled, prefetched flow tensors are also
+          injected onto the camera and the consistency mask is computed
+          on GPU (zero host-side IO stall).
         * **Eager mode** — pops a random camera from an internal
           ``viewpoint_stack`` that auto-refills each epoch.
         """
@@ -202,7 +221,7 @@ class Scene:
             assert self._lazy_data_iter is not None, (
                 "Call scene.setup_lazy_dataloader() before next_train_camera()")
             cameras = self.getTrainCameras(scale)
-            _batch_idx, _batch_img = next(self._lazy_data_iter)
+            _batch_idx, _batch_img, _flow_fwd, _flow_bwd = next(self._lazy_data_iter)
             cam = cameras[_batch_idx.item()]
             pinned_img = _batch_img.squeeze(0)          # [3,H,W] pinned CPU
 
@@ -214,6 +233,36 @@ class Scene:
             else:
                 # Fallback: caching allocator handles de/allocation
                 cam.original_image = pinned_img.to("cuda", non_blocking=True)
+
+            # ── Inject prefetched flow data ────────────────────────────
+            if self._load_flow and _flow_fwd.numel() > 0:
+                # _flow_fwd: [2, H, W] fp16 pinned; _flow_bwd: same
+                if (self._gpu_flow_fwd_buffer is not None
+                        and _flow_fwd.shape == self._gpu_flow_fwd_buffer.shape):
+                    self._gpu_flow_fwd_buffer.copy_(_flow_fwd, non_blocking=True)
+                    cam.flow_fwd = self._gpu_flow_fwd_buffer
+                else:
+                    cam.flow_fwd = _flow_fwd.to("cuda", non_blocking=True)
+
+                if _flow_bwd.numel() > 0:
+                    if (self._gpu_flow_bwd_buffer is not None
+                            and _flow_bwd.shape == self._gpu_flow_bwd_buffer.shape):
+                        self._gpu_flow_bwd_buffer.copy_(_flow_bwd, non_blocking=True)
+                        cam.flow_bwd = self._gpu_flow_bwd_buffer
+                    else:
+                        cam.flow_bwd = _flow_bwd.to("cuda", non_blocking=True)
+
+                    # Compute consistency mask on GPU (fast, avoids CPU↔GPU
+                    # round-trip that the old per-iteration load_flow() did)
+                    from utils.optic_flow_utils import forward_backward_consistency_check
+                    mask_f32 = forward_backward_consistency_check(
+                        cam.flow_fwd.float(), cam.flow_bwd.float(),
+                        alpha1=0.01, alpha2=0.5,
+                    )
+                    cam.flow_mask = mask_f32.bool()
+                else:
+                    cam.flow_bwd = None
+                    cam.flow_mask = None
 
             return cam, len(cameras)
 
@@ -231,14 +280,18 @@ class Scene:
         return cam, total_frame
 
     def release_camera_image(self, cam) -> None:
-        """Drop the camera's image reference after ``loss.backward()``.
+        """Drop the camera's image (and flow) references after ``loss.backward()``.
 
         In lazy-buffer mode the underlying GPU memory stays allocated on
-        ``self._gpu_image_buffer`` — only the Python reference is cleared,
-        so no ``cudaFree`` ever occurs.
+        ``self._gpu_image_buffer`` / ``self._gpu_flow_*_buffer`` — only the
+        Python references are cleared, so no ``cudaFree`` ever occurs.
         """
         if self._lazy_mode:
             cam.original_image = None          # buffer stays alive on self
+            # Also clear flow references (buffers persist on Scene)
+            cam.flow_fwd = None
+            cam.flow_bwd = None
+            cam.flow_mask = None
         elif self._load2gpu_on_the_fly:
             cam.load2device("cpu")
 

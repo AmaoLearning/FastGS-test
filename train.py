@@ -216,8 +216,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             and iteration >= opt.flow_loss_from_iter
             and iteration % opt.flow_loss_interval == 0
             and viewpoint_cam.has_flow):
-            # 延迟加载：仅在需要时从磁盘读取光流到 GPU
-            viewpoint_cam.load_flow(device='cuda')
+            # Lazy mode: flow was already prefetched by the DataLoader and
+            # injected onto the camera by Scene.next_train_camera().
+            # Eager mode: load from disk synchronously (fallback).
+            if viewpoint_cam.flow_fwd is None:
+                viewpoint_cam.load_flow(device='cuda')
             flow_gt = viewpoint_cam.flow_fwd  # [2, H, W]
             # 计算 world-space velocity（当前时刻）
             N = gaussians.get_xyz.shape[0]
@@ -268,12 +271,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
         
         loss.backward()
 
-        # 释放光流张量以回收 GPU 显存（每次迭代最多只驻留 1 帧的光流）
-        viewpoint_cam.unload_flow()
-
         iter_end.record()
 
-        # Release image VRAM (lazy: drop ref to buffer; eager: move to CPU)
+        # Release image + flow VRAM.
+        # Lazy mode: Scene.release_camera_image() drops references; GPU
+        #   buffers persist on Scene for zero-alloc reuse.
+        # Eager mode: unload_flow() frees the per-camera tensors.
+        if not scene.lazy_mode:
+            viewpoint_cam.unload_flow()
         scene.release_camera_image(viewpoint_cam)
 
         with torch.no_grad():
