@@ -746,6 +746,165 @@ def readdynerfInfo(datadir,use_bg_points,eval):
     return scene_info
 
 
+# ── N3V Lazy Reader (Phase 1: metadata only, zero image IO) ──────────
+
+
+def readCamerasFromDynerfLazy(
+    path: str,
+    split: str,
+    eval_index: int = 0,
+    num_frames: int = 300,
+    load_flow: bool = False,
+):
+    """Metadata-only N3V camera reader matching the *dynerf* pipeline.
+
+    Camera parameters (R, T, FoV, fid) are computed identically to
+    ``Neural3D_NDC_Dataset.load_images_path`` + ``format_infos``.
+    **No image files are opened** — only absolute paths are stored.
+    """
+    poses_arr = np.load(os.path.join(path, "poses_bounds.npy"))
+    poses = poses_arr[:, :-2].reshape(-1, 3, 5)
+
+    H_raw, W_raw, focal_raw = poses[0, :, -1]
+
+    # Neural3D_NDC_Dataset convention: target (1352, 1014), downsample = 2
+    img_w, img_h = 1352, 1014
+    downsample_factor = 2704.0 / img_w  # = 2.0
+    focal = focal_raw / downsample_factor
+
+    # LLFF pose conversion (identical to Neural3D_NDC_Dataset.load_meta)
+    poses = np.concatenate(
+        [poses[..., 1:2], -poses[..., :1], poses[..., 2:4]], -1
+    )
+
+    videos = sorted(glob(os.path.join(path, "cam*")))
+    assert len(videos) == poses.shape[0], (
+        f"Camera count mismatch: {len(videos)} dirs vs {poses.shape[0]} poses"
+    )
+
+    FovX = focal2fov(focal, img_w)
+    FovY = focal2fov(focal, img_h)
+
+    # Optical flow directory detection
+    has_flow = False
+    flow_root = os.path.join(path, "optical_flow")
+    if load_flow:
+        has_flow = os.path.isdir(flow_root)
+        if has_flow:
+            print(f"[INFO] Found optical flow at {flow_root}")
+
+    cam_infos = []
+    global_idx = 0
+
+    for cam_i in range(len(videos)):
+        # Train / test split — matches Neural3D_NDC_Dataset (eval_index = test)
+        if split == "train" and cam_i == eval_index:
+            continue
+        if split == "test" and cam_i != eval_index:
+            continue
+
+        video_dir = videos[cam_i]
+        cam_name = os.path.basename(video_dir)  # e.g. "cam00"
+        image_dir = os.path.join(video_dir, "images")
+        image_names = sorted(os.listdir(image_dir))
+
+        # R, T extraction — identical to Neural3D_NDC_Dataset.load_images_path
+        pose = np.array(poses[cam_i])  # (3, 4)
+        R = pose[:3, :3].copy()
+        R = -R
+        R[:, 0] = -R[:, 0]
+        T = -pose[:3, 3].dot(R)
+
+        for frame_idx, img_name in enumerate(image_names[:num_frames]):
+            image_path = os.path.join(image_dir, img_name)
+            fid = frame_idx / num_frames  # dynerf convention: idx / N
+
+            flow_fwd_path = None
+            flow_bwd_path = None
+            if has_flow:
+                id_stem = Path(img_name).stem
+                flow_cam_dir = os.path.join(flow_root, cam_name)
+                fwd = os.path.join(flow_cam_dir, f"of_fwd_{id_stem}.npy")
+                bwd = os.path.join(flow_cam_dir, f"of_bwd_{id_stem}.npy")
+                if os.path.exists(fwd):
+                    flow_fwd_path = fwd
+                if os.path.exists(bwd):
+                    flow_bwd_path = bwd
+
+            cam_infos.append(CameraInfo(
+                uid=global_idx,
+                R=R, T=T,
+                FovY=FovY, FovX=FovX,
+                image=None,          # KEY: no image loaded
+                image_path=image_path,
+                image_name=f"{global_idx}",
+                width=img_w, height=img_h,
+                fid=fid,
+                flow_fwd_path=flow_fwd_path,
+                flow_bwd_path=flow_bwd_path,
+            ))
+            global_idx += 1
+
+    print(f"  -> {len(cam_infos)} cameras ({split}), images deferred to DataLoader")
+    return cam_infos
+
+
+def readN3VSceneInfoLazy(
+    datadir: str,
+    white_background: bool,
+    eval: bool,
+    num_frames: int = 300,
+    load_flow: bool = False,
+):
+    """N3V scene reader — loads **only metadata** (zero image IO at init).
+
+    Point cloud defaults to ``points3D_downsample2.ply``.
+    """
+    print("Reading Training Cameras (lazy, metadata only)")
+    train_cam_infos = readCamerasFromDynerfLazy(
+        datadir, "train", eval_index=0,
+        num_frames=num_frames, load_flow=load_flow,
+    )
+
+    test_cam_infos: list = []
+    if eval:
+        print("Reading Test Cameras (lazy, metadata only)")
+        test_cam_infos = readCamerasFromDynerfLazy(
+            datadir, "test", eval_index=0,
+            num_frames=num_frames, load_flow=load_flow,
+        )
+    else:
+        test_cam_infos = []
+
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+
+    ply_path = os.path.join(datadir, "points3D_downsample2.ply")
+    if not os.path.exists(ply_path):
+        num_pts = 100_000
+        print(f"Generating random point cloud ({num_pts})...")
+        xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
+        shs = np.random.random((num_pts, 3)) / 255.0
+        pcd = BasicPointCloud(
+            points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
+        storePly(ply_path, xyz, SH2RGB(shs) * 255)
+    else:
+        print(f"Using preprocessed point cloud at {ply_path}!")
+
+    try:
+        pcd = fetchPly(ply_path)
+    except Exception:
+        pcd = None
+
+    scene_info = SceneInfo(
+        point_cloud=pcd,
+        train_cameras=train_cam_infos,
+        test_cameras=test_cam_infos,
+        nerf_normalization=nerf_normalization,
+        ply_path=ply_path,
+    )
+    return scene_info
+
+
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,  # colmap dataset reader from official 3D Gaussian [https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/]
     "Blender": readNerfSyntheticInfo,  # D-NeRF dataset [https://drive.google.com/file/d/1uHVyApwqugXTFuIRRlE4abTW8_rrVeIK/view?usp=sharing]
@@ -753,4 +912,5 @@ sceneLoadTypeCallbacks = {
     "nerfies": readNerfiesInfo,  # NeRFies & HyperNeRF dataset proposed by [https://github.com/google/hypernerf/releases/tag/v0.1]
     "plenopticVideo": readPlenopticVideoDataset,  # Neural 3D dataset in [https://github.com/facebookresearch/Neural_3D_Video]
     "dynerf": readdynerfInfo,  # 4DGS way processing Neural 3D dataset
+    "N3VLazy": readN3VSceneInfoLazy,  # N3V lazy loader — metadata only, zero OOM
 }

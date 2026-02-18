@@ -58,6 +58,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt, args)
 
+    # Initialize async image prefetch pipeline (lazy mode only)
+    if not scene._lazy_mode:
+        scene.setup_lazy_dataloader()
+
     # ── Optical Flow Loss Setup ──
     flow_helper = None
     flow_loss_fn = None
@@ -91,7 +95,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
     optim_end = torch.cuda.Event(enable_timing=True)
     total_time = 0.0
 
-    viewpoint_stack = None
     ema_loss_for_log = 0.0
     # best_psnr = 0.0
     # best_iteration = 0
@@ -126,15 +129,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             gaussians.oneupSHdegree()
 
         # Pick a random Camera
-        if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
-
-        total_frame = len(viewpoint_stack)
+        viewpoint_cam, total_frame = scene.next_train_camera()
         time_interval = 1 / total_frame
-
-        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
-        if dataset.load2gpu_on_the_fly:
-            viewpoint_cam.load2device()
         fid = viewpoint_cam.fid
 
         velocity_loss = None  # 仅在需要时计算
@@ -274,8 +270,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
 
         iter_end.record()
 
-        if dataset.load2gpu_on_the_fly:
-            viewpoint_cam.load2device('cpu')
+        # Release image VRAM (lazy: drop ref to buffer; eager: move to CPU)
+        scene.release_camera_image(viewpoint_cam)
 
         with torch.no_grad():
             gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
@@ -319,8 +315,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                     my_viewpoint_stack = scene.getTrainCameras().copy()
                     camlist = sampling_cameras(my_viewpoint_stack)
 
-                    # The multiview consistent densification of fastgs
+                    scene.ensure_cameras_loaded(camlist)
                     importance_score, pruning_score = compute_gaussian_score_fastgs(camlist, gaussians, pipe, background, opt, d_xyz, d_rotation, d_scaling, dataset.is_6dof, DENSIFY=True)
+                    scene.release_cameras(camlist)
                     
                     # 生成 velocity_loss 掩码并传入 densification
                     velocity_mask = None
@@ -370,7 +367,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 my_viewpoint_stack = scene.getTrainCameras().copy()
                 camlist = sampling_cameras(my_viewpoint_stack)
 
-                _, pruning_score = compute_gaussian_score_fastgs(camlist, gaussians, pipe, background, opt, d_xyz, d_rotation, d_scaling, dataset.is_6dof)                    
+                scene.ensure_cameras_loaded(camlist)
+                _, pruning_score = compute_gaussian_score_fastgs(camlist, gaussians, pipe, background, opt, d_xyz, d_rotation, d_scaling, dataset.is_6dof)
+                scene.release_cameras(camlist)
+
                 gaussians.final_prune_fastgs(min_opacity = 0.1, pruning_score = pruning_score)
             
             if iteration < opt.iterations:

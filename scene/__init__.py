@@ -12,6 +12,10 @@
 import os
 import random
 import json
+from typing import Optional, List, Tuple
+
+import torch
+
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
@@ -42,14 +46,29 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
 
+        # ── Lazy loading state ──
+        self._lazy_mode: bool = getattr(args, 'lazy_load', False)
+        self._load2gpu_on_the_fly: bool = getattr(args, 'load2gpu_on_the_fly', False)
+        self._lazy_data_iter = None
+        self._gpu_image_buffer: Optional[torch.Tensor] = None
+        self._viewpoint_stack: list = []  # for non-lazy random sampling
+
         load_flow = getattr(args, 'use_flow_loss', False)
 
         if os.path.exists(os.path.join(args.source_path, "poses_bounds.npy")):
-            # print(f"Found poses_bounds.npy, assuming Neu3D/LLFF data set! (num_t=300, flow={load_flow})")
-            # scene_info = sceneLoadTypeCallbacks["plenopticVideo"](args.source_path, args.eval, num_images=30,
-            #                                                        load_flow=load_flow)
-            print("Found poses_bounds.npy file, assuming Neur3D data set!")
-            scene_info = sceneLoadTypeCallbacks["dynerf"](args.source_path, args.white_background, args.eval)
+            if getattr(args, 'lazy_load', False):
+                _n_frames = getattr(args, 'num_images', 300)
+                print(f"Found poses_bounds.npy, using N3V lazy loader "
+                      f"(metadata only, {_n_frames} frames/cam, flow={load_flow})")
+                scene_info = sceneLoadTypeCallbacks["N3VLazy"](
+                    args.source_path, args.white_background, args.eval,
+                    num_frames=_n_frames, load_flow=load_flow)
+            else:
+                # print(f"Found poses_bounds.npy, assuming Neu3D/LLFF data set! (num_t=300, flow={load_flow})")
+                # scene_info = sceneLoadTypeCallbacks["plenopticVideo"](args.source_path, args.eval, num_images=30,
+                #                                                        load_flow=load_flow)
+                print("Found poses_bounds.npy file, assuming Neur3D data set!")
+                scene_info = sceneLoadTypeCallbacks["dynerf"](args.source_path, args.white_background, args.eval)
         elif os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval,
                                                           load_flow=load_flow)
@@ -120,3 +139,124 @@ class Scene:
 
     def getTestCameras(self, scale=1.0):
         return self.test_cameras[scale]
+
+    # ── Lazy loading API ─────────────────────────────────────────────
+
+    @property
+    def lazy_mode(self) -> bool:
+        return self._lazy_mode
+
+    def setup_lazy_dataloader(
+        self,
+        num_workers: int = 8,
+        prefetch_factor: int = 4,
+        scale: float = 1.0,
+    ) -> None:
+        """Initialize the async image prefetch pipeline.
+
+        Call once after ``__init__``.  No-op if ``lazy_load`` is disabled.
+        When all cameras share the same resolution, a persistent GPU buffer
+        is pre-allocated so that training iterations incur **zero**
+        ``cudaMalloc`` / ``cudaFree``.
+        """
+        from utils.dataload_utils import create_camera_dataloader, InfiniteDataLoader
+
+        cameras = self.getTrainCameras(scale)
+        _dl = create_camera_dataloader(
+            cameras,
+            batch_size=1,
+            num_workers=num_workers,
+            prefetch_factor=prefetch_factor,
+            pin_memory=True,
+            persistent_workers=True,
+            shuffle=True,
+        )
+        self._lazy_data_iter = InfiniteDataLoader(_dl)
+
+        # Pre-allocate a fixed CUDA buffer if every camera uses the same
+        # resolution (the common case for N3V).  This avoids even the
+        # caching-allocator look-up on every iteration.
+        resolutions = set(c._target_resolution for c in cameras)
+        if len(resolutions) == 1:
+            w, h = resolutions.pop()
+            self._gpu_image_buffer = torch.empty(
+                3, h, w, dtype=torch.float32, device="cuda")
+            print(f"[INFO] Lazy DataLoader: {len(cameras)} cameras, "
+                  f"{num_workers} workers, prefetch={prefetch_factor}, "
+                  f"GPU buffer={w}x{h} (zero-alloc)")
+        else:
+            print(f"[INFO] Lazy DataLoader: {len(cameras)} cameras, "
+                  f"{num_workers} workers, prefetch={prefetch_factor}, "
+                  f"(mixed resolutions, no persistent buffer)")
+
+    def next_train_camera(self, scale: float = 1.0):
+        """Return ``(camera, total_frame)`` with the image ready on GPU.
+
+        * **Lazy mode** — pulls from the async DataLoader and copies the
+          pre-fetched pinned tensor into the persistent GPU buffer (or
+          falls back to ``.to('cuda')`` for mixed-resolution datasets).
+        * **Eager mode** — pops a random camera from an internal
+          ``viewpoint_stack`` that auto-refills each epoch.
+        """
+        if self._lazy_mode:
+            assert self._lazy_data_iter is not None, (
+                "Call scene.setup_lazy_dataloader() before next_train_camera()")
+            cameras = self.getTrainCameras(scale)
+            _batch_idx, _batch_img = next(self._lazy_data_iter)
+            cam = cameras[_batch_idx.item()]
+            pinned_img = _batch_img.squeeze(0)          # [3,H,W] pinned CPU
+
+            if (self._gpu_image_buffer is not None
+                    and pinned_img.shape == self._gpu_image_buffer.shape):
+                # Zero-alloc fast path: DMA into persistent buffer
+                self._gpu_image_buffer.copy_(pinned_img, non_blocking=True)
+                cam.original_image = self._gpu_image_buffer
+            else:
+                # Fallback: caching allocator handles de/allocation
+                cam.original_image = pinned_img.to("cuda", non_blocking=True)
+
+            return cam, len(cameras)
+
+        # ── Eager (non-lazy) path ──
+        if not self._viewpoint_stack:
+            self._viewpoint_stack = self.getTrainCameras(scale).copy()
+
+        total_frame = len(self._viewpoint_stack)
+        idx = random.randint(0, len(self._viewpoint_stack) - 1)
+        cam = self._viewpoint_stack.pop(idx)
+
+        if self._load2gpu_on_the_fly:
+            cam.load2device()
+
+        return cam, total_frame
+
+    def release_camera_image(self, cam) -> None:
+        """Drop the camera's image reference after ``loss.backward()``.
+
+        In lazy-buffer mode the underlying GPU memory stays allocated on
+        ``self._gpu_image_buffer`` — only the Python reference is cleared,
+        so no ``cudaFree`` ever occurs.
+        """
+        if self._lazy_mode:
+            cam.original_image = None          # buffer stays alive on self
+        elif self._load2gpu_on_the_fly:
+            cam.load2device("cpu")
+
+    def ensure_cameras_loaded(self, cameras: list) -> None:
+        """Synchronously load images for a batch of cameras.
+
+        Called before multi-view scoring (densification / pruning).
+        No-op in eager mode (images are already resident).
+        """
+        if self._lazy_mode:
+            for cam in cameras:
+                cam.load_image_to_gpu("cuda")
+
+    def release_cameras(self, cameras: list) -> None:
+        """Release images for a batch of cameras after scoring.
+
+        No-op in eager mode.
+        """
+        if self._lazy_mode:
+            for cam in cameras:
+                cam.unload_image()

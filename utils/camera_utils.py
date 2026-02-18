@@ -58,11 +58,68 @@ def loadCam(args, id, cam_info, resolution_scale):
                   flow_fwd_path=cam_info.flow_fwd_path, flow_bwd_path=cam_info.flow_bwd_path)
 
 
+def loadLazyCam(args, id, cam_info, resolution_scale):
+    """Create a :class:`LazyCamera` from a *CameraInfo* whose ``image`` is None.
+
+    Resolution logic mirrors :func:`loadCam` exactly, using
+    ``cam_info.width / cam_info.height`` instead of PIL image size.
+    """
+    from scene.cameras import LazyCamera
+
+    orig_w, orig_h = cam_info.width, cam_info.height
+
+    if args.resolution in [1, 2, 4, 8]:
+        resolution = (
+            round(orig_w / (resolution_scale * args.resolution)),
+            round(orig_h / (resolution_scale * args.resolution)),
+        )
+    else:
+        if args.resolution == -1:
+            if orig_w > 1600:
+                global WARNED
+                if not WARNED:
+                    print(
+                        "[ INFO ] Encountered quite large input images (>1.6K pixels width), rescaling to 1.6K.\n "
+                        "If this is not desired, please explicitly specify '--resolution/-r' as 1"
+                    )
+                    WARNED = True
+                global_down = orig_w / 1600
+            else:
+                global_down = 1
+        else:
+            global_down = orig_w / args.resolution
+
+        scale = float(global_down) * float(resolution_scale)
+        resolution = (int(orig_w / scale), int(orig_h / scale))
+
+    return LazyCamera(
+        colmap_id=cam_info.uid,
+        R=cam_info.R,
+        T=cam_info.T,
+        FoVx=cam_info.FovX,
+        FoVy=cam_info.FovY,
+        image_path=cam_info.image_path,
+        image_name=cam_info.image_name,
+        uid=id,
+        width=cam_info.width,
+        height=cam_info.height,
+        target_resolution=resolution,
+        data_device=args.data_device if not args.load2gpu_on_the_fly else 'cpu',
+        fid=cam_info.fid,
+        depth=cam_info.depth,
+        flow_fwd_path=getattr(cam_info, 'flow_fwd_path', None),
+        flow_bwd_path=getattr(cam_info, 'flow_bwd_path', None),
+    )
+
+
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []
 
     for id, c in enumerate(cam_infos):
-        camera_list.append(loadCam(args, id, c, resolution_scale))
+        if c.image is None:
+            camera_list.append(loadLazyCam(args, id, c, resolution_scale))
+        else:
+            camera_list.append(loadCam(args, id, c, resolution_scale))
 
     return camera_list
 

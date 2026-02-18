@@ -68,6 +68,10 @@ class ModelParams(ParamGroup):
         # optical flow loss
         self.use_flow_loss = False  # 是否启用投影光流损失
         # flow_dir 已废弃：光流数据现在由数据集读取器从 optical_flow/ 目录自动加载
+
+        # lazy loading — N3V large-scale dataset (zero OOM)
+        self.lazy_load = False
+        self.num_images = 300  # number of frames per camera for N3V dataset
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
