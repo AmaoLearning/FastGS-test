@@ -63,7 +63,7 @@ class ModelParams(ParamGroup):
 
         # velocity
         self.use_velocity = False
-        self.velocity_network_type = "mlp"  # "mlp" or "hash" - 使用 MLP 或 Hash Encoding
+        self.velocity_network_type = "mlp"  # "mlp", "hash", or "tcnn" - 使用 MLP、纯PyTorch Hash 或 tinycudann 加速
 
         # optical flow loss
         self.use_flow_loss = False  # 是否启用投影光流损失

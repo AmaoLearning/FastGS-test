@@ -33,7 +33,7 @@ except ImportError:
 
 import random
 from utils.fast_utils import compute_gaussian_score_fastgs, sampling_cameras
-from utils.motion_utils import VelocityNetwork, VelocityNetworkHash
+from utils.motion_utils import VelocityNetwork, VelocityNetworkHash, VelocityNetworkTcnn
 from utils.flow_rasterizer import FlowRasterizerHelper, OpticalFlowLoss
 from utils.optic_flow_utils import load_precomputed_flow
 
@@ -47,7 +47,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
 
     # velocity - 根据配置选择网络类型
     if dataset.use_velocity:
-        if dataset.velocity_network_type == "hash":
+        if dataset.velocity_network_type == "tcnn":
+            print("[INFO] Using tinycudann Velocity Network (fused hash + MLP)")
+            velocity = VelocityNetworkTcnn(is_blender=dataset.is_blender, is_6dof=dataset.is_6dof).cuda()
+        elif dataset.velocity_network_type == "hash":
             print("[INFO] Using Hash Encoding Velocity Network")
             velocity = VelocityNetworkHash(is_blender=dataset.is_blender, is_6dof=dataset.is_6dof).cuda()
         else:
