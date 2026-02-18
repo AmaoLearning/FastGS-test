@@ -328,15 +328,18 @@ class VelocityNetworkTcnn(nn.Module):
         # is preserved by keeping the same D and W.
         output_dim = 6 if is_6dof else 3
 
-        # tinycudann FullyFusedMLP requires n_neurons to be a multiple of
-        # 16; round up if necessary.
+        # FullyFusedMLP only supports width ≤ 128.  For W > 128 we fall
+        # back to CutlassMLP which uses NVIDIA Cutlass fused GEMM+ReLU
+        # kernels and supports arbitrary width (still ~2-4× faster than
+        # pure-PyTorch nn.Linear).
         fused_width = ((W + 15) // 16) * 16
+        mlp_otype = "FullyFusedMLP" if fused_width <= 128 else "CutlassMLP"
 
         self.mlp = tcnn.Network(
             n_input_dims=mlp_input_dim,
             n_output_dims=output_dim,
             network_config={
-                "otype": "FullyFusedMLP",
+                "otype": mlp_otype,
                 "activation": "ReLU",
                 "output_activation": "None",
                 "n_neurons": fused_width,
