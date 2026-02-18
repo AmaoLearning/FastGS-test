@@ -62,7 +62,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
     gaussians.training_setup(opt, args)
 
     # Initialize async image prefetch pipeline (lazy mode only)
-    if not scene._lazy_mode:
+    if scene._lazy_mode:
         scene.setup_lazy_dataloader()
 
     # ── Optical Flow Loss Setup ──
