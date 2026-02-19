@@ -35,8 +35,7 @@ def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration, views,
     makedirs(gts_path, exist_ok=True)
     makedirs(depth_path, exist_ok=True)
 
-    t_list = []
-    total_time=0.0
+    total_time = 0.0
 
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
         if load2gpu_on_the_fly:
@@ -49,8 +48,18 @@ def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration, views,
         fid = view.fid
         xyz = gaussians.get_xyz
         time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
+
+        # ---- timing starts (deform + render only, excludes I/O) ----
+        torch.cuda.synchronize()
+        t_start = time.time()
+
         d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input)
         results = render_fastgs(view, gaussians, pipeline, background, args.mult, d_xyz, d_rotation, d_scaling, is_6dof)
+
+        torch.cuda.synchronize()
+        total_time += time.time() - t_start
+        # ---- timing ends ----
+
         rendering = results["render"]
         depth = results["depth"]
         depth = depth / (depth.max() + 1e-5)
@@ -60,32 +69,10 @@ def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration, views,
         torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(depth, os.path.join(depth_path, '{0:05d}'.format(idx) + ".png"))
 
-        # Free image VRAM — 5100 cameras cannot all stay resident
+        # Free image VRAM — thousands of cameras cannot all stay resident
         if hasattr(view, 'unload_image'):
             view.unload_image()
 
-    for idx, view in enumerate(tqdm(views, desc="Rendering progress (timing)")):
-        # LazyCamera: reload image needed for render viewpoint params
-        if view.original_image is None and hasattr(view, 'load_image_to_gpu'):
-            view.load_image_to_gpu('cuda')
-
-        fid = view.fid
-        xyz = gaussians.get_xyz
-        time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
-
-        torch.cuda.synchronize()
-        t_start = time.time()
-
-        d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input)
-        results = render_fastgs(view, gaussians, pipeline, background, args.mult, d_xyz, d_rotation, d_scaling, is_6dof)
-
-        torch.cuda.synchronize()
-        t_end = time.time()
-        total_time += t_end - t_start
-
-        if hasattr(view, 'unload_image'):
-            view.unload_image()
-    
     num_frames = len(views)
     avg_time = total_time / num_frames if num_frames > 0 else 0
     fps = 1.0 / avg_time if avg_time > 0 else 0

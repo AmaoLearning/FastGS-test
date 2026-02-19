@@ -6,12 +6,12 @@ python train.py -s /root/datasets/Neu3D/flame_steak -m output/flame_steak --eval
 python train.py -s /root/datasets/Neu3D/sear_steak -m output/sear_steak --eval --iterations 30000 --lazy_load
 python train.py -s /root/datasets/Neu3D/flame_salmon_1 -m output/flame_salmon_1 --eval --iterations 30000 --lazy_load
 
-python render.py -m output/coffee_martini --mode render
-python render.py -m output/cook_spinach --mode render
-python render.py -m output/cut_roasted_beef --mode render
-python render.py -m output/flame_steak --mode render
-python render.py -m output/sear_steak --mode render
-python render.py -m output/flame_salmon_1 --mode render
+python render.py -m output/coffee_martini --mode render --skip_train
+python render.py -m output/cook_spinach --mode render --skip_train
+python render.py -m output/cut_roasted_beef --mode render --skip_train
+python render.py -m output/flame_steak --mode render --skip_train
+python render.py -m output/sear_steak --mode render --skip_train
+python render.py -m output/flame_salmon_1 --mode render --skip_train
 
 python metrics.py -m output/coffee_martini
 python metrics.py -m output/cook_spinach
