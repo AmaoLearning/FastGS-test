@@ -41,6 +41,11 @@ def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration, views,
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
         if load2gpu_on_the_fly:
             view.load2device()
+
+        # LazyCamera: image starts as None; load from disk on demand
+        if view.original_image is None and hasattr(view, 'load_image_to_gpu'):
+            view.load_image_to_gpu('cuda')
+
         fid = view.fid
         xyz = gaussians.get_xyz
         time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
@@ -55,7 +60,15 @@ def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration, views,
         torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(depth, os.path.join(depth_path, '{0:05d}'.format(idx) + ".png"))
 
-    for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
+        # Free image VRAM — 5100 cameras cannot all stay resident
+        if hasattr(view, 'unload_image'):
+            view.unload_image()
+
+    for idx, view in enumerate(tqdm(views, desc="Rendering progress (timing)")):
+        # LazyCamera: reload image needed for render viewpoint params
+        if view.original_image is None and hasattr(view, 'load_image_to_gpu'):
+            view.load_image_to_gpu('cuda')
+
         fid = view.fid
         xyz = gaussians.get_xyz
         time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
@@ -69,6 +82,9 @@ def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration, views,
         torch.cuda.synchronize()
         t_end = time.time()
         total_time += t_end - t_start
+
+        if hasattr(view, 'unload_image'):
+            view.unload_image()
     
     num_frames = len(views)
     avg_time = total_time / num_frames if num_frames > 0 else 0
@@ -94,7 +110,7 @@ def interpolate_time(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, 
         xyz = gaussians.get_xyz
         time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
         d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input)
-        results = render(view, gaussians, pipeline, background, args, d_xyz, d_rotation, d_scaling, is_6dof)
+        results = render_fastgs(view, gaussians, pipeline, background, args.mult, d_xyz, d_rotation, d_scaling, is_6dof)
         rendering = results["render"]
         renderings.append(to8b(rendering.cpu().numpy()))
         depth = results["depth"]
@@ -140,7 +156,7 @@ def interpolate_view(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, 
         xyz = gaussians.get_xyz
         time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
         d_xyz, d_rotation, d_scaling = timer.step(xyz.detach(), time_input)
-        results = render(view, gaussians, pipeline, background, args, d_xyz, d_rotation, d_scaling, is_6dof)
+        results = render_fastgs(view, gaussians, pipeline, background, args.mult, d_xyz, d_rotation, d_scaling, is_6dof)
         rendering = results["render"]
         renderings.append(to8b(rendering.cpu().numpy()))
         depth = results["depth"]
@@ -184,7 +200,7 @@ def interpolate_all(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, v
         xyz = gaussians.get_xyz
         time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
         d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input)
-        results = render(view, gaussians, pipeline, background, args, d_xyz, d_rotation, d_scaling, is_6dof)
+        results = render_fastgs(view, gaussians, pipeline, background, args.mult, d_xyz, d_rotation, d_scaling, is_6dof)
         rendering = results["render"]
         renderings.append(to8b(rendering.cpu().numpy()))
         depth = results["depth"]
@@ -232,7 +248,7 @@ def interpolate_poses(model_path, load2gpt_on_the_fly, is_6dof, name, iteration,
         time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
         d_xyz, d_rotation, d_scaling = timer.step(xyz.detach(), time_input)
 
-        results = render(view, gaussians, pipeline, background, args, d_xyz, d_rotation, d_scaling, is_6dof)
+        results = render_fastgs(view, gaussians, pipeline, background, args.mult, d_xyz, d_rotation, d_scaling, is_6dof)
         rendering = results["render"]
         renderings.append(to8b(rendering.cpu().numpy()))
         depth = results["depth"]
@@ -288,7 +304,7 @@ def interpolate_view_original(model_path, load2gpt_on_the_fly, is_6dof, name, it
         time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
         d_xyz, d_rotation, d_scaling = timer.step(xyz.detach(), time_input)
 
-        results = render(view, gaussians, pipeline, background, args, d_xyz, d_rotation, d_scaling, is_6dof)
+        results = render_fastgs(view, gaussians, pipeline, background, args.mult, d_xyz, d_rotation, d_scaling, is_6dof)
         rendering = results["render"]
         renderings.append(to8b(rendering.cpu().numpy()))
         depth = results["depth"]
