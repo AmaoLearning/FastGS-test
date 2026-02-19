@@ -10,6 +10,7 @@
 #
 
 import os
+import time
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim, kl_divergence, l2_loss, velocity_temporal_smoothness_loss
@@ -91,11 +92,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-    iter_start = torch.cuda.Event(enable_timing=True)
-    iter_end = torch.cuda.Event(enable_timing=True)
-
-    optim_start = torch.cuda.Event(enable_timing=True)
-    optim_end = torch.cuda.Event(enable_timing=True)
+    # Wall-clock timer — CUDA event timing was removed because
+    # Event.elapsed_time() and torch.cuda.synchronize() block the CPU
+    # every iteration, starving the GPU of work.
+    wall_start = time.perf_counter()
     total_time = 0.0
 
     ema_loss_for_log = 0.0
@@ -119,8 +119,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                     break
             except Exception as e:
                 network_gui.conn = None
-
-        iter_start.record()
 
         gaussians.update_learning_rate(iteration)
         deform.update_learning_rate(iteration)
@@ -216,11 +214,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             and iteration >= opt.flow_loss_from_iter
             and iteration % opt.flow_loss_interval == 0
             and viewpoint_cam.has_flow):
-            # Lazy mode: flow was already prefetched by the DataLoader and
-            # injected onto the camera by Scene.next_train_camera().
-            # Eager mode: load from disk synchronously (fallback).
-            if viewpoint_cam.flow_fwd is None:
-                viewpoint_cam.load_flow(device='cuda')
+            # On-demand flow loading: only ~10% of iterations reach this
+            # path (flow_loss_interval=10), so the sync IO cost is amortized.
+            viewpoint_cam.load_flow(device='cuda')
             flow_gt = viewpoint_cam.flow_fwd  # [2, H, W]
             # 计算 world-space velocity（当前时刻）
             N = gaussians.get_xyz.shape[0]
@@ -271,14 +267,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
         
         loss.backward()
 
-        iter_end.record()
-
-        # Release image + flow VRAM.
-        # Lazy mode: Scene.release_camera_image() drops references; GPU
-        #   buffers persist on Scene for zero-alloc reuse.
-        # Eager mode: unload_flow() frees the per-camera tensors.
-        if not scene.lazy_mode:
-            viewpoint_cam.unload_flow()
+        # Release VRAM.
+        # Flow: unload_flow() frees per-camera flow tensors (no-op if none loaded).
+        # Image: release_camera_image() drops the reference; in lazy mode the
+        #   GPU buffer persists on Scene for zero-alloc reuse.
+        viewpoint_cam.unload_flow()
         scene.release_camera_image(viewpoint_cam)
 
         with torch.no_grad():
@@ -297,7 +290,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                                                                  radii[visibility_filter])
 
             # Log and save
-            iter_time = iter_start.elapsed_time(iter_end)
             # cur_psnr = training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_time,
             #                            testing_iterations, scene, render_fastgs, (pipe, background, opt.mult), deform,
             #                            dataset.load2gpu_on_the_fly, dataset.is_6dof)
@@ -312,7 +304,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 deform.save_weights(args.model_path, iteration)
 
             # Densification
-            optim_start.record()
             if iteration < opt.densify_until_iter:
                 # 累积 velocity loss 统计 (用于 densification 掩码)
                 if dataset.use_velocity and per_gaussian_velocity_loss is not None:
@@ -389,14 +380,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                     velocity.optimizer.zero_grad()
                 gaussians.optimizer_step(iteration)
 
-            optim_end.record()
-            torch.cuda.synchronize()
-            optim_time = optim_start.elapsed_time(optim_end)
-            total_time += (iter_time + optim_time) / 1e3
-
+    # Final sync — only once at the very end
+    torch.cuda.synchronize()
+    total_time = time.perf_counter() - wall_start
     # print("Best PSNR = {} in Iteration {}".format(best_psnr, best_iteration))
     print(f"Gaussian number: {gaussians._xyz.shape[0]}")
-    print(f"Dash time: {total_time}")
+    print(f"Dash time: {total_time:.2f}s")
 
 
 def prepare_output_and_logger(args):
