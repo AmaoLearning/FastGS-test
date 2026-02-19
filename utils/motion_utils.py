@@ -7,6 +7,7 @@ import os
 from utils.system_utils import searchForMaxIteration
 from utils.general_utils import get_expon_lr_func
 from typing import Tuple, Union
+from torch.func import vmap, jacrev
 
 # tinycudann: optional — only needed when velocity_network_type == "tcnn"
 try:
@@ -65,6 +66,10 @@ def compute_velocity_jacobian_quantities(
         """单点速度函数，输入 xyz [3], t [1]，输出 v [3]"""
         return velocity_net(xyz.unsqueeze(0), t.unsqueeze(0)).squeeze(0)
     
+    # Create vmap+jacrev function ONCE outside the loop
+    jacobian_fn = jacrev(velocity_fn, argnums=0)
+    batched_jacobian_fn = vmap(jacobian_fn, in_dims=(0, 0))
+    
     # 分块处理以控制显存
     for start_idx in range(0, N, chunk_size):
         end_idx = min(start_idx + chunk_size, N)
@@ -77,18 +82,8 @@ def compute_velocity_jacobian_quantities(
             chunk_velocity = velocity_net(chunk_coords, chunk_times)  # [chunk, 3]
             velocity[start_idx:end_idx] = chunk_velocity
             
-            # 使用 vmap + jacrev 计算雅可比矩阵
-            # jacrev 计算 ∂v/∂xyz，返回 [3, 3] 的雅可比矩阵
-            # vmap 将其向量化到整个 batch
+            # 使用 vmap + jacrev 计算雅可比矩阵 (functions hoisted above loop)
             try:
-                from torch.func import vmap, jacrev
-                
-                # 对 xyz 求雅可比矩阵
-                jacobian_fn = jacrev(velocity_fn, argnums=0)
-                
-                # vmap 向量化
-                batched_jacobian_fn = vmap(jacobian_fn, in_dims=(0, 0))
-                
                 # 计算雅可比矩阵 [chunk, 3, 3]
                 # J[i,j] = ∂v_i / ∂x_j
                 jacobians = batched_jacobian_fn(chunk_coords, chunk_times)

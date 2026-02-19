@@ -46,6 +46,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
     deform = DeformModel(dataset.is_blender, dataset.is_6dof)
     deform.train_setting(opt)
 
+    # torch.compile: fuse small Linear+ReLU kernels in the deform MLP to
+    # reduce per-layer kernel launch overhead (~8 layers × 5μs ≈ 40μs/iter).
+    # Uses 'default' mode (inductor, no CUDA graphs) to tolerate dynamic
+    # shapes during densification.  Guards against older PyTorch (<2.0).
+    try:
+        deform.deform = torch.compile(deform.deform, mode="default", dynamic=True)
+        print("[INFO] Deform network compiled with torch.compile (inductor)")
+    except Exception as _e:
+        print(f"[INFO] torch.compile unavailable: {_e}, using eager mode")
+
     # velocity - 根据配置选择网络类型
     if dataset.use_velocity:
         if dataset.velocity_network_type == "tcnn":
@@ -202,7 +212,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
         # depth = render_pkg_re["depth"]
 
         # Loss
-        gt_image = viewpoint_cam.original_image.cuda()
+        gt_image = viewpoint_cam.original_image
+        if not gt_image.is_cuda:
+            gt_image = gt_image.cuda()
         Ll1 = l1_loss(image, gt_image)
         ssim_loss = 1.0 - fast_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss
@@ -254,11 +266,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             if opt.use_velocity_smooth and opt.lambda_velocity_smooth > 0 and iteration % opt.velocity_interval == 0:
                 N = gaussians.get_xyz.shape[0]
                 time_input = fid.unsqueeze(0).expand(N, -1)
+                # Reuse current_v computed in velocity loss block above
+                # to skip 1 of 2 velocity forward passes.
+                _reuse_v = current_v if velocity_loss is not None else None
                 velocity_smooth_loss = velocity_temporal_smoothness_loss(
                     velocity, 
                     gaussians.get_xyz.detach(), 
                     time_input, 
-                    dt=opt.velocity_smooth_dt * time_interval
+                    dt=opt.velocity_smooth_dt * time_interval,
+                    v_t=_reuse_v,
                 )
                 loss = loss + opt.lambda_velocity_smooth * velocity_smooth_loss
                 
@@ -277,10 +293,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
         with torch.no_grad():
             gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
             
-            # Progress bar
-            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+            # Progress bar — use detached tensor for to avoid
+            # implicit cudaDeviceSynchronize() on every .item() call.
+            # Only call .item() once every 100 iterations for display.
+            _loss_val = loss.detach()
+            ema_loss_for_log = 0.4 * _loss_val + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Gaussian Number": f"{gaussians._xyz.shape[0]:.{2}f}"})
+                if iteration % 100 == 0:
+                    _display_loss = ema_loss_for_log.item() if torch.is_tensor(ema_loss_for_log) else ema_loss_for_log
+                else:
+                    _display_loss = _display_loss if '_display_loss' in dir() else 0.0
+                progress_bar.set_postfix({"Loss": f"{_display_loss:.{7}f}", "Gaussian Number": f"{gaussians._xyz.shape[0]:.{2}f}"})
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
@@ -374,10 +397,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             
             if iteration < opt.iterations:
                 deform.optimizer.step()
-                deform.optimizer.zero_grad()
+                deform.optimizer.zero_grad(set_to_none=True)
                 if dataset.use_velocity:
                     velocity.optimizer.step()
-                    velocity.optimizer.zero_grad()
+                    velocity.optimizer.zero_grad(set_to_none=True)
                 gaussians.optimizer_step(iteration)
 
     # Final sync — only once at the very end

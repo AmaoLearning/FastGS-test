@@ -545,24 +545,24 @@ class GaussianModel:
         all_clones = torch.logical_and(clone_qualifiers, grad_qualifiers)
         all_splits = torch.logical_and(split_qualifiers, grad_qualifiers_abs)
 
-        print(f"\nOriginal all_clones: {all_clones.sum().item()}, all_splits: {all_splits.sum().item()}")
+        # Collect all mask counts on GPU first, then do a single GPU→CPU sync
+        _stats = [all_clones.sum(), all_splits.sum()]  # accumulate GPU tensors
         
         # 如果提供了 velocity_mask，则与原有掩码做与运算
         # velocity_mask 为 True 表示该高斯的运动预测准确，可以参与 densification
         if velocity_mask is not None:
             all_clones = torch.logical_and(all_clones, velocity_mask)
             all_splits = torch.logical_and(all_splits, velocity_mask)
-
-            print(f"With velocity_mask: {velocity_mask.sum().item()}, all_clones: {all_clones.sum().item()}, all_splits: {all_splits.sum().item()}")
+            _stats.extend([velocity_mask.sum(), all_clones.sum(), all_splits.sum()])
 
         # 如果提供了 physics masks，则与原有掩码做与运算
         if physics_clone_mask is not None:
             all_clones = torch.logical_and(all_clones, physics_clone_mask)
-            print(f"With physics_clone_mask: {physics_clone_mask.sum().item()}, all_clones: {all_clones.sum().item()}")
+            _stats.extend([physics_clone_mask.sum(), all_clones.sum()])
 
         if physics_split_mask is not None:
             all_splits = torch.logical_and(all_splits, physics_split_mask)
-            print(f"With physics_split_mask: {physics_split_mask.sum().item()}, all_splits: {all_splits.sum().item()}")
+            _stats.extend([physics_split_mask.sum(), all_splits.sum()])
 
         # This is our multi-view consisent metric for densification
         # We use this metric to further filter the candidates for densification, which is similar to taming 3dgs.
@@ -570,7 +570,23 @@ class GaussianModel:
 
         _all_clones = torch.logical_and(metric_mask, all_clones)
         _all_splits = torch.logical_and(metric_mask, all_splits)
-        print(f"With metric_mask: {metric_mask.sum().item()}, all_clones: {_all_clones.sum().item()}, all_splits: {_all_splits.sum().item()}\n")
+        _stats.extend([metric_mask.sum(), _all_clones.sum(), _all_splits.sum()])
+
+        # Single GPU→CPU synchronization point for ALL mask statistics
+        _vals = torch.stack(_stats).cpu().tolist()
+        _i = 0
+        print(f"\nOriginal all_clones: {int(_vals[_i])}, all_splits: {int(_vals[_i+1])}")
+        _i += 2
+        if velocity_mask is not None:
+            print(f"With velocity_mask: {int(_vals[_i])}, all_clones: {int(_vals[_i+1])}, all_splits: {int(_vals[_i+2])}")
+            _i += 3
+        if physics_clone_mask is not None:
+            print(f"With physics_clone_mask: {int(_vals[_i])}, all_clones: {int(_vals[_i+1])}")
+            _i += 2
+        if physics_split_mask is not None:
+            print(f"With physics_split_mask: {int(_vals[_i])}, all_splits: {int(_vals[_i+1])}")
+            _i += 2
+        print(f"With metric_mask: {int(_vals[_i])}, all_clones: {int(_vals[_i+1])}, all_splits: {int(_vals[_i+2])}\n")
 
         self.densify_and_clone_fastgs(metric_mask, all_clones, velocity_net=velocity_net, times=times, eta=args.clone_eta if hasattr(args, 'clone_eta') else 0.2)
         self.densify_and_split_fastgs(metric_mask, all_splits)
@@ -583,14 +599,15 @@ class GaussianModel:
 
         scores = 1 - pruning_score 
         to_remove = torch.sum(prune_mask)
-        remove_budget = int(0.5 * to_remove)
+        remove_budget = int(0.5 * to_remove)  # single GPU→CPU sync
 
         # The budget is not necessary for our method.
         if remove_budget:
             n_init_points = self.get_xyz.shape[0]
-            padded_importance = torch.zeros((n_init_points), dtype=torch.float32)
-            padded_importance[:scores.shape[0]] = 1 / (1e-6 + scores.squeeze())
-            selected_pts_mask = torch.zeros_like(padded_importance, dtype=bool, device="cuda")
+            # ALL computation on GPU — avoid GPU→CPU data transfer
+            padded_importance = torch.zeros(n_init_points, dtype=torch.float32, device="cuda")
+            padded_importance[:scores.shape[0]] = 1.0 / (1e-6 + scores.squeeze())
+            selected_pts_mask = torch.zeros(n_init_points, dtype=torch.bool, device="cuda")
             sampled_indices = torch.multinomial(padded_importance, remove_budget, replacement=False)
             selected_pts_mask[sampled_indices] = True
             final_prune = torch.logical_and(prune_mask, selected_pts_mask)
@@ -602,7 +619,9 @@ class GaussianModel:
         tmp_radii = self.tmp_radii
         self.tmp_radii = None
 
-        torch.cuda.empty_cache()
+        # NOTE: torch.cuda.empty_cache() removed — it forces a full
+        # driver-level cache purge (~1-5ms stall). The caching allocator
+        # already reuses freed blocks efficiently.
 
     def final_prune_fastgs(self, min_opacity, pruning_score = None):
         """Final-stage pruning: remove Gaussians based on opacity and multi-view consistency.
@@ -652,21 +671,26 @@ class GaussianModel:
             threshold = adaptive_threshold
             print(f"  [Adaptive Threshold] Using {adaptive_percentile}th percentile: {threshold:.6f}")
         
-        # 打印分布统计信息，方便设置阈值
+        # 打印分布统计信息，方便设置阈值 — single GPU→CPU sync for all stats
         if valid_mask.sum() > 0:
             valid_losses = avg_velocity_loss[valid_mask]
-            print(f"\n[Velocity Loss Distribution]")
-            print(f"  Total Gaussians: {avg_velocity_loss.shape[0]}, Valid (with stats): {valid_mask.sum().item()}")
-            print(f"  Min: {valid_losses.min().item():.6f}, Max: {valid_losses.max().item():.6f}")
-            print(f"  Mean: {valid_losses.mean().item():.6f}, Std: {valid_losses.std().item():.6f}")
-            # 打印百分位数
             percentiles = [25, 50, 75, 90, 95, 99]
-            for p in percentiles:
-                val = torch.quantile(valid_losses, p / 100.0).item()
-                print(f"  {p}th percentile: {val:.6f}")
+            pct_tensors = [torch.quantile(valid_losses, p / 100.0) for p in percentiles]
+            all_stats = torch.stack([
+                valid_mask.sum().float(),
+                valid_losses.min(), valid_losses.max(),
+                valid_losses.mean(), valid_losses.std(),
+                (valid_losses < threshold).sum().float(),
+            ] + pct_tensors).cpu().tolist()
+            _n_valid = int(all_stats[0])
+            print(f"\n[Velocity Loss Distribution]")
+            print(f"  Total Gaussians: {avg_velocity_loss.shape[0]}, Valid (with stats): {_n_valid}")
+            print(f"  Min: {all_stats[1]:.6f}, Max: {all_stats[2]:.6f}")
+            print(f"  Mean: {all_stats[3]:.6f}, Std: {all_stats[4]:.6f}")
+            for i, p in enumerate(percentiles):
+                print(f"  {p}th percentile: {all_stats[6 + i]:.6f}")
             print(f"  Current threshold: {threshold}")
-            below_thresh = (valid_losses < threshold).sum().item()
-            print(f"  Gaussians below threshold: {below_thresh} ({100*below_thresh/valid_losses.shape[0]:.2f}%)\n")
+            print(f"  Gaussians below threshold: {int(all_stats[5])} ({100*all_stats[5]/_n_valid:.2f}%)\n")
         
         return (avg_velocity_loss >= threshold)
 
@@ -713,28 +737,29 @@ class GaussianModel:
         # 最终掩码：两者都满足
         dynamic_mask = torch.logical_or(is_dynamic, has_grad)
         
-        # 打印分布统计信息，方便设置阈值
+        # 打印分布统计信息，方便设置阈值 — single GPU→CPU sync
         if iteration is not None and iteration % 1001 == 0:
+            percentiles = [25, 50, 75, 90, 95, 99]
+            pct_vals = [torch.quantile(dynamic_norm, p / 100.0) for p in percentiles]
+            all_stats = torch.stack([
+                dynamic_norm.min(), dynamic_norm.max(),
+                dynamic_norm.mean(), dynamic_norm.std(),
+                is_dynamic.sum().float(), has_grad.sum().float(),
+                dynamic_mask.sum().float(),
+            ] + pct_vals).cpu().tolist()
             print(f"\n[Dynamic Metrics Distribution][Iter {iteration}]")
             print(f"  Total Gaussians: {N}")
-            print(f"  Min: {dynamic_norm.min().item():.6f}, Max: {dynamic_norm.max().item():.6f}")
-            print(f"  Mean: {dynamic_norm.mean().item():.6f}, Std: {dynamic_norm.std().item():.6f}")
-            percentiles = [25, 50, 75, 90, 95, 99]
-            for p in percentiles:
-                val = torch.quantile(dynamic_norm, p / 100.0).item()
-                print(f"  {p}th percentile: {val:.6f}")
-            
-            valid_mask = dynamic_norm > 0
-            if valid_mask.sum() > 0:
-                # 打印百分位数
-                print(f"  Current dynamic_thresh: {dynamic_thresh}")
-                above_thresh = is_dynamic.sum().item()
-                print(f"  Gaussians above dynamic_thresh: {above_thresh} ({100*above_thresh/N:.2f}%)")
-            
+            print(f"  Min: {all_stats[0]:.6f}, Max: {all_stats[1]:.6f}")
+            print(f"  Mean: {all_stats[2]:.6f}, Std: {all_stats[3]:.6f}")
+            for i, p in enumerate(percentiles):
+                print(f"  {p}th percentile: {all_stats[7 + i]:.6f}")
+            print(f"  Current dynamic_thresh: {dynamic_thresh}")
+            above_thresh = int(all_stats[4])
+            print(f"  Gaussians above dynamic_thresh: {above_thresh} ({100*above_thresh/N:.2f}%)")
             print(f"\n[Mask Statistics][Iter {iteration}]")
-            print(f"  is_dynamic (dynamic_norm > {dynamic_thresh:.6f}): {is_dynamic.sum().item()} ({100*is_dynamic.sum().item()/N:.2f}%)")
-            print(f"  has_grad (grad_abs > {grad_abs_thresh}): {has_grad.sum().item()} ({100*has_grad.sum().item()/N:.2f}%)")
-            print(f"  dynamic_mask (is_dynamic OR has_grad): {dynamic_mask.sum().item()} ({100*dynamic_mask.sum().item()/N:.2f}%)\n")
+            print(f"  is_dynamic (dynamic_norm > {dynamic_thresh:.6f}): {above_thresh} ({100*above_thresh/N:.2f}%)")
+            print(f"  has_grad (grad_abs > {grad_abs_thresh}): {int(all_stats[5])} ({100*all_stats[5]/N:.2f}%)")
+            print(f"  dynamic_mask (is_dynamic OR has_grad): {int(all_stats[6])} ({100*all_stats[6]/N:.2f}%)\n")
         
         return dynamic_mask
 
@@ -781,26 +806,31 @@ class GaussianModel:
         opacity = self.get_opacity.squeeze()  # [N]
         max_scale = self.get_scaling.max(dim=1).values  # [N]
         
-        # 打印分布统计信息，方便设置硬阈值
+        # 打印分布统计信息，方便设置硬阈值 — single GPU→CPU sync
+        percentiles = [25, 50, 75, 90, 95, 99]
+        div_pcts = [torch.quantile(div, p / 100.0) for p in percentiles]
+        curl_pcts = [torch.quantile(curl, p / 100.0) for p in percentiles]
+        all_stats = torch.stack([
+            div.min(), div.max(), div.mean(), div.std(),
+            curl.min(), curl.max(), curl.mean(), curl.std(),
+        ] + div_pcts + curl_pcts).cpu().tolist()
+        
         print(f"\n[Divergence Distribution]")
         print(f"  Total Gaussians: {N}")
-        print(f"  Min: {div.min().item():.6f}, Max: {div.max().item():.6f}")
-        print(f"  Mean: {div.mean().item():.6f}, Std: {div.std().item():.6f}")
-        percentiles = [25, 50, 75, 90, 95, 99]
-        for p in percentiles:
-            val = torch.quantile(div, p / 100.0).item()
-            print(f"  {p}th percentile: {val:.6f}")
+        print(f"  Min: {all_stats[0]:.6f}, Max: {all_stats[1]:.6f}")
+        print(f"  Mean: {all_stats[2]:.6f}, Std: {all_stats[3]:.6f}")
+        for i, p in enumerate(percentiles):
+            print(f"  {p}th percentile: {all_stats[8 + i]:.6f}")
         
         print(f"\n[Curl Distribution]")
-        print(f"  Min: {curl.min().item():.6f}, Max: {curl.max().item():.6f}")
-        print(f"  Mean: {curl.mean().item():.6f}, Std: {curl.std().item():.6f}")
-        for p in percentiles:
-            val = torch.quantile(curl, p / 100.0).item()
-            print(f"  {p}th percentile: {val:.6f}")
+        print(f"  Min: {all_stats[4]:.6f}, Max: {all_stats[5]:.6f}")
+        print(f"  Mean: {all_stats[6]:.6f}, Std: {all_stats[7]:.6f}")
+        for i, p in enumerate(percentiles):
+            print(f"  {p}th percentile: {all_stats[14 + i]:.6f}")
         
         # 计算阈值：优先使用百分位数
         if div_percentile >= 0:
-            div_threshold = torch.quantile(div, div_percentile / 100.0).item()
+            div_threshold = torch.quantile(div, div_percentile / 100.0).item()  # reuses cached kernel
             print(f"\n  Using percentile div_threshold: {div_threshold:.6f} (p{div_percentile})")
 
         if curl_percentile >= 0:
@@ -810,23 +840,25 @@ class GaussianModel:
         split_scale_limit = split_scale_limit_factor * extent
         
         # Clone Mask: 高散度（膨胀区域）+ 不透明度足够
-        # 物理解释：膨胀导致空隙，需要克隆填补
         high_div = div >= div_threshold
         sufficient_opacity = opacity >= min_opacity
         clone_mask = torch.logical_and(high_div, sufficient_opacity)
         
         # Split Mask: 高旋度（湍流区域）+ 高斯足够大
-        # 物理解释：非线性形变导致单一高斯拟合失效，需要分裂细化
         high_curl = curl >= curl_threshold
         large_enough = max_scale >= split_scale_limit
         split_mask = torch.logical_and(high_curl, large_enough)
         
-        # 打印掩码统计信息
+        # 打印掩码统计信息 — single GPU→CPU sync
+        mask_stats = torch.stack([
+            high_div.sum().float(), high_curl.sum().float(),
+            clone_mask.sum().float(), split_mask.sum().float(),
+        ]).cpu().tolist()
         print(f"\n[Physics Densification Masks]")
-        print(f"  high_div (div > {div_threshold:.6f}): {high_div.sum().item()} ({100*high_div.sum().item()/N:.2f}%)")
-        print(f"  high_curl (curl > {curl_threshold:.6f}): {high_curl.sum().item()} ({100*high_curl.sum().item()/N:.2f}%)")
-        print(f"  Clone candidates (high_div AND opacity>{min_opacity}): {clone_mask.sum().item()}")
-        print(f"  Split candidates (high_curl AND scale>{split_scale_limit:.6f}): {split_mask.sum().item()}")
+        print(f"  high_div (div > {div_threshold:.6f}): {int(mask_stats[0])} ({100*mask_stats[0]/N:.2f}%)")
+        print(f"  high_curl (curl > {curl_threshold:.6f}): {int(mask_stats[1])} ({100*mask_stats[1]/N:.2f}%)")
+        print(f"  Clone candidates (high_div AND opacity>{min_opacity}): {int(mask_stats[2])}")
+        print(f"  Split candidates (high_curl AND scale>{split_scale_limit:.6f}): {int(mask_stats[3])}")
         
         return clone_mask, split_mask
     
