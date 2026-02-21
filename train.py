@@ -39,7 +39,8 @@ from utils.flow_rasterizer import FlowRasterizerHelper, OpticalFlowLoss
 from utils.optic_flow_utils import load_precomputed_flow
 
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: bool = False):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: bool = False,
+             profile: bool = False, profile_start: int = 500, profile_steps: int = 50):
     safe_state(quiet) # fix random seeds
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
@@ -113,7 +114,40 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
     # best_iteration = 0
     progress_bar = tqdm(range(opt.iterations), desc="Training progress")
     smooth_term = get_linear_noise_func(lr_init=0.1, lr_final=1e-15, lr_delay_mult=0.01, max_steps=20000)
+
+    # ── Phase-level timer for diagnosing GPU utilization ──
+    # Records wall-clock time (with CUDA sync) per phase:
+    #   data / deform / render / loss / backward / optim / other
+    # Prints breakdown every 100 iterations. Adds ~0.3ms overhead per
+    # iteration due to cuda.synchronize() calls — disable for production.
+    _phase_accum = {k: 0.0 for k in ["data", "deform", "render", "loss_fwd", "backward", "optim", "misc"]}
+    _phase_count = 0
+    _PHASE_REPORT_INTERVAL = 100
+    _enable_phase_timer = profile  # only active when --profile is set
+
+    # ── torch.profiler (Chrome trace) ──
+    _profiler_ctx = None
+    if profile:
+        trace_dir = os.path.join(dataset.model_path, "profiler_traces")
+        os.makedirs(trace_dir, exist_ok=True)
+        print(f"[PROFILE] Will capture {profile_steps} iterations starting at iter {profile_start}")
+        print(f"[PROFILE] Trace output: {trace_dir}")
+        print(f"[PROFILE] Phase timer enabled — prints breakdown every {_PHASE_REPORT_INTERVAL} iters")
+
     for iteration in range(1, opt.iterations + 1):
+        # Start profiler at the designated iteration
+        if profile and iteration == profile_start and _profiler_ctx is None:
+            from torch.profiler import profile as _torch_profile, ProfilerActivity, schedule, tensorboard_trace_handler
+            _profiler_ctx = _torch_profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                schedule=schedule(wait=2, warmup=3, active=profile_steps, repeat=1),
+                on_trace_ready=tensorboard_trace_handler(trace_dir),
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True,
+            )
+            _profiler_ctx.__enter__()
+            print(f"[PROFILE] Profiler started at iteration {iteration}")
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -130,6 +164,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             except Exception as e:
                 network_gui.conn = None
 
+        # ── Phase timer: iteration start ──
+        if _enable_phase_timer:
+            torch.cuda.synchronize()
+
         gaussians.update_learning_rate(iteration)
         deform.update_learning_rate(iteration)
         if dataset.use_velocity:
@@ -140,9 +178,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             gaussians.oneupSHdegree()
 
         # Pick a random Camera
+        if _enable_phase_timer:
+            torch.cuda.synchronize()
+            _t0 = time.perf_counter()
+
         viewpoint_cam, total_frame = scene.next_train_camera()
         time_interval = 1 / total_frame
         fid = viewpoint_cam.fid
+
+        if _enable_phase_timer:
+            torch.cuda.synchronize()
+            _phase_accum["data"] += time.perf_counter() - _t0
+            _t0 = time.perf_counter()
 
         velocity_loss = None  # 仅在需要时计算
         per_gaussian_velocity_loss = None  # 每个高斯的 velocity loss
@@ -205,11 +252,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                     print(f"[Iter {iteration}] velocity loss = {velocity_loss.item():.6f}")
                     print(f"[Iter {iteration}] velocity mean = {current_v.mean(dim=0).detach().cpu().numpy()} at time {(time_input + ast_noise)[0].item():.4f}")
 
+        if _enable_phase_timer:
+            torch.cuda.synchronize()
+            _phase_accum["deform"] += time.perf_counter() - _t0
+            _t0 = time.perf_counter()
+
         # Render
         render_pkg_re = render_fastgs(viewpoint_cam, gaussians, pipe, background, opt.mult, d_xyz, d_rotation, d_scaling, dataset.is_6dof)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg_re["render"], render_pkg_re[
             "viewspace_points"], render_pkg_re["visibility_filter"], render_pkg_re["radii"]
         # depth = render_pkg_re["depth"]
+
+        if _enable_phase_timer:
+            torch.cuda.synchronize()
+            _phase_accum["render"] += time.perf_counter() - _t0
+            _t0 = time.perf_counter()
 
         # Loss
         gt_image = viewpoint_cam.original_image
@@ -281,7 +338,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 if iteration % 1000 == 0:
                     print(f"[Iter {iteration}] velocity smooth loss = {velocity_smooth_loss.item():.6f}")
         
+        if _enable_phase_timer:
+            torch.cuda.synchronize()
+            _phase_accum["loss_fwd"] += time.perf_counter() - _t0
+            _t0 = time.perf_counter()
+
         loss.backward()
+
+        if _enable_phase_timer:
+            torch.cuda.synchronize()
+            _phase_accum["backward"] += time.perf_counter() - _t0
+            _t0 = time.perf_counter()
 
         # Release VRAM.
         # Flow: unload_flow() frees per-camera flow tensors (no-op if none loaded).
@@ -403,6 +470,32 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                     velocity.optimizer.zero_grad(set_to_none=True)
                 gaussians.optimizer_step(iteration)
 
+            if _enable_phase_timer:
+                torch.cuda.synchronize()
+                _phase_accum["optim"] += time.perf_counter() - _t0
+                _phase_count += 1
+                if _phase_count % _PHASE_REPORT_INTERVAL == 0:
+                    _total = sum(_phase_accum.values()) or 1e-9
+                    print(f"\n[PHASE TIMER] iter {iteration}, last {_PHASE_REPORT_INTERVAL} iters avg (ms):")
+                    for k in ["data", "deform", "render", "loss_fwd", "backward", "optim"]:
+                        _v = _phase_accum[k] / _phase_count * 1000
+                        _pct = _phase_accum[k] / _total * 100
+                        print(f"  {k:>10s}: {_v:7.2f} ms  ({_pct:5.1f}%)")
+                    _iter_avg = _total / _phase_count * 1000
+                    print(f"  {'TOTAL':>10s}: {_iter_avg:7.2f} ms/iter  ({1000/_iter_avg:.1f} iter/s)")
+                    # Reset accumulators
+                    _phase_accum = {k: 0.0 for k in _phase_accum}
+                    _phase_count = 0
+
+            # Profiler step (must be called every iteration while active)
+            if _profiler_ctx is not None:
+                _profiler_ctx.step()
+                # Stop profiler after enough steps
+                if iteration >= profile_start + profile_steps + 5:  # wait+warmup+active
+                    _profiler_ctx.__exit__(None, None, None)
+                    _profiler_ctx = None
+                    print(f"[PROFILE] Profiler stopped at iteration {iteration}. Trace saved to {trace_dir}")
+
     # Final sync — only once at the very end
     torch.cuda.synchronize()
     total_time = time.perf_counter() - wall_start
@@ -506,6 +599,9 @@ if __name__ == "__main__":
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[30000,40000])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[30000,40000])
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--profile", action="store_true", help="Enable torch.profiler for 50 iterations (outputs Chrome trace)")
+    parser.add_argument("--profile_start", type=int, default=500, help="Iteration to start profiling")
+    parser.add_argument("--profile_steps", type=int, default=50, help="Number of iterations to profile")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
 
@@ -514,7 +610,10 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     # network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations,
+            profile=getattr(args, 'profile', False),
+            profile_start=getattr(args, 'profile_start', 500),
+            profile_steps=getattr(args, 'profile_steps', 50))
 
     # All done
     print("\nTraining complete.")
