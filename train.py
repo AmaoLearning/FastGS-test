@@ -248,6 +248,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 # 总体 velocity loss (用于反向传播)
                 velocity_loss = per_gaussian_velocity_loss.mean()
 
+                if tb_writer and iteration % 100 == 0:
+                    tb_writer.add_scalar('train_loss_patches/velocity_loss', velocity_loss.item(), iteration)
                 if iteration % 1000 == 0:
                     print(f"[Iter {iteration}] velocity loss = {velocity_loss.item():.6f}")
                     print(f"[Iter {iteration}] velocity mean = {current_v.mean(dim=0).detach().cpu().numpy()} at time {(time_input + ast_noise)[0].item():.4f}")
@@ -275,7 +277,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
         Ll1 = l1_loss(image, gt_image)
         ssim_loss = 1.0 - fast_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss
-        
+
+        # ── Inline TensorBoard logging (training_report is commented out) ──
+        if tb_writer and iteration % 100 == 0:
+            tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
+            tb_writer.add_scalar('train_loss_patches/ssim_loss', ssim_loss.item(), iteration)
+            tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
+            tb_writer.add_scalar('train_stats/num_gaussians', gaussians._xyz.shape[0], iteration)
+
         # ── Optical Flow Loss ──
         flow_loss = None
         if (dataset.use_flow_loss and dataset.use_velocity
@@ -335,9 +344,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 )
                 loss = loss + opt.lambda_velocity_smooth * velocity_smooth_loss
                 
+                if tb_writer and iteration % 100 == 0:
+                    tb_writer.add_scalar('train_loss_patches/velocity_smooth_loss', velocity_smooth_loss.item(), iteration)
                 if iteration % 1000 == 0:
                     print(f"[Iter {iteration}] velocity smooth loss = {velocity_smooth_loss.item():.6f}")
-        
+
+        # Log final total loss (after all auxiliary losses are added)
+        if tb_writer and iteration % 100 == 0:
+            tb_writer.add_scalar('train_loss_patches/total_loss_final', loss.item(), iteration)
+
         if _enable_phase_timer:
             torch.cuda.synchronize()
             _phase_accum["loss_fwd"] += time.perf_counter() - _t0
