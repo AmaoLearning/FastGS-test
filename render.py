@@ -377,13 +377,10 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
 
         # ── Load velocity network for dynamic masking ──
         velocity_net = None
-        use_velocity = getattr(args, 'use_velocity', False)
-        use_dynamic_mask = getattr(args, 'use_dynamic_mask',
-                                   getattr(dataset, 'use_dynamic_mask', False))
-        dynamic_thresh = getattr(args, 'dynamic_thresh',
-                                 getattr(dataset, 'dynamic_thresh', 0.001))
-        dynamic_percentile = getattr(args, 'dynamic_thresh_percentile',
-                                     getattr(dataset, 'dynamic_thresh_percentile', -1))
+        use_velocity = getattr(dataset, 'use_velocity', False)
+        use_dynamic_mask = getattr(dataset, 'use_dynamic_mask', False)
+        dynamic_thresh = getattr(args, 'dynamic_thresh', 0.001)
+        dynamic_percentile = getattr(args, 'dynamic_thresh_percentile', -1)
 
         if use_velocity and use_dynamic_mask:
             vnet_type = getattr(dataset, 'velocity_network_type',
@@ -449,18 +446,12 @@ if __name__ == "__main__":
     parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--mode", default='render', choices=['render', 'time', 'view', 'all', 'pose', 'original'])
-    parser.add_argument("--mult", type=float, default=0.5)
     args = get_combined_args(parser)
 
     # Backfill dynamic mask defaults if missing from cfg_args
-    _optim_defaults = OptimizationParams(ArgumentParser())
-    for _k in ["dynamic_decay", "dynamic_thresh", "dynamic_thresh_percentile"]:
+    for _k in ["mult", "dynamic_decay", "dynamic_thresh", "dynamic_thresh_percentile"]:
         if not hasattr(args, _k) or getattr(args, _k) is None:
-            setattr(args, _k, getattr(_optim_defaults, _k))
-
-    _model_defaults = ModelParams(ArgumentParser())
-    if not hasattr(args, "use_dynamic_mask") or getattr(args, "use_dynamic_mask") is None:
-        setattr(args, "use_dynamic_mask", getattr(_model_defaults, "use_dynamic_mask"))
+            setattr(args, _k, getattr(optim, _k))
 
     print("Rendering " + args.model_path)
 
