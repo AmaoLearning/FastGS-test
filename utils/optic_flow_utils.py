@@ -23,68 +23,56 @@ from torch.utils.model_zoo import load_url
 def forward_backward_consistency_check(
     flow_fwd: torch.Tensor,
     flow_bwd: torch.Tensor,
-    alpha1: float = 0.01,
-    alpha2: float = 0.5,
+    alpha1: float = 0.005,  # [严格化] 从 0.01 降至 0.005
+    alpha2: float = 0.2,    # [严格化] 从 0.5 像素降至 0.2 亚像素
 ) -> torch.Tensor:
     """
-    Forward-Backward Consistency Check（前后向一致性检查）.
-
-    通过验证前向光流和后向光流的循环一致性来生成遮挡掩码。
-    如果像素 x 沿前向光流 F_fwd 到达 x'，再沿后向光流 F_bwd 回到 x''，
-    则 ||x - x''||_2 应当很小。否则该像素发生了遮挡或光流估计失败。
-
-    Δ = || F_fwd(x) + F_bwd(x + F_fwd(x)) ||_2
-    M = Δ < α₁ · (||F_fwd(x)||_2 + ||F_bwd_warped(x)||_2) + α₂
-
-    Args:
-        flow_fwd: 前向光流 t → t+1, shape [2, H, W] 或 [B, 2, H, W].
-        flow_bwd: 后向光流 t+1 → t, shape [2, H, W] 或 [B, 2, H, W].
-        alpha1: 相对阈值系数（默认 0.01）.
-        alpha2: 绝对阈值偏移量，单位：像素（默认 0.5）.
-
-    Returns:
-        valid_mask: [1, H, W] 或 [B, 1, H, W], 1.0 = 可信, 0.0 = 遮挡/不可信.
+    改进版 Forward-Backward Consistency Check
     """
     squeeze = False
     if flow_fwd.dim() == 3:
-        flow_fwd = flow_fwd.unsqueeze(0)   # [1, 2, H, W]
+        flow_fwd = flow_fwd.unsqueeze(0)
         flow_bwd = flow_bwd.unsqueeze(0)
         squeeze = True
 
     B, _, H, W = flow_fwd.shape
 
-    # 构建像素坐标网格
     grid_y, grid_x = torch.meshgrid(
         torch.arange(H, dtype=torch.float32, device=flow_fwd.device),
         torch.arange(W, dtype=torch.float32, device=flow_fwd.device),
         indexing='ij',
     )
+    
     # x' = x + F_fwd(x)
     sample_x = grid_x.unsqueeze(0) + flow_fwd[:, 0]  # [B, H, W]
     sample_y = grid_y.unsqueeze(0) + flow_fwd[:, 1]  # [B, H, W]
 
-    # 归一化到 [-1, 1] 用于 grid_sample
+    # [新增] 严格越界检查 (Out-of-bounds Mask)
+    # 任何在前向光流中飞出画面的像素，绝对不可信
+    out_of_bounds = (sample_x < 0) | (sample_x > W - 1) | \
+                    (sample_y < 0) | (sample_y > H - 1)  # [B, H, W]
+
     sample_x_norm = 2.0 * sample_x / (W - 1) - 1.0
     sample_y_norm = 2.0 * sample_y / (H - 1) - 1.0
-    grid = torch.stack([sample_x_norm, sample_y_norm], dim=-1)  # [B, H, W, 2]
+    grid = torch.stack([sample_x_norm, sample_y_norm], dim=-1)
 
-    # 对后向光流做双线性插值：F_bwd(x + F_fwd(x))
     flow_bwd_warped = F.grid_sample(
         flow_bwd, grid, mode='bilinear', padding_mode='zeros', align_corners=True,
-    )  # [B, 2, H, W]
+    )
 
-    # 循环误差 Δ = ||F_fwd(x) + F_bwd_warped(x)||_2
-    cycle_error = torch.norm(flow_fwd + flow_bwd_warped, dim=1, keepdim=True)  # [B, 1, H, W]
-
-    # 自适应阈值 = α₁ · (||F_fwd|| + ||F_bwd_warped||) + α₂
+    cycle_error = torch.norm(flow_fwd + flow_bwd_warped, dim=1, keepdim=True)
     mag_fwd = torch.norm(flow_fwd, dim=1, keepdim=True)
     mag_bwd_w = torch.norm(flow_bwd_warped, dim=1, keepdim=True)
+    
     threshold = alpha1 * (mag_fwd + mag_bwd_w) + alpha2
 
     valid_mask = (cycle_error < threshold).float()  # [B, 1, H, W]
 
+    # [新增] 将越界像素强制设为 0 (不可信)
+    valid_mask = valid_mask.masked_fill(out_of_bounds.unsqueeze(1), 0.0)
+
     if squeeze:
-        valid_mask = valid_mask.squeeze(0)  # [1, H, W]
+        valid_mask = valid_mask.squeeze(0)
 
     return valid_mask
 

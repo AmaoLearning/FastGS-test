@@ -67,6 +67,16 @@ class ModelParams(ParamGroup):
 
         # optical flow loss
         self.use_flow_loss = False  # 是否启用投影光流损失
+        self.use_flow_tv_loss = False  # 是否对光流预测加 TV 正则
+        self.use_velocity_smooth = False  # 是否启用时间平滑正则化
+
+        # dynamic mask (用于选择性计算 deform)
+        self.use_dynamic_mask = False  # 是否启用动态掩码
+
+        # physics-driven densification (物理驱动致密化)
+        self.use_physics_densify = False  # 是否启用物理驱动致密化
+        self.use_div_mask = False  # 是否使用散度掩码（控制 Clone），需配合 use_physics_densify 使用，store_true
+        self.use_curl_mask = False  # 是否使用旋度掩码（控制 Split），需配合 use_physics_densify 使用，store_true
         # flow_dir 已废弃：光流数据现在由数据集读取器从 optical_flow/ 目录自动加载
 
         # lazy loading — N3V large-scale dataset (zero OOM)
@@ -89,7 +99,7 @@ class PipelineParams(ParamGroup):
 
 
 class OptimizationParams(ParamGroup):
-    def __init__(self, parser):
+    def __init__(self, parser, sentinel: bool = False):
         self.iterations = 40_000
         self.warm_up = 3_000
         self.position_lr_init = 0.00016
@@ -128,7 +138,6 @@ class OptimizationParams(ParamGroup):
         self.detach_velocity_loss_from_deform = True  # 是否阻断 velocity loss 对形变场的梯度传播
         
         # velocity temporal smoothness
-        self.use_velocity_smooth = False  # 是否启用时间平滑正则化
         self.lambda_velocity_smooth = 0.1  # 时间平滑正则化权重
         self.velocity_smooth_dt = 0.1  # 时间平滑采样的时间间隔（相对于单帧间隔的比例）
         
@@ -136,27 +145,20 @@ class OptimizationParams(ParamGroup):
         self.lambda_flow = 0.1  # 光流损失权重
         self.flow_loss_from_iter = 6000  # 从第几个 iteration 开始使用光流损失
         self.flow_loss_interval = 10  # 每隔几个 iteration 计算一次光流损失（节省算力）
-        self.use_flow_tv_loss = False  # 是否对光流预测加 TV 正则
         self.flow_tv_weight = 0.01  # TV 正则权重
         self.detach_flow_geometry = True  # 是否阻断光流损失对几何（位置/协方差）的梯度传播
 
-        # dynamic mask (用于选择性计算 deform)
-        self.use_dynamic_mask = False  # 是否启用动态掩码
         self.dynamic_decay = 0.95  # Leaky Max 的衰减系数；0.95好于0.99，后者衰减太慢
         self.dynamic_thresh = 0.001  # 动态阈值，速度大于此值的高斯被认为是动态的
         self.dynamic_thresh_percentile = 75  # 自适应阈值百分比，-1表示使用固定阈值，0-100表示使用自适应阈值（如50表示取中位数）
         
-        # physics-driven densification (物理驱动致密化)
-        self.use_physics_densify = False  # 是否启用物理驱动致密化
-        self.use_div_mask = False  # 是否使用散度掩码（控制 Clone），需配合 use_physics_densify 使用，store_true
-        self.use_curl_mask = False  # 是否使用旋度掩码（控制 Split），需配合 use_physics_densify 使用，store_true
         self.div_percentile = -1  # 散度阈值百分位数，高于此值触发 Clone
         self.curl_percentile = -1  # 旋度阈值百分位数，高于此值触发 Split
         self.div_thresh = 0  # 散度硬阈值，>= 0 时使用硬阈值，< 0 时使用百分位数
         self.curl_thresh = 0  # 旋度硬阈值，>= 0 时使用硬阈值，< 0 时使用百分位数
         self.physics_clone_eta = 0.2  # Clone 时沿速度反方向偏移的系数
         self.physics_split_scale_factor = 2.0  # Split 时缩放因子
-        super().__init__(parser, "Optimization Parameters")
+        super().__init__(parser, "Optimization Parameters", sentinel)
 
 
 def get_combined_args(parser: ArgumentParser):

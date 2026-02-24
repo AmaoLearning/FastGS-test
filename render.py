@@ -19,7 +19,7 @@ import torchvision
 from utils.general_utils import safe_state
 from utils.pose_utils import pose_spherical, render_wander_path
 from argparse import ArgumentParser
-from arguments import ModelParams, PipelineParams, get_combined_args
+from arguments import ModelParams, PipelineParams, OptimizationParams, get_combined_args
 from gaussian_renderer import GaussianModel
 from utils.motion_utils import VelocityNetwork, VelocityNetworkHash, VelocityNetworkTcnn
 import imageio
@@ -377,7 +377,7 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
 
         # ── Load velocity network for dynamic masking ──
         velocity_net = None
-        use_velocity = getattr(dataset, 'use_velocity', False)
+        use_velocity = getattr(args, 'use_velocity', False)
         use_dynamic_mask = getattr(args, 'use_dynamic_mask',
                                    getattr(dataset, 'use_dynamic_mask', False))
         dynamic_thresh = getattr(args, 'dynamic_thresh',
@@ -442,6 +442,7 @@ if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Testing script parameters")
     model = ModelParams(parser, sentinel=True)
+    optim = OptimizationParams(parser, sentinel=True)
     pipeline = PipelineParams(parser)
     parser.add_argument("--iteration", default=-1, type=int)
     parser.add_argument("--skip_train", action="store_true")
@@ -450,6 +451,17 @@ if __name__ == "__main__":
     parser.add_argument("--mode", default='render', choices=['render', 'time', 'view', 'all', 'pose', 'original'])
     parser.add_argument("--mult", type=float, default=0.5)
     args = get_combined_args(parser)
+
+    # Backfill dynamic mask defaults if missing from cfg_args
+    _optim_defaults = OptimizationParams(ArgumentParser())
+    for _k in ["dynamic_decay", "dynamic_thresh", "dynamic_thresh_percentile"]:
+        if not hasattr(args, _k) or getattr(args, _k) is None:
+            setattr(args, _k, getattr(_optim_defaults, _k))
+
+    _model_defaults = ModelParams(ArgumentParser())
+    if not hasattr(args, "use_dynamic_mask") or getattr(args, "use_dynamic_mask") is None:
+        setattr(args, "use_dynamic_mask", getattr(_model_defaults, "use_dynamic_mask"))
+
     print("Rendering " + args.model_path)
 
     # Initialize system state (RNG)

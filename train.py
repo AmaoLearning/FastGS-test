@@ -91,7 +91,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 debug=False,
             ).cuda()
             flow_loss_fn = OpticalFlowLoss(
-                use_tv_loss=opt.use_flow_tv_loss,
+                use_tv_loss=dataset.use_flow_tv_loss,
                 tv_weight=opt.flow_tv_weight,
             )
             n_with_flow = sum(1 for c in scene.getTrainCameras() if c.has_flow)
@@ -202,7 +202,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             ast_noise = 0 if dataset.is_blender else torch.randn(1, 1, device='cuda').expand(N, -1) * time_interval * smooth_term(iteration)
 
             # 如果启用动态掩码，只对动态高斯计算 deform
-            if opt.use_dynamic_mask and iteration % opt.velocity_interval != 0:
+            if dataset.use_dynamic_mask and iteration % opt.velocity_interval != 0:
                 dynamic_mask = gaussians.get_dynamic_mask(
                     opt.dynamic_thresh, 
                     opt.grad_abs_thresh, 
@@ -329,7 +329,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 loss = loss + opt.lambda_velocity * velocity_loss
             
             # 时间平滑正则化损失：约束相邻时间步的速度场保持平滑
-            if opt.use_velocity_smooth and opt.lambda_velocity_smooth > 0 and iteration % opt.velocity_interval == 0:
+            if dataset.use_velocity_smooth and opt.lambda_velocity_smooth > 0 and iteration % opt.velocity_interval == 0:
                 N = gaussians.get_xyz.shape[0]
                 time_input = fid.unsqueeze(0).expand(N, -1)
                 # Reuse current_v computed in velocity loss block above
@@ -438,13 +438,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                             adaptive_percentile=opt.velocity_loss_percentile
                         )
 
-                        if opt.use_physics_densify:
+                        if dataset.use_physics_densify:
                             N = gaussians.get_xyz.shape[0]
                             time_input = fid.unsqueeze(0).expand(N, -1)
+                            physics_args = Namespace(
+                                use_div_mask=dataset.use_div_mask,
+                                use_curl_mask=dataset.use_curl_mask,
+                                div_percentile=opt.div_percentile,
+                                curl_percentile=opt.curl_percentile,
+                                div_thresh=opt.div_thresh,
+                                curl_thresh=opt.curl_thresh,
+                                dense=opt.dense,
+                            )
                             physics_clone_mask, physics_split_mask = gaussians.get_physics_masks(
                                 velocity_net=velocity,
                                 times=time_input,
-                                args=opt,
+                                args=physics_args,
                                 extent=scene.cameras_extent
                             )
                             velocity_net_for_clone = velocity
