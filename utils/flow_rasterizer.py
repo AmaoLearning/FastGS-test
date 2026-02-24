@@ -131,7 +131,7 @@ class FlowRasterizerHelper(nn.Module):
 class OpticalFlowLoss(nn.Module):
     """
     Loss function for optical flow supervision.
-    Combines L1 loss on valid pixels with optional TV regularization.
+    Uses masked Huber (Smooth L1) loss on valid pixels with optional TV regularization.
     """
 
     def __init__(self, use_tv_loss: bool = False, tv_weight: float = 0.01):
@@ -148,13 +148,23 @@ class OpticalFlowLoss(nn.Module):
         if valid_mask.dim() == 2:
             valid_mask = valid_mask.unsqueeze(0)
 
-        diff = torch.abs(flow_pred - flow_gt)
-        l1_loss = (diff * valid_mask).sum() / (valid_mask.sum() * flow_pred.shape[0] + 1e-8)
+        # If mask has no valid pixels, skip loss to avoid NaNs / wasted compute
+        valid_count = valid_mask.sum()
+        if valid_count == 0:
+            return flow_pred.new_zeros(())
+
+        # Apply mask first to reduce computation — operate only on valid pixels
+        mask = valid_mask.bool().expand_as(flow_pred)
+        pred_valid = flow_pred[mask]
+        gt_valid = flow_gt[mask]
+
+        # Huber (Smooth L1) per-pixel, per-channel
+        huber_loss = F.smooth_l1_loss(pred_valid, gt_valid, reduction="mean", beta=1.0)
 
         if self.use_tv_loss:
             tv = self._tv(flow_pred) * self.tv_weight
-            return l1_loss + tv
-        return l1_loss
+            return huber_loss + tv
+        return huber_loss
 
     @staticmethod
     def _tv(flow: torch.Tensor) -> torch.Tensor:

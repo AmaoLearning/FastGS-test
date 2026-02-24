@@ -134,7 +134,7 @@ class OptimizationParams(ParamGroup):
         
         # optical flow loss（投影光流监督损失）
         self.lambda_flow = 0.1  # 光流损失权重
-        self.flow_loss_from_iter = 3000  # 从第几个 iteration 开始使用光流损失
+        self.flow_loss_from_iter = 6000  # 从第几个 iteration 开始使用光流损失
         self.flow_loss_interval = 10  # 每隔几个 iteration 计算一次光流损失（节省算力）
         self.use_flow_tv_loss = False  # 是否对光流预测加 TV 正则
         self.flow_tv_weight = 0.01  # TV 正则权重

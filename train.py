@@ -243,7 +243,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 else:
                     velocity_diff = _d_xyz - d_xyz
                 velocity_pred = current_v * time_interval
-                per_gaussian_velocity_loss = ((velocity_diff - velocity_pred) ** 2).mean(dim=-1, keepdim=True)
+                per_gaussian_velocity_loss = (velocity_diff - velocity_pred).mean(dim=-1, keepdim=True)
                 
                 # 总体 velocity loss (用于反向传播)
                 velocity_loss = per_gaussian_velocity_loss.mean()
