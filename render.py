@@ -448,10 +448,16 @@ if __name__ == "__main__":
     parser.add_argument("--mode", default='render', choices=['render', 'time', 'view', 'all', 'pose', 'original'])
     args = get_combined_args(parser)
 
-    # Backfill dynamic mask defaults if missing from cfg_args
+    # Backfill defaults if missing from cfg_args
+    _optim_defaults = OptimizationParams(ArgumentParser())
     for _k in ["mult", "dynamic_decay", "dynamic_thresh", "dynamic_thresh_percentile"]:
         if not hasattr(args, _k) or getattr(args, _k) is None:
-            setattr(args, _k, getattr(optim, _k))
+            setattr(args, _k, getattr(_optim_defaults, _k))
+
+    _model_defaults = ModelParams(ArgumentParser())
+    for _k in ["use_dynamic_mask", "use_velocity"]:
+        if not hasattr(args, _k) or getattr(args, _k) is None:
+            setattr(args, _k, getattr(_model_defaults, _k))
 
     print("Rendering " + args.model_path)
 

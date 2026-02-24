@@ -42,7 +42,7 @@ from utils.optic_flow_utils import load_precomputed_flow
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: bool = False,
              profile: bool = False, profile_start: int = 500, profile_steps: int = 50):
     safe_state(quiet) # fix random seeds
-    tb_writer = prepare_output_and_logger(dataset)
+    tb_writer = prepare_output_and_logger(dataset, opt, pipe)
     gaussians = GaussianModel(dataset.sh_degree)
     deform = DeformModel(dataset.is_blender, dataset.is_6dof)
     deform.train_setting(opt)
@@ -530,24 +530,37 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
     print(f"Dash time: {total_time:.2f}s")
 
 
-def prepare_output_and_logger(args):
-    if not args.model_path:
+def prepare_output_and_logger(dataset, opt, pipe):
+    model_path = dataset.model_path if dataset is not None else None
+    if not model_path:
         if os.getenv('OAR_JOB_ID'):
             unique_str = os.getenv('OAR_JOB_ID')
         else:
             unique_str = str(uuid.uuid4())
-        args.model_path = os.path.join("./output/", unique_str[0:10])
+        model_path = os.path.join("./output/", unique_str[0:10])
+        if dataset is not None:
+            dataset.model_path = model_path
 
     # Set up output folder
-    print("Output folder: {}".format(args.model_path))
-    os.makedirs(args.model_path, exist_ok=True)
-    with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
-        cfg_log_f.write(str(Namespace(**vars(args))))
+    print("Output folder: {}".format(model_path))
+    os.makedirs(model_path, exist_ok=True)
+
+    # Persist merged cfg (CLI + grouped params)
+    if args is not None:
+        combined_cfg = Namespace(**vars(args))
+        if dataset is not None:
+            combined_cfg.__dict__.update(vars(dataset))
+        if opt is not None:
+            combined_cfg.__dict__.update(vars(opt))
+        if pipe is not None:
+            combined_cfg.__dict__.update(vars(pipe))
+        with open(os.path.join(model_path, "cfg_args"), 'w') as cfg_log_f:
+            cfg_log_f.write(str(combined_cfg))
 
     # Create Tensorboard writer
     tb_writer = None
     if TENSORBOARD_FOUND:
-        tb_writer = SummaryWriter(args.model_path)
+        tb_writer = SummaryWriter(model_path)
     else:
         print("Tensorboard not available: not logging progress")
     return tb_writer
