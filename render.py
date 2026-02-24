@@ -21,12 +21,45 @@ from utils.pose_utils import pose_spherical, render_wander_path
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import GaussianModel
+from utils.motion_utils import VelocityNetwork, VelocityNetworkHash, VelocityNetworkTcnn
 import imageio
 import numpy as np
 import time
 
 
-def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration, views, gaussians, pipeline, background, args, deform):
+def _apply_dynamic_mask(d_xyz, d_rotation, d_scaling, velocity_net, xyz, time_input,
+                        dynamic_thresh: float, dynamic_percentile: float):
+    """Zero-out deformations for static Gaussians using the velocity field.
+
+    Reproduces the exact train-time masking logic so that static Gaussians
+    whose deformation MLP was never trained receive zero deltas at test time.
+
+    Args:
+        d_xyz, d_rotation, d_scaling: raw deformation outputs [N, 3/4/3]
+        velocity_net: trained velocity network
+        xyz: canonical Gaussian positions [N, 3]
+        time_input: time embedding [N, 1]
+        dynamic_thresh: fixed velocity norm threshold
+        dynamic_percentile: if >= 0, override *dynamic_thresh* with this
+            percentile of the velocity norm distribution (same as training)
+
+    Returns:
+        Masked (d_xyz, d_rotation, d_scaling)
+    """
+    with torch.no_grad():
+        v = velocity_net.forward(xyz, time_input)            # [N, 3]
+        v_norm = torch.norm(v, dim=-1)                       # [N]
+        if dynamic_percentile >= 0:
+            dynamic_thresh = torch.quantile(v_norm, dynamic_percentile / 100.0).item()
+        is_static = v_norm < dynamic_thresh                  # [N] bool
+        d_xyz[is_static] = 0.0
+        d_rotation[is_static] = 0.0
+        d_scaling[is_static] = 0.0
+    return d_xyz, d_rotation, d_scaling
+
+
+def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration, views, gaussians, pipeline, background, args, deform,
+               velocity_net=None, dynamic_thresh: float = 0.001, dynamic_percentile: float = -1):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
     depth_path = os.path.join(model_path, name, "ours_{}".format(iteration), "depth")
@@ -54,6 +87,13 @@ def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration, views,
         t_start = time.time()
 
         d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input)
+
+        # ── Dynamic Mask: zero-out deformations for static Gaussians ──
+        if velocity_net is not None:
+            d_xyz, d_rotation, d_scaling = _apply_dynamic_mask(
+                d_xyz, d_rotation, d_scaling, velocity_net, xyz.detach(), time_input,
+                dynamic_thresh, dynamic_percentile)
+
         results = render_fastgs(view, gaussians, pipeline, background, args.mult, d_xyz, d_rotation, d_scaling, is_6dof)
 
         torch.cuda.synchronize()
@@ -79,7 +119,8 @@ def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration, views,
     print(f"[{name}] Rendered {num_frames} frames in {total_time:.2f} seconds. Average FPS: {fps:.2f}")
 
 
-def interpolate_time(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, views, gaussians, pipeline, background, args, deform):
+def interpolate_time(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, views, gaussians, pipeline, background, args, deform,
+                     velocity_net=None, dynamic_thresh: float = 0.001, dynamic_percentile: float = -1):
     render_path = os.path.join(model_path, name, "interpolate_{}".format(iteration), "renders")
     depth_path = os.path.join(model_path, name, "interpolate_{}".format(iteration), "depth")
 
@@ -97,6 +138,10 @@ def interpolate_time(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, 
         xyz = gaussians.get_xyz
         time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
         d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input)
+        if velocity_net is not None:
+            d_xyz, d_rotation, d_scaling = _apply_dynamic_mask(
+                d_xyz, d_rotation, d_scaling, velocity_net, xyz.detach(), time_input,
+                dynamic_thresh, dynamic_percentile)
         results = render_fastgs(view, gaussians, pipeline, background, args.mult, d_xyz, d_rotation, d_scaling, is_6dof)
         rendering = results["render"]
         renderings.append(to8b(rendering.cpu().numpy()))
@@ -110,7 +155,8 @@ def interpolate_time(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, 
     imageio.mimwrite(os.path.join(render_path, 'video.mp4'), renderings, fps=30, quality=8)
 
 
-def interpolate_view(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, views, gaussians, pipeline, background, args, timer):
+def interpolate_view(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, views, gaussians, pipeline, background, args, timer,
+                     velocity_net=None, dynamic_thresh: float = 0.001, dynamic_percentile: float = -1):
     render_path = os.path.join(model_path, name, "interpolate_view_{}".format(iteration), "renders")
     depth_path = os.path.join(model_path, name, "interpolate_view_{}".format(iteration), "depth")
     # acc_path = os.path.join(model_path, name, "interpolate_view_{}".format(iteration), "acc")
@@ -143,6 +189,10 @@ def interpolate_view(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, 
         xyz = gaussians.get_xyz
         time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
         d_xyz, d_rotation, d_scaling = timer.step(xyz.detach(), time_input)
+        if velocity_net is not None:
+            d_xyz, d_rotation, d_scaling = _apply_dynamic_mask(
+                d_xyz, d_rotation, d_scaling, velocity_net, xyz.detach(), time_input,
+                dynamic_thresh, dynamic_percentile)
         results = render_fastgs(view, gaussians, pipeline, background, args.mult, d_xyz, d_rotation, d_scaling, is_6dof)
         rendering = results["render"]
         renderings.append(to8b(rendering.cpu().numpy()))
@@ -158,7 +208,8 @@ def interpolate_view(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, 
     imageio.mimwrite(os.path.join(render_path, 'video.mp4'), renderings, fps=30, quality=8)
 
 
-def interpolate_all(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, views, gaussians, pipeline, background, args, deform):
+def interpolate_all(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, views, gaussians, pipeline, background, args, deform,
+                    velocity_net=None, dynamic_thresh: float = 0.001, dynamic_percentile: float = -1):
     render_path = os.path.join(model_path, name, "interpolate_all_{}".format(iteration), "renders")
     depth_path = os.path.join(model_path, name, "interpolate_all_{}".format(iteration), "depth")
 
@@ -187,6 +238,10 @@ def interpolate_all(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, v
         xyz = gaussians.get_xyz
         time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
         d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input)
+        if velocity_net is not None:
+            d_xyz, d_rotation, d_scaling = _apply_dynamic_mask(
+                d_xyz, d_rotation, d_scaling, velocity_net, xyz.detach(), time_input,
+                dynamic_thresh, dynamic_percentile)
         results = render_fastgs(view, gaussians, pipeline, background, args.mult, d_xyz, d_rotation, d_scaling, is_6dof)
         rendering = results["render"]
         renderings.append(to8b(rendering.cpu().numpy()))
@@ -200,7 +255,8 @@ def interpolate_all(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, v
     imageio.mimwrite(os.path.join(render_path, 'video.mp4'), renderings, fps=30, quality=8)
 
 
-def interpolate_poses(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, views, gaussians, pipeline, background, args, timer):
+def interpolate_poses(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, views, gaussians, pipeline, background, args, timer,
+                      velocity_net=None, dynamic_thresh: float = 0.001, dynamic_percentile: float = -1):
     render_path = os.path.join(model_path, name, "interpolate_pose_{}".format(iteration), "renders")
     depth_path = os.path.join(model_path, name, "interpolate_pose_{}".format(iteration), "depth")
 
@@ -235,6 +291,11 @@ def interpolate_poses(model_path, load2gpt_on_the_fly, is_6dof, name, iteration,
         time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
         d_xyz, d_rotation, d_scaling = timer.step(xyz.detach(), time_input)
 
+        if velocity_net is not None:
+            d_xyz, d_rotation, d_scaling = _apply_dynamic_mask(
+                d_xyz, d_rotation, d_scaling, velocity_net, xyz.detach(), time_input,
+                dynamic_thresh, dynamic_percentile)
+
         results = render_fastgs(view, gaussians, pipeline, background, args.mult, d_xyz, d_rotation, d_scaling, is_6dof)
         rendering = results["render"]
         renderings.append(to8b(rendering.cpu().numpy()))
@@ -246,7 +307,7 @@ def interpolate_poses(model_path, load2gpt_on_the_fly, is_6dof, name, iteration,
 
 
 def interpolate_view_original(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, views, gaussians, pipeline, background, args,
-                              timer):
+                              timer, velocity_net=None, dynamic_thresh: float = 0.001, dynamic_percentile: float = -1):
     render_path = os.path.join(model_path, name, "interpolate_hyper_view_{}".format(iteration), "renders")
     depth_path = os.path.join(model_path, name, "interpolate_hyper_view_{}".format(iteration), "depth")
     # acc_path = os.path.join(model_path, name, "interpolate_all_{}".format(iteration), "acc")
@@ -291,6 +352,11 @@ def interpolate_view_original(model_path, load2gpt_on_the_fly, is_6dof, name, it
         time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
         d_xyz, d_rotation, d_scaling = timer.step(xyz.detach(), time_input)
 
+        if velocity_net is not None:
+            d_xyz, d_rotation, d_scaling = _apply_dynamic_mask(
+                d_xyz, d_rotation, d_scaling, velocity_net, xyz.detach(), time_input,
+                dynamic_thresh, dynamic_percentile)
+
         results = render_fastgs(view, gaussians, pipeline, background, args.mult, d_xyz, d_rotation, d_scaling, is_6dof)
         rendering = results["render"]
         renderings.append(to8b(rendering.cpu().numpy()))
@@ -309,8 +375,44 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
         deform = DeformModel(dataset.is_blender, dataset.is_6dof)
         deform.load_weights(dataset.model_path)
 
+        # ── Load velocity network for dynamic masking ──
+        velocity_net = None
+        use_velocity = getattr(dataset, 'use_velocity', False)
+        use_dynamic_mask = getattr(args, 'use_dynamic_mask',
+                                   getattr(dataset, 'use_dynamic_mask', False))
+        dynamic_thresh = getattr(args, 'dynamic_thresh',
+                                 getattr(dataset, 'dynamic_thresh', 0.001))
+        dynamic_percentile = getattr(args, 'dynamic_thresh_percentile',
+                                     getattr(dataset, 'dynamic_thresh_percentile', -1))
+
+        if use_velocity and use_dynamic_mask:
+            vnet_type = getattr(dataset, 'velocity_network_type',
+                                getattr(args, 'velocity_network_type', 'mlp'))
+            if vnet_type == 'tcnn':
+                velocity_net = VelocityNetworkTcnn(
+                    is_blender=dataset.is_blender, is_6dof=dataset.is_6dof).cuda()
+            elif vnet_type == 'hash':
+                velocity_net = VelocityNetworkHash(
+                    is_blender=dataset.is_blender, is_6dof=dataset.is_6dof).cuda()
+            else:
+                velocity_net = VelocityNetwork(
+                    is_blender=dataset.is_blender, is_6dof=dataset.is_6dof).cuda()
+            velocity_net.load_weights(dataset.model_path)
+            velocity_net.eval()
+            n_static = "(percentile={})" .format(dynamic_percentile) if dynamic_percentile >= 0 else "(thresh={:.6f})".format(dynamic_thresh)
+            print(f"[INFO] Velocity network loaded ({vnet_type}), dynamic mask enabled {n_static}")
+        elif use_velocity and not use_dynamic_mask:
+            print("[INFO] Velocity network available but dynamic mask disabled (--use_dynamic_mask not set)")
+
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+
+        # Extra kwargs for dynamic masking
+        _mask_kwargs = dict(
+            velocity_net=velocity_net,
+            dynamic_thresh=dynamic_thresh,
+            dynamic_percentile=dynamic_percentile,
+        )
 
         if mode == "render":
             render_func = render_set
@@ -328,12 +430,12 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
         if not skip_train:
             render_func(dataset.model_path, dataset.load2gpu_on_the_fly, dataset.is_6dof, "train", scene.loaded_iter,
                         scene.getTrainCameras(), gaussians, pipeline,
-                        background, args, deform)
+                        background, args, deform, **_mask_kwargs)
 
         if not skip_test:
             render_func(dataset.model_path, dataset.load2gpu_on_the_fly, dataset.is_6dof, "test", scene.loaded_iter,
                         scene.getTestCameras(), gaussians, pipeline,
-                        background, args, deform)
+                        background, args, deform, **_mask_kwargs)
 
 
 if __name__ == "__main__":

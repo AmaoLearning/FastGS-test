@@ -407,6 +407,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
                 deform.save_weights(args.model_path, iteration)
+                if dataset.use_velocity:
+                    velocity.save_weights(args.model_path, iteration)
 
             # Densification
             if iteration < opt.densify_until_iter:
