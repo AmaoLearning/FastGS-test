@@ -129,13 +129,14 @@ class OptimizationParams(ParamGroup):
         self.mult = 0.5
 
         # velocity
-        self.velocity_lr = 0.2
+        self.velocity_lr = 0.01  # 降低初始学习率，0.2过高导致不稳定
         self.velocity_lr_max_steps = 40_000
-        self.lambda_velocity = 100
-        self.velocity_interval = 10
+        self.lambda_velocity = 10  # 降低权重，100过高会压制渲染损失
+        self.velocity_interval = 5  # 更频繁更新，从10改为5
         self.velocity_loss_thresh = 0.00003  # velocity loss 阈值
         self.velocity_loss_percentile = 30  # 自适应阈值百分比，-1表示使用固定阈值，0-100表示使用自适应阈值（如50表示取中位数作为阈值）
         self.detach_velocity_loss_from_deform = True  # 是否阻断 velocity loss 对形变场的梯度传播
+        self.velocity_grad_clip = 1.0  # 速度场梯度裁剪阈值，0表示不裁剪
         
         # velocity temporal smoothness
         self.lambda_velocity_smooth = 0.1  # 时间平滑正则化权重
@@ -148,9 +149,13 @@ class OptimizationParams(ParamGroup):
         self.flow_tv_weight = 0.01  # TV 正则权重
         self.detach_flow_geometry = True  # 是否阻断光流损失对几何（位置/协方差）的梯度传播
 
-        self.dynamic_decay = 0.95  # Leaky Max 的衰减系数；0.95好于0.99，后者衰减太慢
-        self.dynamic_thresh = 0.001  # 动态阈值，速度大于此值的高斯被认为是动态的
-        self.dynamic_thresh_percentile = 75  # 自适应阈值百分比，-1表示使用固定阈值，0-100表示使用自适应阈值（如50表示取中位数）
+        self.dynamic_decay = 0.9  # Leaky Max 的衰减系数；从0.95降低到0.9，更快响应新的速度变化
+        self.dynamic_thresh = 0.0001  # 动态阈值，降低阈值让更多高斯被认为是动态的
+        self.dynamic_thresh_percentile = 50  # 自适应阈值百分比，从75降低到50，避免过于激进
+        
+        # 静态区域densification限制 (新增)
+        self.limit_static_densify = False  # 是否限制静态区域的clone/split
+        self.static_densify_percentile = 25  # 动态指标低于此百分位的高斯被认为是静态的，限制其densification
         
         self.div_percentile = -1  # 散度阈值百分位数，高于此值触发 Clone
         self.curl_percentile = -1  # 旋度阈值百分位数，高于此值触发 Split

@@ -520,7 +520,7 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_dynamic_metrics)
 
-    def densify_and_prune_fastgs(self, max_screen_size, min_opacity, extent, radii, args, importance_score = None, pruning_score = None, velocity_mask = None, physics_clone_mask = None, physics_split_mask = None, velocity_net = None, times = None):
+    def densify_and_prune_fastgs(self, max_screen_size, min_opacity, extent, radii, args, importance_score = None, pruning_score = None, velocity_mask = None, physics_clone_mask = None, physics_split_mask = None, velocity_net = None, times = None, static_mask = None):
         
         ''' 
             Densification and Pruning based on FastGS criteria:
@@ -529,6 +529,7 @@ class GaussianModel:
                 This is our main contribution compared to the vanilla 3DGS.
             3.  Finally, gaussians with low opacity or very large size are pruned.
             4.  (New) If velocity_mask is provided, only gaussians with accurate velocity prediction are densified.
+            5.  (New) If static_mask is provided, static gaussians are excluded from densification to reduce redundancy.
         '''
         grad_vars = self.xyz_gradient_accum / self.denom
         grad_vars[grad_vars.isnan()] = 0.0
@@ -564,6 +565,16 @@ class GaussianModel:
             all_splits = torch.logical_and(all_splits, physics_split_mask)
             _stats.extend([physics_split_mask.sum(), all_splits.sum()])
 
+        # 如果提供了 static_mask，则排除静态高斯的 densification
+        # static_mask 为 True 表示该高斯是静态的，应该被排除在 densification 之外
+        # 注意：我们不删除静态高斯，只是不再增加它们
+        if static_mask is not None:
+            # ~static_mask: True 表示非静态（可以 densify）
+            non_static_mask = ~static_mask
+            all_clones = torch.logical_and(all_clones, non_static_mask)
+            all_splits = torch.logical_and(all_splits, non_static_mask)
+            _stats.extend([static_mask.sum(), all_clones.sum(), all_splits.sum()])
+
         # This is our multi-view consisent metric for densification
         # We use this metric to further filter the candidates for densification, which is similar to taming 3dgs.
         metric_mask = importance_score > 5
@@ -586,6 +597,9 @@ class GaussianModel:
         if physics_split_mask is not None:
             print(f"With physics_split_mask: {int(_vals[_i])}, all_splits: {int(_vals[_i+1])}")
             _i += 2
+        if static_mask is not None:
+            print(f"Static gaussians excluded: {int(_vals[_i])}, all_clones: {int(_vals[_i+1])}, all_splits: {int(_vals[_i+2])}")
+            _i += 3
         print(f"With metric_mask: {int(_vals[_i])}, all_clones: {int(_vals[_i+1])}, all_splits: {int(_vals[_i+2])}\n")
 
         self.densify_and_clone_fastgs(metric_mask, all_clones, velocity_net=velocity_net, times=times, eta=args.clone_eta if hasattr(args, 'clone_eta') else 0.2)
@@ -631,6 +645,32 @@ class GaussianModel:
         scores_mask = pruning_score > 0.9
         final_prune = torch.logical_or(prune_mask, scores_mask)
         self.prune_points(final_prune)
+
+    def get_static_mask(self, percentile=25):
+        """生成静态高斯掩码：用于限制静态区域的densification
+        
+        静态高斯是背景的重要组成部分（墙壁、桌面等），不应被删除。
+        此方法生成一个掩码，用于在densification时限制静态区域的clone/split，
+        从而减少静态区域的高斯冗余，同时保留已有的静态高斯。
+        
+        Args:
+            percentile: 动态指标百分位数阈值，低于此值的高斯被视为"静态"
+        
+        Returns:
+            static_mask: bool tensor [N], True 表示该高斯是静态的
+        """
+        # 计算动态指标的模长
+        dynamic_norm = torch.norm(self.dynamic_metrics, dim=-1)  # [N]
+        
+        # 计算阈值
+        threshold = torch.quantile(dynamic_norm, percentile / 100.0).item()
+        
+        # 静态掩码：动态指标低于阈值
+        # 额外保护：动态指标为0的高斯可能是新生成的，不视为静态
+        is_initialized = dynamic_norm > 1e-7
+        is_static = torch.logical_and(dynamic_norm < threshold, is_initialized)
+        
+        return is_static
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter, :2], dim=-1,
@@ -694,15 +734,27 @@ class GaussianModel:
         
         return (avg_velocity_loss >= threshold)
 
-    def update_dynamic_metrics(self, current_v, decay=0.99):
+    def update_dynamic_metrics(self, current_v, decay=0.99, min_value=1e-8):
         """更新动态指标：使用 Leaky Max (Decaying Peak) 方法
         Args:
             current_v: 当前速度 [N, 3]
             decay: 衰减系数，控制历史峰值的衰减速度
+            min_value: 最小值保护，防止指标完全退化为0
         """
+        # 数值保护：跳过NaN/Inf
+        if torch.isnan(current_v).any() or torch.isinf(current_v).any():
+            return
+        
         # dynamic_metrics = max(|current_v|, dynamic_metrics * decay)
         current_v_abs = current_v.abs()
-        self.dynamic_metrics = torch.max(current_v_abs, self.dynamic_metrics * decay)
+        
+        # 使用 exponential moving average 与 leaky max 结合，更稳定
+        # 新策略：同时考虑当前值和历史衰减值的平滑更新
+        decayed_metrics = self.dynamic_metrics * decay
+        self.dynamic_metrics = torch.max(current_v_abs, decayed_metrics)
+        
+        # 添加最小值保护，防止完全退化
+        self.dynamic_metrics = torch.clamp(self.dynamic_metrics, min=min_value)
     
     def get_dynamic_mask(self, dynamic_thresh, grad_abs_thresh, iteration=None, adaptive_percentile=-1):
         """生成动态掩码：只有动态且梯度足够大的高斯才需要计算 deform

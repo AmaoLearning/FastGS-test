@@ -7,7 +7,7 @@ import os
 from utils.system_utils import searchForMaxIteration
 from utils.general_utils import get_expon_lr_func
 from typing import Tuple, Union
-from torch.func import vmap, jacrev
+# from torch.func import vmap, jacrev # torch < 2.0
 
 # tinycudann: optional — only needed when velocity_network_type == "tcnn"
 try:
