@@ -59,9 +59,15 @@ class Scene:
         load_flow = getattr(args, 'use_flow_loss', False)
         self._load_flow: bool = load_flow
 
+        # Number of *temporal* frames (used for time_interval in velocity
+        # loss).  For multi-camera datasets the total camera count is
+        # spatial × temporal; only the temporal part should define dt.
+        self._num_temporal_frames: Optional[int] = None
+
         if os.path.exists(os.path.join(args.source_path, "poses_bounds.npy")):
             if getattr(args, 'lazy_load', False):
                 _n_frames = getattr(args, 'num_images', 300)
+                self._num_temporal_frames = _n_frames
                 print(f"Found poses_bounds.npy, using N3V lazy loader "
                       f"(metadata only, {_n_frames} frames/cam, flow={load_flow})")
                 scene_info = sceneLoadTypeCallbacks["N3VLazy"](
@@ -119,6 +125,18 @@ class Scene:
             print("Loading Test Cameras")
             self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale,
                                                                            args)
+
+        # Fallback: if _num_temporal_frames was not set by a specific loader,
+        # assume each camera corresponds to one unique time step.
+        if self._num_temporal_frames is None:
+            self._num_temporal_frames = len(
+                self.train_cameras.get(resolution_scales[0], []))
+            print(f"[Scene] num_temporal_frames = {self._num_temporal_frames} "
+                  f"(fallback: len(train_cameras))")
+        else:
+            print(f"[Scene] num_temporal_frames = {self._num_temporal_frames} "
+                  f"(total train cameras = "
+                  f"{len(self.train_cameras.get(resolution_scales[0], []))})")
 
         if self.loaded_iter:
             self.gaussians.load_ply(os.path.join(self.model_path,
@@ -279,27 +297,26 @@ class Scene:
                 # render + backward on the default stream.
                 self._kick_prefetch(compute_done)
 
-                return cam, len(cameras)
+                return cam, self._num_temporal_frames
             else:
                 # Fallback (mixed resolutions): no double buffer
                 _batch_idx, _batch_img, _, _ = next(self._lazy_data_iter)
                 cam = cameras[_batch_idx.item()]
                 cam.original_image = _batch_img.squeeze(0).to(
                     "cuda", non_blocking=True)
-                return cam, len(cameras)
+                return cam, self._num_temporal_frames
 
         # ── Eager (non-lazy) path ──
         if not self._viewpoint_stack:
             self._viewpoint_stack = self.getTrainCameras(scale).copy()
 
-        total_frame = len(self._viewpoint_stack)
         idx = random.randint(0, len(self._viewpoint_stack) - 1)
         cam = self._viewpoint_stack.pop(idx)
 
         if self._load2gpu_on_the_fly:
             cam.load2device()
 
-        return cam, total_frame
+        return cam, self._num_temporal_frames
 
     def release_camera_image(self, cam) -> None:
         """Drop the camera's image reference after ``loss.backward()``.
