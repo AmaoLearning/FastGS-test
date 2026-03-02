@@ -145,9 +145,14 @@ class OptimizationParams(ParamGroup):
         # optical flow loss（投影光流监督损失）
         self.lambda_flow = 0.1  # 光流损失权重
         self.flow_loss_from_iter = 6000  # 从第几个 iteration 开始使用光流损失
-        self.flow_loss_interval = 10  # 每隔几个 iteration 计算一次光流损失（节省算力）
+        self.flow_loss_interval = 5  # 每隔几个 iteration 计算一次光流损失（节省算力）
         self.flow_tv_weight = 0.01  # TV 正则权重
         self.detach_flow_geometry = True  # 是否阻断光流损失对几何（位置/协方差）的梯度传播
+        
+        # 自适应权重平衡（velocity_loss 和 flow_loss）
+        self.adaptive_velocity_weight = False  # 是否启用自适应权重平衡
+        self.velocity_flow_target_ratio = 1.0  # 目标损失比例 velocity_loss / flow_loss
+        self.adaptive_weight_ema = 0.99  # EMA衰减系数，用于平滑损失历史
 
         self.dynamic_decay = 0.9  # Leaky Max 的衰减系数；从0.95降低到0.9，更快响应新的速度变化
         self.dynamic_thresh = 0.0001  # 动态阈值，降低阈值让更多高斯被认为是动态的

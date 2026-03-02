@@ -115,6 +115,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
     progress_bar = tqdm(range(opt.iterations), desc="Training progress")
     smooth_term = get_linear_noise_func(lr_init=0.1, lr_final=1e-15, lr_delay_mult=0.01, max_steps=20000)
 
+    # ── 自适应权重平衡：追踪 velocity_loss 和 flow_loss 的 EMA ──
+    _ema_velocity_loss = None  # 初始为 None，首次观测后初始化
+    _ema_flow_loss = None
+    _adaptive_lambda_velocity = opt.lambda_velocity  # 动态调整的权重
+    _adaptive_lambda_flow = opt.lambda_flow
+
     # ── Phase-level timer for diagnosing GPU utilization ──
     # Records wall-clock time (with CUDA sync) per phase:
     #   data / deform / render / loss / backward / optim / other
@@ -330,18 +336,67 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 flow_mask = torch.ones(1, flow_gt.shape[1], flow_gt.shape[2],
                                        dtype=torch.bool, device=flow_gt.device)
             flow_loss = flow_loss_fn(flow_pred, flow_gt.float(), flow_mask.float())
+            
+            # 更新 flow_loss 的 EMA
+            with torch.no_grad():
+                _flow_loss_val = flow_loss.detach().item()
+                if _ema_flow_loss is None:
+                    _ema_flow_loss = _flow_loss_val
+                else:
+                    _ema_flow_loss = opt.adaptive_weight_ema * _ema_flow_loss + (1 - opt.adaptive_weight_ema) * _flow_loss_val
+            
+            # 将 flow_loss 加入总损失（权重使用固定值，自适应调整在 velocity 侧）
             loss = loss + opt.lambda_flow * flow_loss
 
             if iteration % 1000 == 0:
-                print(f"[Iter {iteration}] flow loss = {flow_loss.item():.6f}")
+                print(f"[Iter {iteration}] flow loss = {flow_loss.item():.6f} (EMA: {_ema_flow_loss:.6f})")
             if tb_writer and iteration % 100 == 0:
                 tb_writer.add_scalar('train_loss_patches/flow_loss', flow_loss.item(), iteration)
+                tb_writer.add_scalar('train_loss_patches/flow_loss_ema', _ema_flow_loss, iteration)
+                tb_writer.add_scalar('train_loss_patches/flow_loss_weighted', 
+                                    opt.lambda_flow * flow_loss.item(), iteration)
         
         # 只有在 use_velocity 开启且不在 warm_up 期间时才加入 velocity_loss 和时间平滑正则化
         velocity_smooth_loss = None
         if dataset.use_velocity and iteration >= opt.warm_up:
             if velocity_loss is not None:
-                loss = loss + opt.lambda_velocity * velocity_loss
+                # 更新 velocity_loss 的 EMA
+                with torch.no_grad():
+                    _velocity_loss_val = velocity_loss.detach().item()
+                    if _ema_velocity_loss is None:
+                        _ema_velocity_loss = _velocity_loss_val
+                    else:
+                        _ema_velocity_loss = opt.adaptive_weight_ema * _ema_velocity_loss + (1 - opt.adaptive_weight_ema) * _velocity_loss_val
+                
+                # 自适应权重平衡
+                if opt.adaptive_velocity_weight and _ema_velocity_loss is not None and _ema_flow_loss is not None and _ema_flow_loss > 1e-8:
+                    # 目标：使 lambda_velocity * velocity_loss ≈ velocity_flow_target_ratio * lambda_flow * flow_loss
+                    # 即：lambda_velocity = velocity_flow_target_ratio * lambda_flow * flow_loss / velocity_loss
+                    target_ratio = opt.velocity_flow_target_ratio
+                    current_ratio = _ema_velocity_loss / (_ema_flow_loss + 1e-8)
+                    
+                    # 计算调整后的权重，使两个损失贡献相当
+                    # 如果 velocity_loss 比 flow_loss 大，降低 lambda_velocity
+                    _adaptive_lambda_velocity = opt.lambda_velocity * (target_ratio / (current_ratio + 1e-8))
+                    # 限制调整幅度，避免过度振荡
+                    _adaptive_lambda_velocity = max(0.1 * opt.lambda_velocity, 
+                                                    min(10.0 * opt.lambda_velocity, _adaptive_lambda_velocity))
+                    
+                    if iteration % 1000 == 0:
+                        print(f"[Adaptive Weight] velocity/flow ratio: {current_ratio:.4f}, "
+                              f"lambda_velocity: {opt.lambda_velocity} -> {_adaptive_lambda_velocity:.4f}")
+                    if tb_writer and iteration % 100 == 0:
+                        tb_writer.add_scalar('train_loss_patches/adaptive_lambda_velocity', _adaptive_lambda_velocity, iteration)
+                        tb_writer.add_scalar('train_loss_patches/velocity_flow_ratio', current_ratio, iteration)
+                else:
+                    _adaptive_lambda_velocity = opt.lambda_velocity
+                
+                loss = loss + _adaptive_lambda_velocity * velocity_loss
+                
+                if tb_writer and iteration % 100 == 0:
+                    tb_writer.add_scalar('train_loss_patches/velocity_loss_ema', _ema_velocity_loss, iteration)
+                    tb_writer.add_scalar('train_loss_patches/velocity_loss_weighted', 
+                                        _adaptive_lambda_velocity * velocity_loss.item(), iteration)
             
             # 时间平滑正则化损失：约束相邻时间步的速度场保持平滑
             if dataset.use_velocity_smooth and opt.lambda_velocity_smooth > 0 and iteration % opt.velocity_interval == 0:
