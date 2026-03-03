@@ -554,7 +554,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 if iteration % opt.densification_interval == 0:
                     gaussians.zero_accums()
 
-            if iteration % 3000 == 0 and iteration > 15_000 and iteration < 30_000:
+            if iteration % opt.final_prune_interval == 0 and iteration > opt.final_prune_from_iter and iteration < opt.final_prune_until_iter:
                 my_viewpoint_stack = scene.getTrainCameras().copy()
                 camlist = sampling_cameras(my_viewpoint_stack)
 

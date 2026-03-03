@@ -118,6 +118,9 @@ class OptimizationParams(ParamGroup):
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.0007
+        self.final_prune_from_iter = 15_000
+        self.final_prune_until_iter = 30_000
+        self.final_prune_interval = 3000
 
         # fastgs parameters
         self.loss_thresh = 0.1
