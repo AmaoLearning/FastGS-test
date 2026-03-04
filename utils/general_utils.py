@@ -198,4 +198,11 @@ def safe_state(silent, seed: int = 42, deterministic: bool = False):
         except Exception:
             pass
     
+    try:
+        import tinycudann as tcnn
+        tcnn.set_random_seed(seed)
+        print(f"[INFO] tinycudann detected! Set the random seed:{seed}")
+    except Exception:
+        pass
+    
     torch.cuda.set_device(torch.device("cuda:0"))
