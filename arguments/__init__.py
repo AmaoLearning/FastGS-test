@@ -137,7 +137,7 @@ class OptimizationParams(ParamGroup):
         self.lambda_velocity = 10  # 降低权重，100过高会压制渲染损失
         self.velocity_interval = 5  # 更频繁更新，从10改为5
         self.velocity_loss_thresh = 0.00003  # velocity loss 阈值
-        self.velocity_loss_percentile = 30  # 自适应阈值百分比，-1表示使用固定阈值，0-100表示使用自适应阈值（如50表示取中位数作为阈值）
+        self.velocity_loss_percentile = 70  # 自适应阈值百分比，-1表示使用固定阈值，0-100表示使用自适应阈值（如70表示约70%的低损失高斯通过筛选）
         self.detach_velocity_loss_from_deform = True  # 是否阻断 velocity loss 对形变场的梯度传播
         self.velocity_grad_clip = 1.0  # 速度场梯度裁剪阈值，0表示不裁剪
         

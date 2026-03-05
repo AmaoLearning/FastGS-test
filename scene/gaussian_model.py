@@ -690,11 +690,11 @@ class GaussianModel:
     def get_velocity_loss_mask(self, threshold, adaptive_percentile=-1):
         """基于累积的平均 velocity loss 生成掩码
         Args:
-            threshold: velocity loss 阈值，高于此值的高斯将被标记
+            threshold: velocity loss 阈值，低于此值的高斯将被标记
             adaptive_percentile: 自适应阈值百分比，-1表示使用固定阈值，0-100表示使用自适应阈值
-                                 例如: 50 表示取中位数作为阈值，使得约50%的高斯通过筛选
+                                 例如: 70 表示取70分位数作为阈值，使得约70%的高斯通过筛选
         Returns:
-            mask: bool tensor, True 表示该高斯的平均 velocity loss 高于阈值（运动预测不准）
+            mask: bool tensor, True 表示该高斯的平均 velocity loss 低于阈值（运动预测较准）
         """
         avg_velocity_loss = self.velocity_loss_accum / (self.velocity_denom + 1e-7)
         avg_velocity_loss[avg_velocity_loss.isnan()] = 0.0
@@ -732,7 +732,8 @@ class GaussianModel:
             print(f"  Current threshold: {threshold}")
             print(f"  Gaussians below threshold: {int(all_stats[5])} ({100*all_stats[5]/_n_valid:.2f}%)\n")
         
-        return (avg_velocity_loss >= threshold)
+        # 仅允许有统计样本且 velocity loss 较低的高斯参与 densification
+        return torch.logical_and(valid_mask, avg_velocity_loss <= threshold)
 
     def update_dynamic_metrics(self, current_v, decay=0.99, min_value=1e-8):
         """更新动态指标：使用 Leaky Max (Decaying Peak) 方法
