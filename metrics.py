@@ -62,17 +62,18 @@ def evaluate(model_paths):
             full_dict_polytopeonly[scene_dir] = {}
             per_view_dict_polytopeonly[scene_dir] = {}
 
-            num_gaussians = read_num_gaussians(scene_dir)
-            if num_gaussians is not None:
-                print(f"  Num Gaussians: {num_gaussians}")
-                full_dict[scene_dir]["num_gaussians"] = num_gaussians
-
             test_dir = Path(scene_dir) / "test"
 
             for method in os.listdir(test_dir):
                 if not method.startswith("ours"):
                     continue
                 print("Method:", method)
+                
+                iteration = int(method.split('_')[-1])
+                num_gaussians = read_num_gaussians(scene_dir, iteration)
+                if num_gaussians is not None:
+                    print(f"  Num Gaussians: {num_gaussians}")
+                    full_dict[scene_dir][method]["num_gaussians"] = num_gaussians
 
                 full_dict[scene_dir][method] = {}
                 per_view_dict[scene_dir][method] = {}
