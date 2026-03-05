@@ -21,6 +21,7 @@ import json
 from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser
+import traceback
 
 
 def readImages(renders_dir, gt_dir):
@@ -68,17 +69,17 @@ def evaluate(model_paths):
                 if not method.startswith("ours"):
                     continue
                 print("Method:", method)
+
+                full_dict[scene_dir][method] = {}
+                per_view_dict[scene_dir][method] = {}
+                full_dict_polytopeonly[scene_dir][method] = {}
+                per_view_dict_polytopeonly[scene_dir][method] = {}
                 
                 iteration = int(method.split('_')[-1])
                 num_gaussians = read_num_gaussians(scene_dir, iteration)
                 if num_gaussians is not None:
                     print(f"  Num Gaussians: {num_gaussians}")
                     full_dict[scene_dir][method]["num_gaussians"] = num_gaussians
-
-                full_dict[scene_dir][method] = {}
-                per_view_dict[scene_dir][method] = {}
-                full_dict_polytopeonly[scene_dir][method] = {}
-                per_view_dict_polytopeonly[scene_dir][method] = {}
 
                 method_dir = test_dir / method
                 gt_dir = method_dir / "gt"
@@ -111,8 +112,10 @@ def evaluate(model_paths):
                 json.dump(full_dict[scene_dir], fp, indent=True)
             with open(scene_dir + "/per_view.json", 'w') as fp:
                 json.dump(per_view_dict[scene_dir], fp, indent=True)
-        except:
+        except Exception as exc:
             print("Unable to compute metrics for model", scene_dir)
+            print(f"Reason: {exc}")
+            traceback.print_exc()
 
 
 if __name__ == "__main__":
