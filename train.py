@@ -13,7 +13,7 @@ import os
 import time
 import torch
 from random import randint
-from utils.loss_utils import l1_loss, ssim, kl_divergence, l2_loss, velocity_temporal_smoothness_loss
+from utils.loss_utils import l1_loss, ssim, kl_divergence, l2_loss
 from gaussian_renderer import render_fastgs, network_gui
 import sys
 from scene import Scene, GaussianModel, DeformModel
@@ -34,7 +34,6 @@ except ImportError:
 
 import random
 from utils.fast_utils import compute_gaussian_score_fastgs, sampling_cameras
-from utils.motion_utils import VelocityNetwork, VelocityNetworkHash, VelocityNetworkTcnn
 from utils.flow_rasterizer import FlowRasterizerHelper, OpticalFlowLoss
 from utils.optic_flow_utils import load_precomputed_flow
 
@@ -57,19 +56,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
     except Exception as _e:
         print(f"[INFO] torch.compile unavailable: {_e}, using eager mode")
 
-    # velocity - 根据配置选择网络类型
-    if dataset.use_velocity:
-        if dataset.velocity_network_type == "tcnn":
-            print("[INFO] Using tinycudann Velocity Network (fused hash + MLP)")
-            velocity = VelocityNetworkTcnn(is_blender=dataset.is_blender, is_6dof=dataset.is_6dof).cuda()
-        elif dataset.velocity_network_type == "hash":
-            print("[INFO] Using Hash Encoding Velocity Network")
-            velocity = VelocityNetworkHash(is_blender=dataset.is_blender, is_6dof=dataset.is_6dof).cuda()
-        else:
-            print("[INFO] Using MLP Velocity Network")
-            velocity = VelocityNetwork(is_blender=dataset.is_blender, is_6dof=dataset.is_6dof).cuda()
-        velocity.train_setting(opt)
-
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt, args)
 
@@ -77,10 +63,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
     if scene._lazy_mode:
         scene.setup_lazy_dataloader()
 
-    # ── Optical Flow Loss Setup ──
+    # ── Optical Flow Loss Setup (deform finite-diff → diff-flow-rasterization) ──
     flow_helper = None
     flow_loss_fn = None
-    if dataset.use_flow_loss and dataset.use_velocity:
+    if dataset.use_flow_loss:
         # 检查训练集是否有光流文件路径（延迟加载，此时不读取数组）
         any_has_flow = any(c.has_flow for c in scene.getTrainCameras())
         if any_has_flow:
@@ -114,12 +100,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
     # best_iteration = 0
     progress_bar = tqdm(range(opt.iterations), desc="Training progress")
     smooth_term = get_linear_noise_func(lr_init=0.1, lr_final=1e-15, lr_delay_mult=0.01, max_steps=20000)
-
-    # ── 自适应权重平衡：追踪 velocity_loss 和 flow_loss 的 EMA ──
-    _ema_velocity_loss = None  # 初始为 None，首次观测后初始化
-    _ema_flow_loss = None
-    _adaptive_lambda_velocity = opt.lambda_velocity  # 动态调整的权重
-    _adaptive_lambda_flow = opt.lambda_flow
 
     # ── Phase-level timer for diagnosing GPU utilization ──
     # Records wall-clock time (with CUDA sync) per phase:
@@ -176,8 +156,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
 
         gaussians.update_learning_rate(iteration)
         deform.update_learning_rate(iteration)
-        if dataset.use_velocity:
-            velocity.update_learning_rate(iteration)
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
@@ -197,8 +175,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             _phase_accum["data"] += time.perf_counter() - _t0
             _t0 = time.perf_counter()
 
-        velocity_loss = None  # 仅在需要时计算
-        per_gaussian_velocity_loss = None  # 每个高斯的 velocity loss
         if iteration < opt.warm_up:
             d_xyz, d_rotation, d_scaling = 0.0, 0.0, 0.0
         else:
@@ -207,73 +183,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
 
             ast_noise = 0 if dataset.is_blender else torch.randn(1, 1, device='cuda').expand(N, -1) * time_interval * smooth_term(iteration)
 
-            # 如果启用动态掩码，只对动态高斯计算 deform
-            if dataset.use_dynamic_mask and iteration % opt.velocity_interval != 0:
-                dynamic_mask = gaussians.get_dynamic_mask(
-                    opt.dynamic_thresh, 
-                    opt.grad_abs_thresh, 
-                    iteration,
-                    adaptive_percentile=opt.dynamic_thresh_percentile
-                )
-                # 初始化为零
-                d_xyz = torch.zeros((N, 3), device="cuda")
-                d_rotation = torch.zeros((N, 4), device="cuda")
-                d_scaling = torch.zeros((N, 3), device="cuda")
-                # 只对动态高斯计算 deform
-                if dynamic_mask.sum() > 0:
-                    d_xyz_masked, d_rotation_masked, d_scaling_masked = deform.step(
-                        gaussians.get_xyz[dynamic_mask].detach(), 
-                        time_input[dynamic_mask] + (ast_noise[dynamic_mask] if torch.is_tensor(ast_noise) else ast_noise)
-                    )
-                    d_xyz[dynamic_mask] = d_xyz_masked
-                    d_rotation[dynamic_mask] = d_rotation_masked
-                    d_scaling[dynamic_mask] = d_scaling_masked
-                
-                if iteration % 1000 == 0:
-                    print(f"[Iter {iteration}] Dynamic mask: {dynamic_mask.sum().item()}/{N} ({100*dynamic_mask.sum().item()/N:.2f}%)")
-            else:
-                d_xyz, d_rotation, d_scaling = deform.step(gaussians.get_xyz.detach(), time_input + ast_noise)
-            
-            if dataset.use_velocity and iteration % opt.velocity_interval == 0:
-                _d_xyz, _, _ = deform.step(gaussians.get_xyz.detach(), time_input + ast_noise + time_interval)
-                current_v = velocity.forward(gaussians.get_xyz.detach(), time_input + ast_noise)
-                
-                # 更新动态指标 (Leaky Max) - 添加数值保护
-                with torch.no_grad():
-                    # 检测NaN并跳过更新
-                    if not torch.isnan(current_v).any() and not torch.isinf(current_v).any():
-                        gaussians.update_dynamic_metrics(current_v.detach(), decay=opt.dynamic_decay)
-                    elif iteration % 100 == 0:
-                        print(f"[WARNING][Iter {iteration}] NaN/Inf detected in velocity, skipping dynamic_metrics update")
-                
-                # 计算每个高斯的 velocity loss (用于累积统计)
-                # 可选：阻断梯度从 velocity loss 传播到形变场（deform）
-                if opt.detach_velocity_loss_from_deform:
-                    velocity_diff = (_d_xyz - d_xyz).detach()
-                else:
-                    velocity_diff = _d_xyz - d_xyz
-                velocity_pred = current_v * time_interval
-                
-                # 使用L2范数代替mean，避免正负抵消导致训练信号消失
-                per_gaussian_velocity_loss = ((velocity_diff - velocity_pred) ** 2).mean(dim=-1, keepdim=True)
-                
-                # 总体 velocity loss (用于反向传播) - 添加数值保护
-                velocity_loss = per_gaussian_velocity_loss.mean()
-                
-                # 检测并处理NaN/Inf
-                if torch.isnan(velocity_loss) or torch.isinf(velocity_loss):
-                    print(f"[WARNING][Iter {iteration}] velocity_loss is NaN/Inf, skipping this iteration")
-                    velocity_loss = None
-                    per_gaussian_velocity_loss = None
-
-                if velocity_loss is not None and tb_writer and iteration % 100 == 0:
-                    tb_writer.add_scalar('train_loss_patches/velocity_loss', velocity_loss.item(), iteration)
-                if velocity_loss is not None and iteration % 1000 == 0:
-                    print(f"[Iter {iteration}] velocity loss = {velocity_loss.item():.6f}")
-                    v_mean = current_v.mean(dim=0).detach()
-                    v_std = current_v.std(dim=0).detach()
-                    print(f"[Iter {iteration}] velocity mean = {v_mean.cpu().numpy()}, std = {v_std.cpu().numpy()}")
-                    print(f"[Iter {iteration}] velocity norm mean = {current_v.norm(dim=-1).mean().item():.6f}")
+            d_xyz, d_rotation, d_scaling = deform.step(gaussians.get_xyz.detach(), time_input + ast_noise)
 
         if _enable_phase_timer:
             torch.cuda.synchronize()
@@ -306,23 +216,31 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
             tb_writer.add_scalar('train_stats/num_gaussians', gaussians._xyz.shape[0], iteration)
 
-        # ── Optical Flow Loss ──
+        # ── Optical Flow Loss (deform finite-diff → projected flow → GT comparison) ──
         flow_loss = None
-        if (dataset.use_flow_loss and dataset.use_velocity
+        per_gaussian_flow_error = None
+        if (dataset.use_flow_loss
             and flow_helper is not None
             and iteration >= opt.flow_loss_from_iter
             and iteration % opt.flow_loss_interval == 0
+            and iteration >= opt.warm_up
+            and torch.is_tensor(d_xyz)
             and viewpoint_cam.has_flow):
-            # On-demand flow loading: only ~10% of iterations reach this
-            # path (flow_loss_interval=10), so the sync IO cost is amortized.
+            # On-demand flow loading
             viewpoint_cam.load_flow(device='cuda')
             flow_gt = viewpoint_cam.flow_fwd  # [2, H, W]
-            # 计算 world-space velocity（当前时刻）
+
+            # Deform at t+dt → finite-difference velocity (NOT detached → gradient flows to deform)
             N = gaussians.get_xyz.shape[0]
             time_input = fid.unsqueeze(0).expand(N, -1)
-            velocity3D = velocity.forward(gaussians.get_xyz.detach(), time_input)
-            # 渲染投影光流
-            deformed_means3D = (gaussians.get_xyz + d_xyz) if torch.is_tensor(d_xyz) else gaussians.get_xyz
+            d_xyz_next, _, _ = deform.step(
+                gaussians.get_xyz.detach(),
+                time_input + ast_noise + time_interval
+            )
+            velocity3D = (d_xyz_next - d_xyz) / time_interval  # [N, 3], gradient → deform
+
+            # Render projected optical flow
+            deformed_means3D = gaussians.get_xyz + d_xyz
             flow_pred, _, _ = flow_helper.render_flow(
                 gaussians=gaussians,
                 velocity3D=velocity3D,
@@ -330,95 +248,31 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 override_means3D=deformed_means3D,
                 detach_geometry=opt.detach_flow_geometry,
             )
-            # 使用 Forward-Backward Consistency Mask 过滤不可信区域
+
+            # Flow mask (forward-backward consistency)
             flow_mask = viewpoint_cam.flow_mask  # [1, H, W] bool or None
             if flow_mask is None:
                 flow_mask = torch.ones(1, flow_gt.shape[1], flow_gt.shape[2],
                                        dtype=torch.bool, device=flow_gt.device)
             flow_loss = flow_loss_fn(flow_pred, flow_gt.float(), flow_mask.float())
-            
-            # 更新 flow_loss 的 EMA
-            with torch.no_grad():
-                _flow_loss_val = flow_loss.detach().item()
-                if _ema_flow_loss is None:
-                    _ema_flow_loss = _flow_loss_val
-                else:
-                    _ema_flow_loss = opt.adaptive_weight_ema * _ema_flow_loss + (1 - opt.adaptive_weight_ema) * _flow_loss_val
-            
-            # 将 flow_loss 加入总损失（权重使用固定值，自适应调整在 velocity 侧）
+
+            # Per-gaussian flow error for densification mask:
+            # Gradient magnitude of flow_loss w.r.t. velocity3D indicates how much
+            # each gaussian's velocity needs to change to reduce flow error.
+            # Low magnitude → good fit → eligible for densification.
+            if flow_loss.requires_grad and velocity3D.requires_grad:
+                [flow_grad] = torch.autograd.grad(
+                    flow_loss, velocity3D, retain_graph=True
+                )
+                per_gaussian_flow_error = flow_grad.detach().norm(dim=-1, keepdim=True)
+
             loss = loss + opt.lambda_flow * flow_loss
 
             if iteration % 1000 == 0:
-                print(f"[Iter {iteration}] flow loss = {flow_loss.item():.6f} (EMA: {_ema_flow_loss:.6f})")
+                print(f"[Iter {iteration}] flow loss = {flow_loss.item():.6f}")
             if tb_writer and iteration % 100 == 0:
                 tb_writer.add_scalar('train_loss_patches/flow_loss', flow_loss.item(), iteration)
-                tb_writer.add_scalar('train_loss_patches/flow_loss_ema', _ema_flow_loss, iteration)
-                tb_writer.add_scalar('train_loss_patches/flow_loss_weighted', 
-                                    opt.lambda_flow * flow_loss.item(), iteration)
         
-        # 只有在 use_velocity 开启且不在 warm_up 期间时才加入 velocity_loss 和时间平滑正则化
-        velocity_smooth_loss = None
-        if dataset.use_velocity and iteration >= opt.warm_up:
-            if velocity_loss is not None:
-                # 更新 velocity_loss 的 EMA
-                with torch.no_grad():
-                    _velocity_loss_val = velocity_loss.detach().item()
-                    if _ema_velocity_loss is None:
-                        _ema_velocity_loss = _velocity_loss_val
-                    else:
-                        _ema_velocity_loss = opt.adaptive_weight_ema * _ema_velocity_loss + (1 - opt.adaptive_weight_ema) * _velocity_loss_val
-                
-                # 自适应权重平衡
-                if opt.adaptive_velocity_weight and _ema_velocity_loss is not None and _ema_flow_loss is not None and _ema_flow_loss > 1e-8:
-                    # 目标：使 lambda_velocity * velocity_loss ≈ velocity_flow_target_ratio * lambda_flow * flow_loss
-                    # 即：lambda_velocity = velocity_flow_target_ratio * lambda_flow * flow_loss / velocity_loss
-                    target_ratio = opt.velocity_flow_target_ratio
-                    current_ratio = _ema_velocity_loss / (_ema_flow_loss + 1e-8)
-                    
-                    # 计算调整后的权重，使两个损失贡献相当
-                    # 如果 velocity_loss 比 flow_loss 大，降低 lambda_velocity
-                    _adaptive_lambda_velocity = opt.lambda_velocity * (target_ratio / (current_ratio + 1e-8))
-                    # 限制调整幅度，避免过度振荡
-                    _adaptive_lambda_velocity = max(0.1 * opt.lambda_velocity, 
-                                                    min(10.0 * opt.lambda_velocity, _adaptive_lambda_velocity))
-                    
-                    if iteration % 1000 == 0:
-                        print(f"[Adaptive Weight] velocity/flow ratio: {current_ratio:.4f}, "
-                              f"lambda_velocity: {opt.lambda_velocity} -> {_adaptive_lambda_velocity:.4f}")
-                    if tb_writer and iteration % 100 == 0:
-                        tb_writer.add_scalar('train_loss_patches/adaptive_lambda_velocity', _adaptive_lambda_velocity, iteration)
-                        tb_writer.add_scalar('train_loss_patches/velocity_flow_ratio', current_ratio, iteration)
-                else:
-                    _adaptive_lambda_velocity = opt.lambda_velocity
-                
-                loss = loss + _adaptive_lambda_velocity * velocity_loss
-                
-                if tb_writer and iteration % 100 == 0:
-                    tb_writer.add_scalar('train_loss_patches/velocity_loss_ema', _ema_velocity_loss, iteration)
-                    tb_writer.add_scalar('train_loss_patches/velocity_loss_weighted', 
-                                        _adaptive_lambda_velocity * velocity_loss.item(), iteration)
-            
-            # 时间平滑正则化损失：约束相邻时间步的速度场保持平滑
-            if dataset.use_velocity_smooth and opt.lambda_velocity_smooth > 0 and iteration % opt.velocity_interval == 0:
-                N = gaussians.get_xyz.shape[0]
-                time_input = fid.unsqueeze(0).expand(N, -1)
-                # Reuse current_v computed in velocity loss block above
-                # to skip 1 of 2 velocity forward passes.
-                _reuse_v = current_v if velocity_loss is not None else None
-                velocity_smooth_loss = velocity_temporal_smoothness_loss(
-                    velocity, 
-                    gaussians.get_xyz.detach(), 
-                    time_input, 
-                    dt=opt.velocity_smooth_dt * time_interval,
-                    v_t=_reuse_v,
-                )
-                loss = loss + opt.lambda_velocity_smooth * velocity_smooth_loss
-                
-                if tb_writer and iteration % 100 == 0:
-                    tb_writer.add_scalar('train_loss_patches/velocity_smooth_loss', velocity_smooth_loss.item(), iteration)
-                if iteration % 1000 == 0:
-                    print(f"[Iter {iteration}] velocity smooth loss = {velocity_smooth_loss.item():.6f}")
-
         # Log final total loss (after all auxiliary losses are added)
         if tb_writer and iteration % 100 == 0:
             tb_writer.add_scalar('train_loss_patches/total_loss_final', loss.item(), iteration)
@@ -477,14 +331,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
                 deform.save_weights(args.model_path, iteration)
-                if dataset.use_velocity:
-                    velocity.save_weights(args.model_path, iteration)
 
             # Densification
             if iteration < opt.densify_until_iter:
-                # 累积 velocity loss 统计 (用于 densification 掩码)
-                if dataset.use_velocity and per_gaussian_velocity_loss is not None:
-                    gaussians.add_velocity_loss_stats(per_gaussian_velocity_loss.detach(), visibility_filter)
+                # 累积 flow loss 统计 (用于 densification 掩码)
+                if dataset.use_flow_loss and per_gaussian_flow_error is not None:
+                    gaussians.add_flow_loss_stats(per_gaussian_flow_error, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
@@ -495,43 +347,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                     importance_score, pruning_score = compute_gaussian_score_fastgs(camlist, gaussians, pipe, background, opt, d_xyz, d_rotation, d_scaling, dataset.is_6dof, DENSIFY=True)
                     scene.release_cameras(camlist)
                     
-                    # 生成 velocity_loss 掩码并传入 densification
-                    velocity_mask = None
-                    # 生成物理掩码（散度/旋度）并作为过滤条件
-                    physics_clone_mask = None
-                    physics_split_mask = None
-                    velocity_net_for_clone = None
-                    time_input = None
-                    if dataset.use_velocity and iteration >= opt.warm_up:
-                        velocity_mask = gaussians.get_velocity_loss_mask(
-                            opt.velocity_loss_thresh, 
-                            adaptive_percentile=opt.velocity_loss_percentile
+                    # 生成 flow_loss 掩码并传入 densification
+                    flow_mask = None
+                    if dataset.use_flow_loss and iteration >= opt.warm_up:
+                        flow_mask = gaussians.get_flow_loss_mask(
+                            opt.flow_loss_thresh, 
+                            adaptive_percentile=opt.flow_loss_percentile
                         )
-
-                        if dataset.use_physics_densify:
-                            N = gaussians.get_xyz.shape[0]
-                            time_input = fid.unsqueeze(0).expand(N, -1)
-                            physics_args = Namespace(
-                                use_div_mask=dataset.use_div_mask,
-                                use_curl_mask=dataset.use_curl_mask,
-                                div_percentile=opt.div_percentile,
-                                curl_percentile=opt.curl_percentile,
-                                div_thresh=opt.div_thresh,
-                                curl_thresh=opt.curl_thresh,
-                                dense=opt.dense,
-                            )
-                            physics_clone_mask, physics_split_mask = gaussians.get_physics_masks(
-                                velocity_net=velocity,
-                                times=time_input,
-                                args=physics_args,
-                                extent=scene.cameras_extent
-                            )
-                            velocity_net_for_clone = velocity
-                    
-                    # 生成静态高斯掩码（用于限制静态区域的 densification）
-                    static_mask = None
-                    if dataset.use_velocity and dataset.use_dynamic_mask and opt.limit_static_densify:
-                        static_mask = gaussians.get_static_mask(percentile=opt.static_densify_percentile)
                     
                     gaussians.densify_and_prune_fastgs(max_screen_size = size_threshold, 
                                                 min_opacity = 0.005, 
@@ -540,12 +362,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                                                 args = opt,
                                                 importance_score = importance_score,
                                                 pruning_score = pruning_score,
-                                                velocity_mask = velocity_mask,
-                                                physics_clone_mask = physics_clone_mask,
-                                                physics_split_mask = physics_split_mask,
-                                                velocity_net = velocity_net_for_clone,
-                                                times = time_input,
-                                                static_mask = static_mask)
+                                                flow_mask = flow_mask)
 
                 if iteration % opt.opacity_reset_interval == 0 or (
                         dataset.white_background and iteration == opt.densify_from_iter):
@@ -568,12 +385,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             if iteration < opt.iterations:
                 deform.optimizer.step()
                 deform.optimizer.zero_grad(set_to_none=True)
-                if dataset.use_velocity:
-                    # 梯度裁剪防止训练崩溃
-                    if opt.velocity_grad_clip > 0:
-                        torch.nn.utils.clip_grad_norm_(velocity.parameters(), opt.velocity_grad_clip)
-                    velocity.optimizer.step()
-                    velocity.optimizer.zero_grad(set_to_none=True)
                 gaussians.optimizer_step(iteration)
 
             if _enable_phase_timer:

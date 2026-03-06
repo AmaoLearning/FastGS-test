@@ -20,8 +20,6 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
-from utils.motion_utils import compute_velocity_jacobian_quantities
-
 
 class GaussianModel:
     def __init__(self, sh_degree: int):
@@ -44,9 +42,8 @@ class GaussianModel:
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.xyz_gradient_accum_abs = torch.empty(0)
-        self.velocity_loss_accum = torch.empty(0)
-        self.velocity_denom = torch.empty(0)
-        self.dynamic_metrics = torch.empty(0)  # 动态指标：历史速度绝对值的 Leaky Max
+        self.flow_loss_accum = torch.empty(0)
+        self.flow_denom = torch.empty(0)
 
         self.optimizer = None
         self.shoptimizer = None
@@ -128,9 +125,8 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.xyz_gradient_accum_abs = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.velocity_loss_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.velocity_denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.dynamic_metrics = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")  # 3维速度的 Leaky Max
+        self.flow_loss_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.flow_denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
         self.spatial_lr_scale = 5
 
@@ -312,9 +308,8 @@ class GaussianModel:
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
         self.xyz_gradient_accum_abs = self.xyz_gradient_accum_abs[valid_points_mask]
-        self.velocity_loss_accum = self.velocity_loss_accum[valid_points_mask]
-        self.velocity_denom = self.velocity_denom[valid_points_mask]
-        self.dynamic_metrics = self.dynamic_metrics[valid_points_mask]
+        self.flow_loss_accum = self.flow_loss_accum[valid_points_mask]
+        self.flow_denom = self.flow_denom[valid_points_mask]
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
@@ -344,7 +339,7 @@ class GaussianModel:
         return optimizable_tensors
 
     def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
-                              new_rotation, new_dynamic_metrics=None):
+                              new_rotation):
         d = {"xyz": new_xyz,
              "f_dc": new_features_dc,
              "f_rest": new_features_rest,
@@ -360,25 +355,14 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
-        # Extend dynamic_metrics for new gaussians
-        if new_dynamic_metrics is not None:
-            self.dynamic_metrics = torch.cat([self.dynamic_metrics, new_dynamic_metrics], dim=0)
-        else:
-            # Default: new gaussians start with zero dynamic_metrics
-            num_new = new_xyz.shape[0]
-            self.dynamic_metrics = torch.cat([
-                self.dynamic_metrics, 
-                torch.zeros((num_new, 3), device="cuda")
-            ], dim=0)
-
         self.zero_accums()
 
     def zero_accums(self):
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.xyz_gradient_accum_abs = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")  # abs
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.velocity_loss_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.velocity_denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.flow_loss_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.flow_denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
@@ -401,10 +385,8 @@ class GaussianModel:
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N, 1, 1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N, 1, 1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N, 1)
-        # Inherit parent's dynamic_metrics
-        new_dynamic_metrics = self.dynamic_metrics[selected_pts_mask].repeat(N, 1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_dynamic_metrics)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
 
         prune_filter = torch.cat(
             (selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
@@ -423,11 +405,9 @@ class GaussianModel:
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
-        # Inherit parent's dynamic_metrics
-        new_dynamic_metrics = self.dynamic_metrics[selected_pts_mask]
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
-                                   new_rotation, new_dynamic_metrics)
+                                   new_rotation)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom
@@ -462,65 +442,26 @@ class GaussianModel:
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
-        # Inherit parent's dynamic_metrics
-        new_dynamic_metrics = self.dynamic_metrics[selected_pts_mask].repeat(N, 1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_dynamic_metrics)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
 
-    def densify_and_clone_fastgs(self, metric_mask, filter, velocity_net=None, times=None, eta=0.2):
-        """
-        Fast Gaussian Splatting densification with physics-driven cloning.
-        
-        Args:
-            metric_mask: Multi-view consistency mask
-            filter: Additional filter condition (e.g., all_clones)
-            velocity_net: Velocity field network (optional, for physics-driven cloning)
-            times: Time tensor [N, 1] (optional, required when velocity_net is provided)
-            eta: Offset coefficient for physics-driven cloning (default: 0.2)
-        """
+    def densify_and_clone_fastgs(self, metric_mask, filter):
+        """Fast Gaussian Splatting clone: duplicate small gaussians that have large gradients."""
         selected_pts_mask = torch.logical_and(metric_mask, filter)
-        
-        # 如果提供了速度网络，使用物理驱动的克隆方式
-        if velocity_net is not None and times is not None:
-            if selected_pts_mask.sum() == 0:
-                return
-            
-            # 获取选中高斯的属性
-            old_xyz = self._xyz[selected_pts_mask]
-            
-            # 计算速度
-            with torch.no_grad():
-                velocity = velocity_net(old_xyz.detach(), times[selected_pts_mask].detach())
-            
-            mean_scale = self.get_scaling[selected_pts_mask].mean(dim=1, keepdim=True)  # [M, 1]
-            
-            # 计算速度单位向量，避免除零
-            v_norm = torch.norm(velocity, dim=-1, keepdim=True) + 1e-8  # [M, 1]
-            v_direction = velocity / v_norm  # [M, 3]
-            
-            # 新位置：沿速度反方向偏移，填补物体移动后留下的空缺
-            new_xyz = old_xyz - eta * mean_scale * v_direction
-            
-            print(f"  [Physics-Driven Clone] Cloning {selected_pts_mask.sum().item()} gaussians with upstream offset (eta={eta})")
-        else:
-            # 使用原始克隆方式（直接复制位置）
-            new_xyz = self._xyz[selected_pts_mask]
-        
-        # 复制其他属性
+
+        new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
         new_features_rest = self._features_rest[selected_pts_mask]
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
-        # Inherit parent's dynamic_metrics
-        new_dynamic_metrics = self.dynamic_metrics[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_dynamic_metrics)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
 
-    def densify_and_prune_fastgs(self, max_screen_size, min_opacity, extent, radii, args, importance_score = None, pruning_score = None, velocity_mask = None, physics_clone_mask = None, physics_split_mask = None, velocity_net = None, times = None, static_mask = None):
+    def densify_and_prune_fastgs(self, max_screen_size, min_opacity, extent, radii, args, importance_score = None, pruning_score = None, flow_mask = None):
         
         ''' 
             Densification and Pruning based on FastGS criteria:
@@ -528,8 +469,7 @@ class GaussianModel:
             2.  Then, based on their average metric score (computed over multiple sampled views), they are either densified (cloned) or split.
                 This is our main contribution compared to the vanilla 3DGS.
             3.  Finally, gaussians with low opacity or very large size are pruned.
-            4.  (New) If velocity_mask is provided, only gaussians with accurate velocity prediction are densified.
-            5.  (New) If static_mask is provided, static gaussians are excluded from densification to reduce redundancy.
+            4.  (New) If flow_mask is provided, only gaussians with accurate flow prediction are densified.
         '''
         grad_vars = self.xyz_gradient_accum / self.denom
         grad_vars[grad_vars.isnan()] = 0.0
@@ -549,31 +489,12 @@ class GaussianModel:
         # Collect all mask counts on GPU first, then do a single GPU→CPU sync
         _stats = [all_clones.sum(), all_splits.sum()]  # accumulate GPU tensors
         
-        # 如果提供了 velocity_mask，则与原有掩码做与运算
-        # velocity_mask 为 True 表示该高斯的运动预测准确，可以参与 densification
-        if velocity_mask is not None:
-            all_clones = torch.logical_and(all_clones, velocity_mask)
-            all_splits = torch.logical_and(all_splits, velocity_mask)
-            _stats.extend([velocity_mask.sum(), all_clones.sum(), all_splits.sum()])
-
-        # 如果提供了 physics masks，则与原有掩码做与运算
-        if physics_clone_mask is not None:
-            all_clones = torch.logical_and(all_clones, physics_clone_mask)
-            _stats.extend([physics_clone_mask.sum(), all_clones.sum()])
-
-        if physics_split_mask is not None:
-            all_splits = torch.logical_and(all_splits, physics_split_mask)
-            _stats.extend([physics_split_mask.sum(), all_splits.sum()])
-
-        # 如果提供了 static_mask，则排除静态高斯的 densification
-        # static_mask 为 True 表示该高斯是静态的，应该被排除在 densification 之外
-        # 注意：我们不删除静态高斯，只是不再增加它们
-        if static_mask is not None:
-            # ~static_mask: True 表示非静态（可以 densify）
-            non_static_mask = ~static_mask
-            all_clones = torch.logical_and(all_clones, non_static_mask)
-            all_splits = torch.logical_and(all_splits, non_static_mask)
-            _stats.extend([static_mask.sum(), all_clones.sum(), all_splits.sum()])
+        # 如果提供了 flow_mask，则与原有掩码做与运算
+        # flow_mask 为 True 表示该高斯的光流拟合质量好，可以参与 densification
+        if flow_mask is not None:
+            all_clones = torch.logical_and(all_clones, flow_mask)
+            all_splits = torch.logical_and(all_splits, flow_mask)
+            _stats.extend([flow_mask.sum(), all_clones.sum(), all_splits.sum()])
 
         # This is our multi-view consisent metric for densification
         # We use this metric to further filter the candidates for densification, which is similar to taming 3dgs.
@@ -588,21 +509,12 @@ class GaussianModel:
         _i = 0
         print(f"\nOriginal all_clones: {int(_vals[_i])}, all_splits: {int(_vals[_i+1])}")
         _i += 2
-        if velocity_mask is not None:
-            print(f"With velocity_mask: {int(_vals[_i])}, all_clones: {int(_vals[_i+1])}, all_splits: {int(_vals[_i+2])}")
-            _i += 3
-        if physics_clone_mask is not None:
-            print(f"With physics_clone_mask: {int(_vals[_i])}, all_clones: {int(_vals[_i+1])}")
-            _i += 2
-        if physics_split_mask is not None:
-            print(f"With physics_split_mask: {int(_vals[_i])}, all_splits: {int(_vals[_i+1])}")
-            _i += 2
-        if static_mask is not None:
-            print(f"Static gaussians excluded: {int(_vals[_i])}, all_clones: {int(_vals[_i+1])}, all_splits: {int(_vals[_i+2])}")
+        if flow_mask is not None:
+            print(f"With flow_mask: {int(_vals[_i])}, all_clones: {int(_vals[_i+1])}, all_splits: {int(_vals[_i+2])}")
             _i += 3
         print(f"With metric_mask: {int(_vals[_i])}, all_clones: {int(_vals[_i+1])}, all_splits: {int(_vals[_i+2])}\n")
 
-        self.densify_and_clone_fastgs(metric_mask, all_clones, velocity_net=velocity_net, times=times, eta=args.clone_eta if hasattr(args, 'clone_eta') else 0.2)
+        self.densify_and_clone_fastgs(metric_mask, all_clones)
         self.densify_and_split_fastgs(metric_mask, all_splits)
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
@@ -646,66 +558,40 @@ class GaussianModel:
         final_prune = torch.logical_or(prune_mask, scores_mask)
         self.prune_points(final_prune)
 
-    def get_static_mask(self, percentile=25):
-        """生成静态高斯掩码：用于限制静态区域的densification
-        
-        静态高斯是背景的重要组成部分（墙壁、桌面等），不应被删除。
-        此方法生成一个掩码，用于在densification时限制静态区域的clone/split，
-        从而减少静态区域的高斯冗余，同时保留已有的静态高斯。
-        
-        Args:
-            percentile: 动态指标百分位数阈值，低于此值的高斯被视为"静态"
-        
-        Returns:
-            static_mask: bool tensor [N], True 表示该高斯是静态的
-        """
-        # 计算动态指标的模长
-        dynamic_norm = torch.norm(self.dynamic_metrics, dim=-1)  # [N]
-        
-        # 计算阈值
-        threshold = torch.quantile(dynamic_norm, percentile / 100.0).item()
-        
-        # 静态掩码：动态指标低于阈值
-        # 额外保护：动态指标为0的高斯可能是新生成的，不视为静态
-        is_initialized = dynamic_norm > 1e-7
-        is_static = torch.logical_and(dynamic_norm < threshold, is_initialized)
-        
-        return is_static
-
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter, :2], dim=-1,
                                                              keepdim=True)
         self.xyz_gradient_accum_abs[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter, 2:], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
 
-    def add_velocity_loss_stats(self, per_gaussian_velocity_loss, update_filter):
-        """累积每个高斯的 velocity loss
+    def add_flow_loss_stats(self, per_gaussian_flow_error, update_filter):
+        """累积每个高斯的光流拟合误差（用于 densification 掩码）
         Args:
-            per_gaussian_velocity_loss: shape [N, 1], 每个高斯点的 velocity loss
+            per_gaussian_flow_error: shape [N, 1], 每个高斯点的光流误差信号
             update_filter: 可见性掩码
         """
-        self.velocity_loss_accum[update_filter] += per_gaussian_velocity_loss[update_filter]
-        self.velocity_denom[update_filter] += 1
+        self.flow_loss_accum[update_filter] += per_gaussian_flow_error[update_filter]
+        self.flow_denom[update_filter] += 1
 
-    def get_velocity_loss_mask(self, threshold, adaptive_percentile=-1):
-        """基于累积的平均 velocity loss 生成掩码
+    def get_flow_loss_mask(self, threshold, adaptive_percentile=-1):
+        """基于累积的平均光流误差生成掩码
         Args:
-            threshold: velocity loss 阈值，低于此值的高斯将被标记
+            threshold: 光流误差阈值，低于此值的高斯将被标记
             adaptive_percentile: 自适应阈值百分比，-1表示使用固定阈值，0-100表示使用自适应阈值
                                  例如: 70 表示取70分位数作为阈值，使得约70%的高斯通过筛选
         Returns:
-            mask: bool tensor, True 表示该高斯的平均 velocity loss 低于阈值（运动预测较准）
+            mask: bool tensor, True 表示该高斯的平均光流误差低于阈值（光流拟合较好）
         """
-        avg_velocity_loss = self.velocity_loss_accum / (self.velocity_denom + 1e-7)
-        avg_velocity_loss[avg_velocity_loss.isnan()] = 0.0
-        avg_velocity_loss = avg_velocity_loss.squeeze()
+        avg_flow_loss = self.flow_loss_accum / (self.flow_denom + 1e-7)
+        avg_flow_loss[avg_flow_loss.isnan()] = 0.0
+        avg_flow_loss = avg_flow_loss.squeeze()
         
         # 获取有效高斯的掩码
-        valid_mask = self.velocity_denom.squeeze() > 0
+        valid_mask = self.flow_denom.squeeze() > 0
         
         # 如果使用自适应阈值
         if adaptive_percentile >= 0 and valid_mask.sum() > 0:
-            valid_losses = avg_velocity_loss[valid_mask]
+            valid_losses = avg_flow_loss[valid_mask]
             # 计算自适应阈值：取指定百分位数
             adaptive_threshold = torch.quantile(valid_losses, adaptive_percentile / 100.0).item()
             threshold = adaptive_threshold
@@ -713,7 +599,7 @@ class GaussianModel:
         
         # 打印分布统计信息，方便设置阈值 — single GPU→CPU sync for all stats
         if valid_mask.sum() > 0:
-            valid_losses = avg_velocity_loss[valid_mask]
+            valid_losses = avg_flow_loss[valid_mask]
             percentiles = [25, 50, 75, 90, 95, 99]
             pct_tensors = [torch.quantile(valid_losses, p / 100.0) for p in percentiles]
             all_stats = torch.stack([
@@ -723,8 +609,8 @@ class GaussianModel:
                 (valid_losses < threshold).sum().float(),
             ] + pct_tensors).cpu().tolist()
             _n_valid = int(all_stats[0])
-            print(f"\n[Velocity Loss Distribution]")
-            print(f"  Total Gaussians: {avg_velocity_loss.shape[0]}, Valid (with stats): {_n_valid}")
+            print(f"\n[Flow Loss Distribution]")
+            print(f"  Total Gaussians: {avg_flow_loss.shape[0]}, Valid (with stats): {_n_valid}")
             print(f"  Min: {all_stats[1]:.6f}, Max: {all_stats[2]:.6f}")
             print(f"  Mean: {all_stats[3]:.6f}, Std: {all_stats[4]:.6f}")
             for i, p in enumerate(percentiles):
@@ -732,358 +618,5 @@ class GaussianModel:
             print(f"  Current threshold: {threshold}")
             print(f"  Gaussians below threshold: {int(all_stats[5])} ({100*all_stats[5]/_n_valid:.2f}%)\n")
         
-        # 仅允许有统计样本且 velocity loss 较低的高斯参与 densification
-        return torch.logical_and(valid_mask, avg_velocity_loss <= threshold)
-
-    def update_dynamic_metrics(self, current_v, decay=0.99, min_value=1e-8):
-        """更新动态指标：使用 Leaky Max (Decaying Peak) 方法
-        Args:
-            current_v: 当前速度 [N, 3]
-            decay: 衰减系数，控制历史峰值的衰减速度
-            min_value: 最小值保护，防止指标完全退化为0
-        """
-        # 数值保护：跳过NaN/Inf
-        if torch.isnan(current_v).any() or torch.isinf(current_v).any():
-            return
-        
-        # dynamic_metrics = max(|current_v|, dynamic_metrics * decay)
-        current_v_abs = current_v.abs()
-        
-        # 使用 exponential moving average 与 leaky max 结合，更稳定
-        # 新策略：同时考虑当前值和历史衰减值的平滑更新
-        decayed_metrics = self.dynamic_metrics * decay
-        self.dynamic_metrics = torch.max(current_v_abs, decayed_metrics)
-        
-        # 添加最小值保护，防止完全退化
-        self.dynamic_metrics = torch.clamp(self.dynamic_metrics, min=min_value)
-    
-    def get_dynamic_mask(self, dynamic_thresh, grad_abs_thresh, iteration=None, adaptive_percentile=-1):
-        """生成动态掩码：只有动态且梯度足够大的高斯才需要计算 deform
-        Args:
-            dynamic_thresh: 动态阈值，速度大于此值的高斯被认为是动态的
-            grad_abs_thresh: 梯度绝对值阈值
-            iteration: 当前迭代次数，用于控制打印频率
-            adaptive_percentile: 自适应阈值百分比，-1表示使用固定阈值，0-100表示使用自适应阈值
-        Returns:
-            mask: bool tensor, True 表示该高斯需要计算 deform
-        """
-        # 计算动态指标的模长
-        dynamic_norm = torch.norm(self.dynamic_metrics, dim=-1)  # [N]
-        N = dynamic_norm.shape[0]
-        
-        # 如果使用自适应阈值
-        if adaptive_percentile >= 0:
-            # 计算自适应阈值：取指定百分位数
-            adaptive_threshold = torch.quantile(dynamic_norm, adaptive_percentile / 100.0).item()
-            dynamic_thresh = adaptive_threshold
-            if iteration is not None and iteration % 1000 == 0:
-                print(f"  [Adaptive Dynamic Threshold] Using {adaptive_percentile}th percentile: {dynamic_thresh:.6f}")
-        
-        # 动态掩码：速度大于阈值
-        is_dynamic = dynamic_norm >= dynamic_thresh
-        
-        # 梯度掩码：梯度绝对值大于阈值
-        grads_abs = self.xyz_gradient_accum_abs / self.denom
-        grads_abs[grads_abs.isnan()] = 0.0
-        has_grad = grads_abs.squeeze() > grad_abs_thresh
-        
-        # 最终掩码：两者都满足
-        dynamic_mask = torch.logical_or(is_dynamic, has_grad)
-        
-        # 打印分布统计信息，方便设置阈值 — single GPU→CPU sync
-        if iteration is not None and iteration % 1001 == 0:
-            percentiles = [25, 50, 75, 90, 95, 99]
-            pct_vals = [torch.quantile(dynamic_norm, p / 100.0) for p in percentiles]
-            all_stats = torch.stack([
-                dynamic_norm.min(), dynamic_norm.max(),
-                dynamic_norm.mean(), dynamic_norm.std(),
-                is_dynamic.sum().float(), has_grad.sum().float(),
-                dynamic_mask.sum().float(),
-            ] + pct_vals).cpu().tolist()
-            print(f"\n[Dynamic Metrics Distribution][Iter {iteration}]")
-            print(f"  Total Gaussians: {N}")
-            print(f"  Min: {all_stats[0]:.6f}, Max: {all_stats[1]:.6f}")
-            print(f"  Mean: {all_stats[2]:.6f}, Std: {all_stats[3]:.6f}")
-            for i, p in enumerate(percentiles):
-                print(f"  {p}th percentile: {all_stats[7 + i]:.6f}")
-            print(f"  Current dynamic_thresh: {dynamic_thresh}")
-            above_thresh = int(all_stats[4])
-            print(f"  Gaussians above dynamic_thresh: {above_thresh} ({100*above_thresh/N:.2f}%)")
-            print(f"\n[Mask Statistics][Iter {iteration}]")
-            print(f"  is_dynamic (dynamic_norm > {dynamic_thresh:.6f}): {above_thresh} ({100*above_thresh/N:.2f}%)")
-            print(f"  has_grad (grad_abs > {grad_abs_thresh}): {int(all_stats[5])} ({100*all_stats[5]/N:.2f}%)")
-            print(f"  dynamic_mask (is_dynamic OR has_grad): {int(all_stats[6])} ({100*all_stats[6]/N:.2f}%)\n")
-        
-        return dynamic_mask
-
-
-    # ============================================================================
-    # Step 2 & 3: 物理驱动的致密化 (Physics-Driven Densification)
-    # ============================================================================
-    
-    def compute_physics_densify_masks(
-        self, 
-        divergence: torch.Tensor, 
-        curl_magnitude: torch.Tensor,
-        min_opacity: float = 0.005,
-        div_percentile: float = 95,
-        curl_percentile: float = 95,
-        div_threshold: float = -1,
-        curl_threshold: float = -1,
-        split_scale_limit_factor: float = 0.01,
-        extent: float = 1.0
-    ):
-        """
-        基于速度场物理量（散度和旋度）计算致密化掩码。
-        
-        Args:
-            divergence: 散度 [N, 1]
-            curl_magnitude: 旋度模长 [N, 1]
-            min_opacity: 最小不透明度阈值
-            div_percentile: 散度阈值百分位数 (0-100)，当 div_thresh < 0 时使用
-            curl_percentile: 旋度阈值百分位数 (0-100)，当 curl_thresh < 0 时使用
-            div_thresh: 散度硬阈值，>= 0 时使用硬阈值
-            curl_thresh: 旋度硬阈值，>= 0 时使用硬阈值
-            split_scale_limit_factor: Split 时的尺度限制因子
-            extent: 场景范围
-        
-        Returns:
-            clone_mask: 需要克隆的高斯掩码 (高散度 = 膨胀区域)
-            split_mask: 需要分裂的高斯掩码 (高旋度 = 湍流区域)
-        """
-        N = self.get_xyz.shape[0]
-        device = self.get_xyz.device
-        
-        div = divergence.squeeze()  # [N]
-        curl = curl_magnitude.squeeze()  # [N]
-        opacity = self.get_opacity.squeeze()  # [N]
-        max_scale = self.get_scaling.max(dim=1).values  # [N]
-        
-        # 打印分布统计信息，方便设置硬阈值 — single GPU→CPU sync
-        percentiles = [25, 50, 75, 90, 95, 99]
-        div_pcts = [torch.quantile(div, p / 100.0) for p in percentiles]
-        curl_pcts = [torch.quantile(curl, p / 100.0) for p in percentiles]
-        all_stats = torch.stack([
-            div.min(), div.max(), div.mean(), div.std(),
-            curl.min(), curl.max(), curl.mean(), curl.std(),
-        ] + div_pcts + curl_pcts).cpu().tolist()
-        
-        print(f"\n[Divergence Distribution]")
-        print(f"  Total Gaussians: {N}")
-        print(f"  Min: {all_stats[0]:.6f}, Max: {all_stats[1]:.6f}")
-        print(f"  Mean: {all_stats[2]:.6f}, Std: {all_stats[3]:.6f}")
-        for i, p in enumerate(percentiles):
-            print(f"  {p}th percentile: {all_stats[8 + i]:.6f}")
-        
-        print(f"\n[Curl Distribution]")
-        print(f"  Min: {all_stats[4]:.6f}, Max: {all_stats[5]:.6f}")
-        print(f"  Mean: {all_stats[6]:.6f}, Std: {all_stats[7]:.6f}")
-        for i, p in enumerate(percentiles):
-            print(f"  {p}th percentile: {all_stats[14 + i]:.6f}")
-        
-        # 计算阈值：优先使用百分位数
-        if div_percentile >= 0:
-            div_threshold = torch.quantile(div, div_percentile / 100.0).item()  # reuses cached kernel
-            print(f"\n  Using percentile div_threshold: {div_threshold:.6f} (p{div_percentile})")
-
-        if curl_percentile >= 0:
-            curl_threshold = torch.quantile(curl, curl_percentile / 100.0).item()
-            print(f"  Using percentile curl_threshold: {curl_threshold:.6f} (p{curl_percentile})")
-        
-        split_scale_limit = split_scale_limit_factor * extent
-        
-        # Clone Mask: 高散度（膨胀区域）+ 不透明度足够
-        high_div = div >= div_threshold
-        sufficient_opacity = opacity >= min_opacity
-        clone_mask = torch.logical_and(high_div, sufficient_opacity)
-        
-        # Split Mask: 高旋度（湍流区域）+ 高斯足够大
-        high_curl = curl >= curl_threshold
-        large_enough = max_scale >= split_scale_limit
-        split_mask = torch.logical_and(high_curl, large_enough)
-        
-        # 打印掩码统计信息 — single GPU→CPU sync
-        mask_stats = torch.stack([
-            high_div.sum().float(), high_curl.sum().float(),
-            clone_mask.sum().float(), split_mask.sum().float(),
-        ]).cpu().tolist()
-        print(f"\n[Physics Densification Masks]")
-        print(f"  high_div (div > {div_threshold:.6f}): {int(mask_stats[0])} ({100*mask_stats[0]/N:.2f}%)")
-        print(f"  high_curl (curl > {curl_threshold:.6f}): {int(mask_stats[1])} ({100*mask_stats[1]/N:.2f}%)")
-        print(f"  Clone candidates (high_div AND opacity>{min_opacity}): {int(mask_stats[2])}")
-        print(f"  Split candidates (high_curl AND scale>{split_scale_limit:.6f}): {int(mask_stats[3])}")
-        
-        return clone_mask, split_mask
-    
-    def physics_driven_clone(
-        self, 
-        clone_mask: torch.Tensor, 
-        velocity: torch.Tensor, 
-        eta: float = 0.2
-    ):
-        """
-        物理驱动的克隆：沿速度反方向偏移，填补物体移动后留下的空缺。
-        
-        针对 Hash Encoding 的特殊处理：
-        - 问题：位置重合会导致速度重合，克隆失效
-        - 解决：向"上游"（速度反方向）偏移，填补物理空缺
-        
-        Args:
-            clone_mask: 需要克隆的高斯掩码 [N]
-            velocity: 速度向量 [N, 3]
-            eta: 偏移系数，控制偏移距离
-        """
-        if clone_mask.sum() == 0:
-            return
-        
-        selected = clone_mask
-        
-        # 获取选中高斯的属性
-        old_xyz = self._xyz[selected]
-        old_velocity = velocity[selected]
-        mean_scale = self.get_scaling[selected].mean(dim=1, keepdim=True)  # [M, 1]
-        
-        # 计算速度单位向量，避免除零
-        v_norm = torch.norm(old_velocity, dim=-1, keepdim=True) + 1e-8  # [M, 1]
-        v_direction = old_velocity / v_norm  # [M, 3]
-        
-        # 新位置：沿速度反方向偏移
-        # new_xyz = old_xyz - eta * mean_scale * v_direction
-        new_xyz = old_xyz - eta * mean_scale * v_direction
-        
-        # 复制其他属性
-        new_features_dc = self._features_dc[selected]
-        new_features_rest = self._features_rest[selected]
-        new_opacities = self._opacity[selected]
-        new_scaling = self._scaling[selected]
-        new_rotation = self._rotation[selected]
-        new_dynamic_metrics = self.dynamic_metrics[selected]
-        
-        # 添加新高斯
-        self.densification_postfix(
-            new_xyz, new_features_dc, new_features_rest, 
-            new_opacities, new_scaling, new_rotation, new_dynamic_metrics
-        )
-        
-        print(f"  [Physics Clone] Added {selected.sum().item()} gaussians with upstream offset")
-    
-    def physics_driven_split(
-        self, 
-        split_mask: torch.Tensor, 
-        scale_factor: float = 2.0,
-        N_split: int = 2
-    ):
-        """
-        物理驱动的分裂：在高旋度区域进行激进的细化。
-        
-        Args:
-            split_mask: 需要分裂的高斯掩码 [N]
-            scale_factor: 缩放因子，新高斯的尺度 = 原尺度 / scale_factor
-            N_split: 每个高斯分裂成的数量
-        """
-        if split_mask.sum() == 0:
-            return
-        
-        n_init_points = self.get_xyz.shape[0]
-        selected_pts_mask = torch.zeros((n_init_points), dtype=bool, device="cuda")
-        selected_pts_mask[:split_mask.shape[0]] = split_mask
-        
-        # 在原高斯内部采样
-        stds = self.get_scaling[selected_pts_mask].repeat(N_split, 1)
-        means = torch.zeros((stds.size(0), 3), device="cuda")
-        samples = torch.normal(mean=means, std=stds)
-        rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N_split, 1, 1)
-        
-        new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + \
-                  self.get_xyz[selected_pts_mask].repeat(N_split, 1)
-        
-        # 更激进的缩放：使用更大的 scale_factor
-        new_scaling = self.scaling_inverse_activation(
-            self.get_scaling[selected_pts_mask].repeat(N_split, 1) / scale_factor
-        )
-        
-        new_rotation = self._rotation[selected_pts_mask].repeat(N_split, 1)
-        new_features_dc = self._features_dc[selected_pts_mask].repeat(N_split, 1, 1)
-        new_features_rest = self._features_rest[selected_pts_mask].repeat(N_split, 1, 1)
-        new_opacity = self._opacity[selected_pts_mask].repeat(N_split, 1)
-        new_dynamic_metrics = self.dynamic_metrics[selected_pts_mask].repeat(N_split, 1)
-        
-        # 添加新高斯
-        self.densification_postfix(
-            new_xyz, new_features_dc, new_features_rest, 
-            new_opacity, new_scaling, new_rotation, new_dynamic_metrics
-        )
-        
-        # 移除原高斯
-        prune_filter = torch.cat((
-            selected_pts_mask, 
-            torch.zeros(N_split * selected_pts_mask.sum(), device="cuda", dtype=bool)
-        ))
-        self.prune_points(prune_filter)
-        
-        print(f"  [Physics Split] Split {selected_pts_mask.sum().item()} gaussians "
-              f"into {N_split * selected_pts_mask.sum().item()} with scale_factor={scale_factor}")
-    
-    def get_physics_masks(
-        self,
-        velocity_net,
-        times: torch.Tensor,
-        args,
-        extent: float
-    ):
-        """
-        计算物理掩码（散度/旋度），作为 densification 过滤条件。
-        散度掩码和旋度掩码可通过 args.use_div_mask 和 args.use_curl_mask 独立控制。
-        
-        Args:
-            velocity_net: 速度场网络
-            times: 当前时间 [N, 1]
-            args: 优化参数，需包含:
-                - use_div_mask: 是否使用散度掩码（控制 Clone）
-                - use_curl_mask: 是否使用旋度掩码（控制 Split）
-                - div_percentile, curl_percentile, div_thresh, curl_thresh, dense 等
-            extent: 场景范围
-        Returns:
-            physics_clone_mask: bool tensor [N]，如果 use_div_mask=False 则返回 None
-            physics_split_mask: bool tensor [N]，如果 use_curl_mask=False 则返回 None
-        """
-        from utils.motion_utils import compute_velocity_jacobian_quantities
-
-        # 检查是否需要计算任一掩码
-        use_div_mask = getattr(args, 'use_div_mask', True)
-        use_curl_mask = getattr(args, 'use_curl_mask', True)
-        
-        if not use_div_mask and not use_curl_mask:
-            print("\n[Physics Densification] Both div_mask and curl_mask disabled, skipping computation.")
-            return None, None
-
-        N = self.get_xyz.shape[0]
-        print(f"\n[Physics Densification] Computing divergence and curl for {N} gaussians...")
-        print(f"  use_div_mask={use_div_mask}, use_curl_mask={use_curl_mask}")
-        
-        divergence, curl_magnitude, _ = compute_velocity_jacobian_quantities(
-            velocity_net,
-            self.get_xyz.detach(),
-            times.detach()
-        )
-
-        physics_clone_mask, physics_split_mask = self.compute_physics_densify_masks(
-            divergence, curl_magnitude,
-            min_opacity=0.005,
-            div_percentile=args.div_percentile,
-            curl_percentile=args.curl_percentile,
-            div_threshold=args.div_thresh,
-            curl_threshold=args.curl_thresh,
-            split_scale_limit_factor=args.dense,
-            extent=extent
-        )
-
-        # 根据参数决定是否返回对应掩码
-        if not use_div_mask:
-            physics_clone_mask = None
-            print("  [Info] Divergence mask disabled, clone will not be filtered by physics.")
-        if not use_curl_mask:
-            physics_split_mask = None
-            print("  [Info] Curl mask disabled, split will not be filtered by physics.")
-
-        return physics_clone_mask, physics_split_mask
+        # 仅允许有统计样本且光流误差较低的高斯参与 densification
+        return torch.logical_and(valid_mask, avg_flow_loss <= threshold)
