@@ -64,9 +64,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
         scene.setup_lazy_dataloader()
 
     # ── Optical Flow Loss Setup (deform finite-diff → diff-flow-rasterization) ──
+    # flow infrastructure is needed when EITHER flow loss or flow mask is enabled
+    _need_flow = dataset.use_flow_loss or dataset.use_flow_mask
     flow_helper = None
     flow_loss_fn = None
-    if dataset.use_flow_loss:
+    if _need_flow:
         # 检查训练集是否有光流文件路径（延迟加载，此时不读取数组）
         any_has_flow = any(c.has_flow for c in scene.getTrainCameras())
         if any_has_flow:
@@ -83,8 +85,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             n_with_flow = sum(1 for c in scene.getTrainCameras() if c.has_flow)
             print(f"[INFO] Optical flow available for {n_with_flow}/{len(scene.getTrainCameras())} training cameras (lazy loading)")
         else:
-            print(f"[WARNING] use_flow_loss=True but no flow files found, disabling flow loss.")
+            print(f"[WARNING] use_flow_loss/use_flow_mask=True but no flow files found, disabling.")
             dataset.use_flow_loss = False
+            dataset.use_flow_mask = False
+            _need_flow = False
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -217,9 +221,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             tb_writer.add_scalar('train_stats/num_gaussians', gaussians._xyz.shape[0], iteration)
 
         # ── Optical Flow Loss (deform finite-diff → projected flow → GT comparison) ──
+        # Runs when EITHER flow loss or flow mask is enabled (mask needs per-gaussian error)
         flow_loss = None
         per_gaussian_flow_error = None
-        if (dataset.use_flow_loss
+        if (_need_flow
             and flow_helper is not None
             and iteration >= opt.flow_loss_from_iter
             and iteration % opt.flow_loss_interval == 0
@@ -266,7 +271,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 )
                 per_gaussian_flow_error = flow_grad.detach().norm(dim=-1, keepdim=True)
 
-            loss = loss + opt.lambda_flow * flow_loss
+            # Only add flow loss to training objective when use_flow_loss is enabled
+            if dataset.use_flow_loss:
+                loss = loss + opt.lambda_flow * flow_loss
 
             if iteration % 1000 == 0:
                 print(f"[Iter {iteration}] flow loss = {flow_loss.item():.6f}")
@@ -335,7 +342,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             # Densification
             if iteration < opt.densify_until_iter:
                 # 累积 flow loss 统计 (用于 densification 掩码)
-                if dataset.use_flow_loss and per_gaussian_flow_error is not None:
+                if dataset.use_flow_mask and per_gaussian_flow_error is not None:
                     gaussians.add_flow_loss_stats(per_gaussian_flow_error, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
@@ -349,7 +356,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                     
                     # 生成 flow_loss 掩码并传入 densification
                     flow_mask = None
-                    if dataset.use_flow_loss and iteration >= opt.warm_up:
+                    if dataset.use_flow_mask and iteration >= opt.flow_loss_from_iter:
                         flow_mask = gaussians.get_flow_loss_mask(
                             opt.flow_loss_thresh, 
                             adaptive_percentile=opt.flow_loss_percentile
