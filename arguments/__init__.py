@@ -125,6 +125,9 @@ class OptimizationParams(ParamGroup):
         self.flow_tv_weight = 0.01  # TV 正则权重
         self.detach_flow_geometry = False  # 是否阻断光流损失对几何（scaling/rotation/opacity）的梯度传播（velocity3D 始终不 detach）
 
+        # flow mask preprocessing（光流掩码预处理）
+        self.flow_magnitude_thresh = 0.2  # 光流模长阈值（像素），低于此值视为静态噪声，不参与损失/致密化
+
         # flow-based densification mask（用光流拟合质量控制致密化）
         self.flow_loss_thresh = 0.001  # 光流损失阈值（固定阈值模式）
         self.flow_loss_percentile = 70  # 自适应阈值百分比，-1 表示使用固定阈值，0-100 表示使用自适应阈值（如 70 表示约 70% 低损失高斯通过筛选）

@@ -91,10 +91,15 @@ class Camera(nn.Module):
         """该相机是否有光流文件可供加载。"""
         return self.flow_fwd_path is not None
 
-    def load_flow(self, device: str = 'cuda') -> None:
-        """按需从磁盘加载光流到指定设备，并计算一致性 mask。
-        光流以 float16 存储以节省显存，损失计算时 PyTorch 会自动提升精度。
-        若已加载则跳过（幂等操作）。"""
+    def load_flow(self, device: str = 'cuda', flow_magnitude_thresh: float = 0.0) -> None:
+        """按需从磁盘加载光流到指定设备，并计算组合掩码。
+
+        组合掩码 = 前后一致性掩码 & 模长阈值掩码：
+        - 一致性掩码：排除前后向矛盾的不可靠像素
+        - 模长阈值掩码：排除 |flow| < thresh 的静态噪声像素
+
+        光流以 float16 存储以节省显存。若已加载则跳过（幂等操作）。
+        """
         if self.flow_fwd is not None:
             return  # 已加载
         if self.flow_fwd_path is not None and os.path.exists(self.flow_fwd_path):
@@ -105,14 +110,30 @@ class Camera(nn.Module):
             arr = np.load(self.flow_bwd_path)
             self.flow_bwd = torch.from_numpy(arr).permute(2, 0, 1).to(
                 dtype=torch.float16, device=device)
-        # 计算 Forward-Backward Consistency Mask（二值化，用 bool 存储最省内存）
+
+        # ── 1. Forward-Backward Consistency Mask ──
+        consistency_mask = None
         if self.flow_fwd is not None and self.flow_bwd is not None:
-            # consistency check 内部用 float32 计算，结果转 bool
             mask_f32 = forward_backward_consistency_check(
                 self.flow_fwd.float(), self.flow_bwd.float(),
-                alpha1=0.01, alpha2=0.5,
+                # 使用函数默认严格参数 alpha1=0.005, alpha2=0.2
             )  # [1, H, W] float32, 0.0/1.0
-            self.flow_mask = mask_f32.bool()  # [1, H, W] bool, 每像素 1 byte
+            consistency_mask = mask_f32 > 0.5  # [1, H, W] bool
+
+        # ── 2. Magnitude Threshold Mask（抑制静态区域 RAFT 噪声）──
+        mag_mask = None
+        if self.flow_fwd is not None and flow_magnitude_thresh > 0:
+            flow_mag = self.flow_fwd.float().norm(dim=0, keepdim=True)  # [1, H, W]
+            mag_mask = flow_mag > flow_magnitude_thresh  # [1, H, W] bool
+
+        # ── 3. Combine masks ──
+        if consistency_mask is not None and mag_mask is not None:
+            self.flow_mask = consistency_mask & mag_mask
+        elif consistency_mask is not None:
+            self.flow_mask = consistency_mask
+        elif mag_mask is not None:
+            self.flow_mask = mag_mask
+        # else: self.flow_mask remains None → train.py will use all-ones fallback
 
     def unload_flow(self) -> None:
         """释放光流张量以回收 GPU/CPU 内存。"""
@@ -252,7 +273,8 @@ class LazyCamera(nn.Module):
     def has_flow(self) -> bool:
         return self.flow_fwd_path is not None
 
-    def load_flow(self, device: str = "cuda") -> None:
+    def load_flow(self, device: str = "cuda", flow_magnitude_thresh: float = 0.0) -> None:
+        """同 Camera.load_flow — 一致性 + 模长组合掩码。"""
         if self.flow_fwd is not None:
             return
         if self.flow_fwd_path is not None and os.path.exists(self.flow_fwd_path):
@@ -263,12 +285,25 @@ class LazyCamera(nn.Module):
             arr = np.load(self.flow_bwd_path)
             self.flow_bwd = torch.from_numpy(arr).permute(2, 0, 1).to(
                 dtype=torch.float16, device=device)
+
+        consistency_mask = None
         if self.flow_fwd is not None and self.flow_bwd is not None:
             mask_f32 = forward_backward_consistency_check(
                 self.flow_fwd.float(), self.flow_bwd.float(),
-                alpha1=0.01, alpha2=0.5,
             )
-            self.flow_mask = mask_f32.bool()
+            consistency_mask = mask_f32 > 0.5
+
+        mag_mask = None
+        if self.flow_fwd is not None and flow_magnitude_thresh > 0:
+            flow_mag = self.flow_fwd.float().norm(dim=0, keepdim=True)
+            mag_mask = flow_mag > flow_magnitude_thresh
+
+        if consistency_mask is not None and mag_mask is not None:
+            self.flow_mask = consistency_mask & mag_mask
+        elif consistency_mask is not None:
+            self.flow_mask = consistency_mask
+        elif mag_mask is not None:
+            self.flow_mask = mag_mask
 
     def unload_flow(self) -> None:
         self.flow_fwd = None

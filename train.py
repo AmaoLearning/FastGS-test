@@ -231,8 +231,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             and iteration >= opt.warm_up
             and torch.is_tensor(d_xyz)
             and viewpoint_cam.has_flow):
-            # On-demand flow loading
-            viewpoint_cam.load_flow(device='cuda')
+            # On-demand flow loading (consistency + magnitude mask)
+            viewpoint_cam.load_flow(
+                device='cuda',
+                flow_magnitude_thresh=opt.flow_magnitude_thresh,
+            )
             flow_gt = viewpoint_cam.flow_fwd  # [2, H, W]
 
             # Deform at t+dt → finite-difference velocity (NOT detached → gradient flows to deform)
