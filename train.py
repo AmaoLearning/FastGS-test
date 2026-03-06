@@ -238,26 +238,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             )
             flow_gt = viewpoint_cam.flow_fwd  # [2, H, W]
 
-            # Deform at t+dt → finite-difference velocity (NOT detached → gradient flows to deform)
+            # Deform at t+dt → finite-difference displacement (NOT detached → gradient flows to deform)
+            # 光流 GT = 帧间像素位移，对应 3D 量是位置形变差 d_xyz(t+dt) - d_xyz(t)，
+            # 经 Jacobian 投影即得投影光流，无需除以 time_interval（那会变成速度，量纲不匹配）
             N = gaussians.get_xyz.shape[0]
             time_input = fid.unsqueeze(0).expand(N, -1)
             d_xyz_next, _, _ = deform.step(
                 gaussians.get_xyz.detach(),
                 time_input + ast_noise + time_interval
             )
-            velocity3D = (d_xyz_next - d_xyz) / time_interval  # [N, 3], gradient → deform
+            displacement3D = d_xyz_next - d_xyz  # [N, 3], 3D 位移, gradient → deform
 
             # Render projected optical flow
             deformed_means3D = gaussians.get_xyz + d_xyz
             flow_pred, _, _ = flow_helper.render_flow(
                 gaussians=gaussians,
-                velocity3D=velocity3D,
+                velocity3D=displacement3D,
                 viewpoint_camera=viewpoint_cam,
                 override_means3D=deformed_means3D,
                 detach_geometry=opt.detach_flow_geometry,
             )
 
-            # Flow mask (forward-backward consistency)
+            # Flow mask (forward-backward consistency + magnitude threshold)
             flow_mask = viewpoint_cam.flow_mask  # [1, H, W] bool or None
             if flow_mask is None:
                 flow_mask = torch.ones(1, flow_gt.shape[1], flow_gt.shape[2],
@@ -265,12 +267,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             flow_loss = flow_loss_fn(flow_pred, flow_gt.float(), flow_mask.float())
 
             # Per-gaussian flow error for densification mask:
-            # Gradient magnitude of flow_loss w.r.t. velocity3D indicates how much
-            # each gaussian's velocity needs to change to reduce flow error.
+            # Gradient magnitude of flow_loss w.r.t. displacement3D indicates how much
+            # each gaussian's deformation needs to change to reduce flow error.
             # Low magnitude → good fit → eligible for densification.
-            if flow_loss.requires_grad and velocity3D.requires_grad:
+            if flow_loss.requires_grad and displacement3D.requires_grad:
                 [flow_grad] = torch.autograd.grad(
-                    flow_loss, velocity3D, retain_graph=True
+                    flow_loss, displacement3D, retain_graph=True
                 )
                 per_gaussian_flow_error = flow_grad.detach().norm(dim=-1, keepdim=True)
 
