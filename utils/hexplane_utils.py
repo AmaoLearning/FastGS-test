@@ -134,7 +134,7 @@ class HexPlaneField(nn.Module):
         spatial_resolutions: Sequence[int] = (64, 128, 256),
         time_resolutions: Sequence[int] = (64, 128, 256),
         feat_dim: int = 16,
-        fusion: str = "product",
+        fusion: str = "concat",
         init_scale: float = 0.1,
     ) -> None:
         super().__init__()
@@ -168,8 +168,8 @@ class HexPlaneField(nn.Module):
         if fusion == "concat":
             self._out_dim = self.num_levels * 6 * feat_dim
         else:  # product
-            # 3 complementary pairs → C each, concatenated across levels
-            self._out_dim = self.num_levels * feat_dim
+            # 3 complementary pairs → C each, *concatenated* (not summed) per level
+            self._out_dim = self.num_levels * 3 * feat_dim
 
     @property
     def out_dim(self) -> int:
@@ -214,12 +214,11 @@ class HexPlaneField(nn.Module):
                 # pair 0: XY(0) ⊙ ZT(5)
                 # pair 1: XZ(1) ⊙ YT(4)
                 # pair 2: XT(2) ⊙ YZ(3)
-                fused = (
-                    plane_feats[0] * plane_feats[5]   # XY ⊙ ZT
-                    + plane_feats[1] * plane_feats[4]  # XZ ⊙ YT
-                    + plane_feats[2] * plane_feats[3]  # XT ⊙ YZ
-                )  # (N, C)
-                level_feats.append(fused)
+                # Concatenate (NOT sum) the 3 products → (N, 3C)
+                p0 = plane_feats[0] * plane_feats[5]  # XY ⊙ ZT  (N, C)
+                p1 = plane_feats[1] * plane_feats[4]  # XZ ⊙ YT  (N, C)
+                p2 = plane_feats[2] * plane_feats[3]  # XT ⊙ YZ  (N, C)
+                level_feats.append(torch.cat([p0, p1, p2], dim=-1))  # (N, 3C)
 
         return torch.cat(level_feats, dim=-1)  # (N, out_dim)
 
@@ -328,7 +327,7 @@ class HexPlaneDeformNetwork(nn.Module):
         t_multires: int = 10,
         mlp_hidden_dim: int = 128,
         mlp_num_hidden: int = 2,
-        fusion: str = "product",
+        fusion: str = "concat",
         init_scale: float = 0.1,
         is_blender: bool = False,
         is_6dof: bool = False,

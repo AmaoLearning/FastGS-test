@@ -98,7 +98,7 @@ class DeformModel_4DGS:
         feat_dim: int = 16,
         mlp_hidden_dim: int = 128,
         mlp_num_hidden: int = 2,
-        fusion: str = "product",
+        fusion: str = "concat",
     ) -> None:
         self.deform = HexPlaneDeformNetwork(
             spatial_resolutions=spatial_resolutions,
@@ -129,20 +129,38 @@ class DeformModel_4DGS:
     # ── Training configuration ────────────────────────────────────────
 
     def train_setting(self, training_args) -> None:
-        # Separate parameter groups: planes get a higher initial lr than MLP
+        # Separate parameter groups: planes get a higher initial lr than MLP.
+        # Grid-based methods (K-Planes, 4DGS, Instant-NGP) require high lr
+        # for planes because each parameter only receives gradients from
+        # nearby sample points.
         plane_params = list(self.deform.hexplane.parameters())
         mlp_params = list(self.deform.decoder.parameters())
+        # Also include PE buffers that may become parameters in future
+        pe_params = (
+            list(self.deform.pe_xyz.parameters())
+            + list(self.deform.pe_t.parameters())
+        )
         l = [
             {"params": plane_params, "lr": 0.02, "name": "deform_planes"},
-            {"params": mlp_params, "lr": 0.001, "name": "deform_mlp"},
+            {"params": mlp_params + pe_params, "lr": 0.001, "name": "deform_mlp"},
         ]
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
 
-        self.deform_scheduler_args = get_expon_lr_func(
-            lr_init=training_args.position_lr_init * self.spatial_lr_scale,
-            lr_final=training_args.position_lr_final,
-            lr_delay_mult=training_args.position_lr_delay_mult,
-            max_steps=training_args.deform_lr_max_steps,
+        # Independent LR schedulers for planes and MLP.
+        # Planes: 0.02 → 0.002  (10× decay, stays in the high-lr regime)
+        # MLP:    0.001 → 0.00001  (100× decay, standard NeRF-MLP schedule)
+        _max_steps = training_args.deform_lr_max_steps
+        self._plane_lr_func = get_expon_lr_func(
+            lr_init=0.02,
+            lr_final=0.002,
+            lr_delay_mult=0.01,
+            max_steps=_max_steps,
+        )
+        self._mlp_lr_func = get_expon_lr_func(
+            lr_init=0.001,
+            lr_final=0.00001,
+            lr_delay_mult=0.01,
+            max_steps=_max_steps,
         )
 
     # ── Persistence ───────────────────────────────────────────────────
@@ -165,14 +183,14 @@ class DeformModel_4DGS:
     # ── LR scheduling ─────────────────────────────────────────────────
 
     def update_learning_rate(self, iteration: int) -> Optional[float]:
-        lr = self.deform_scheduler_args(iteration)
+        plane_lr = self._plane_lr_func(iteration)
+        mlp_lr = self._mlp_lr_func(iteration)
         for param_group in self.optimizer.param_groups:
             if param_group["name"] == "deform_planes":
-                param_group["lr"] = lr
+                param_group["lr"] = plane_lr
             elif param_group["name"] == "deform_mlp":
-                # MLP decoder uses a scaled-down learning rate
-                param_group["lr"] = lr * 0.1
-        return lr
+                param_group["lr"] = mlp_lr
+        return plane_lr
 
     # ── Regularisation losses ─────────────────────────────────────────
 
