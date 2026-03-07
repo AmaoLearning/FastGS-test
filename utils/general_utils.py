@@ -165,6 +165,8 @@ def build_scaling_rotation(s, r):
 
 
 def safe_state(silent, seed: int = 42, deterministic: bool = False):
+    import logging as _logging
+    _logger = _logging.getLogger("train.stdout")
     old_f = sys.stdout
 
     class F:
@@ -174,9 +176,14 @@ def safe_state(silent, seed: int = 42, deterministic: bool = False):
         def write(self, x):
             if not self.silent:
                 if x.endswith("\n"):
-                    old_f.write(x.replace("\n", " [{}]\n".format(str(datetime.now().strftime("%d/%m %H:%M:%S")))))
+                    stamped = x.replace("\n", " [{}]\n".format(str(datetime.now().strftime("%d/%m %H:%M:%S"))))
+                    old_f.write(stamped)
                 else:
                     old_f.write(x)
+            # Also forward to logging file handler (strip trailing newline)
+            stripped = x.rstrip("\n")
+            if stripped:
+                _logger.info(stripped)
 
         def flush(self):
             old_f.flush()

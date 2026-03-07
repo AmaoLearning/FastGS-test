@@ -11,6 +11,8 @@
 
 import os
 import time
+import logging
+import traceback
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim, kl_divergence, l2_loss
@@ -39,7 +41,12 @@ from utils.optic_flow_utils import load_precomputed_flow
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: bool = False,
-             profile: bool = False, profile_start: int = 500, profile_steps: int = 50):
+             profile: bool = False, profile_start: int = 500, profile_steps: int = 50,
+             logger: logging.Logger = None):
+    # Fall back to a no-op logger when none is provided
+    if logger is None:
+        logger = logging.getLogger("train")
+
     safe_state(quiet) # fix random seeds
     tb_writer = prepare_output_and_logger(dataset, opt, pipe)
     gaussians = GaussianModel(dataset.sh_degree)
@@ -48,6 +55,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
     _deform_type = getattr(dataset, "deform_type", "mlp")
     if _deform_type == "4dgs":
         deform = DeformModel_4DGS(is_blender=dataset.is_blender, is_6dof=dataset.is_6dof)
+        logger.info("Using 4DGS HexPlane deformation network")
         print("[INFO] Using 4DGS HexPlane deformation network")
     else:
         deform = DeformModel(dataset.is_blender, dataset.is_6dof)
@@ -59,8 +67,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
     # shapes during densification.  Guards against older PyTorch (<2.0).
     try:
         deform.deform = torch.compile(deform.deform, mode="default", dynamic=True)
+        logger.info("Deform network compiled with torch.compile (inductor)")
         print("[INFO] Deform network compiled with torch.compile (inductor)")
     except Exception as _e:
+        logger.info("torch.compile unavailable: %s, using eager mode", _e)
         print(f"[INFO] torch.compile unavailable: {_e}, using eager mode")
 
     scene = Scene(dataset, gaussians)
@@ -69,6 +79,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
     # ── Set AABB for HexPlane normalisation (4DGS only) ──
     if _deform_type == "4dgs" and hasattr(deform, "set_aabb"):
         deform.set_aabb(gaussians.get_xyz.detach(), padding=0.1)
+        logger.info("HexPlane AABB set from initial point cloud")
         print("[INFO] HexPlane AABB set from initial point cloud")
 
     # Initialize async image prefetch pipeline (lazy mode only)
@@ -95,9 +106,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 tv_weight=opt.flow_tv_weight,
             )
             n_with_flow = sum(1 for c in scene.getTrainCameras() if c.has_flow)
-            print(f"[INFO] Optical flow available for {n_with_flow}/{len(scene.getTrainCameras())} training cameras (lazy loading)")
+            _flow_msg = f"Optical flow available for {n_with_flow}/{len(scene.getTrainCameras())} training cameras (lazy loading)"
+            logger.info(_flow_msg)
+            print(f"[INFO] {_flow_msg}")
         else:
-            print(f"[WARNING] use_flow_loss/use_flow_mask=True but no flow files found, disabling.")
+            _flow_warn = "use_flow_loss/use_flow_mask=True but no flow files found, disabling."
+            logger.warning(_flow_warn)
+            print(f"[WARNING] {_flow_warn}")
             dataset.use_flow_loss = False
             dataset.use_flow_mask = False
             _need_flow = False
@@ -132,6 +147,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
     if profile:
         trace_dir = os.path.join(dataset.model_path, "profiler_traces")
         os.makedirs(trace_dir, exist_ok=True)
+        logger.info("[PROFILE] Will capture %d iterations starting at iter %d", profile_steps, profile_start)
+        logger.info("[PROFILE] Trace output: %s", trace_dir)
+        logger.info("[PROFILE] Phase timer enabled — prints breakdown every %d iters", _PHASE_REPORT_INTERVAL)
         print(f"[PROFILE] Will capture {profile_steps} iterations starting at iter {profile_start}")
         print(f"[PROFILE] Trace output: {trace_dir}")
         print(f"[PROFILE] Phase timer enabled — prints breakdown every {_PHASE_REPORT_INTERVAL} iters")
@@ -149,6 +167,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 with_stack=True,
             )
             _profiler_ctx.__enter__()
+            logger.info("[PROFILE] Profiler started at iteration %d", iteration)
             print(f"[PROFILE] Profiler started at iteration {iteration}")
         if network_gui.conn == None:
             network_gui.try_connect()
@@ -293,6 +312,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 loss = loss + opt.lambda_flow * flow_loss
 
             if iteration % 1000 == 0:
+                logger.info("[Iter %d] flow loss = %.6f", iteration, flow_loss.item())
                 print(f"[Iter {iteration}] flow loss = {flow_loss.item():.6f}")
             if tb_writer and iteration % 100 == 0:
                 tb_writer.add_scalar('train_loss_patches/flow_loss', flow_loss.item(), iteration)
@@ -361,6 +381,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             #         best_iteration = iteration
 
             if iteration in saving_iterations:
+                logger.info("[ITER %d] Saving Gaussians", iteration)
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
                 deform.save_weights(args.model_path, iteration)
@@ -444,12 +465,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 if iteration >= profile_start + profile_steps + 5:  # wait+warmup+active
                     _profiler_ctx.__exit__(None, None, None)
                     _profiler_ctx = None
+                    logger.info("[PROFILE] Profiler stopped at iteration %d. Trace saved to %s", iteration, trace_dir)
                     print(f"[PROFILE] Profiler stopped at iteration {iteration}. Trace saved to {trace_dir}")
 
     # Final sync — only once at the very end
     torch.cuda.synchronize()
     total_time = time.perf_counter() - wall_start
     # print("Best PSNR = {} in Iteration {}".format(best_psnr, best_iteration))
+    logger.info("Gaussian number: %d", gaussians._xyz.shape[0])
+    logger.info("Dash time: %.2fs", total_time)
     print(f"Gaussian number: {gaussians._xyz.shape[0]}")
     print(f"Dash time: {total_time:.2f}s")
 
@@ -550,6 +574,58 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
     return test_psnr
 
 
+def setup_logging(model_path: str) -> logging.Logger:
+    """Initialise file-based logging under *model_path*/training.log.
+
+    Returns a :class:`logging.Logger` named ``"train"``.
+    The root logger receives a :class:`logging.FileHandler` so that any logger
+    in the process tree also writes to the same file.
+    """
+    log_dir = model_path or "./output"
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, "training.log")
+
+    file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    )
+    logging.root.addHandler(file_handler)
+    logging.root.setLevel(logging.DEBUG)
+
+    logger = logging.getLogger("train")
+    logger.info("=" * 60)
+    print(f"[INFO] Log file: {log_path}")
+    return logger
+
+
+def run_training(args, lp: ModelParams, op: OptimizationParams, pp: PipelineParams) -> None:
+    """Top-level training dispatcher: logging setup → training() → error handling."""
+    logger = setup_logging(args.model_path)
+    logger.info("Training started — args: %s", vars(args))
+
+    # network_gui.init(args.ip, args.port)
+    torch.autograd.set_detect_anomaly(args.detect_anomaly)
+    try:
+        training(
+            lp.extract(args), op.extract(args), pp.extract(args),
+            args.test_iterations, args.save_iterations,
+            profile=getattr(args, 'profile', False),
+            profile_start=getattr(args, 'profile_start', 500),
+            profile_steps=getattr(args, 'profile_steps', 50),
+            logger=logger,
+        )
+    except Exception:
+        tb_str = traceback.format_exc()
+        logger.error("Training failed with exception:\n%s", tb_str)
+        _log_path = os.path.join(args.model_path or "./output", "training.log")
+        print(f"\n[ERROR] Training failed. See log: {_log_path}")
+        sys.exit(1)
+
+    logger.info("Training complete.")
+    print("\nTraining complete.")
+
+
 if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")
@@ -569,14 +645,4 @@ if __name__ == "__main__":
     args.save_iterations.append(args.iterations)
 
     print("Optimizing " + args.model_path)
-
-    # Start GUI server, configure and run training
-    # network_gui.init(args.ip, args.port)
-    torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations,
-            profile=getattr(args, 'profile', False),
-            profile_start=getattr(args, 'profile_start', 500),
-            profile_steps=getattr(args, 'profile_steps', 50))
-
-    # All done
-    print("\nTraining complete.")
+    run_training(args, lp, op, pp)
