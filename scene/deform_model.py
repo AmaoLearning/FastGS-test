@@ -54,11 +54,16 @@ class DeformModel:
 
 
 class DeformModel_4DGS:
-    """4DGS-style deformation model: multi-resolution HexPlane + small MLP decoder.
+    """4DGS-style deformation model: PE + multi-resolution HexPlane + MLP decoder.
 
     Drop-in replacement for :class:`DeformModel` with the same external interface
     (``step``, ``train_setting``, ``save_weights``, ``load_weights``,
     ``update_learning_rate``).
+
+    Architecture matches the 4DGS paper (Wu et al., CVPR 2024):
+      xyz PE (multires=10, 63-d) + t PE (multires=6/10, 13/21-d)
+      + 3-level HexPlane grids (feat_dim=16, product fusion → 48-d)
+      → MLP decoder (128-hidden, 2 layers) → (d_xyz, d_rot, d_scale)
 
     Extra capabilities:
     * ``set_aabb(points)`` — compute normalisation AABB from a point cloud.
@@ -66,14 +71,16 @@ class DeformModel_4DGS:
 
     Parameters
     ----------
+    is_blender : bool
+        If True, use t_multires=6 (D-NeRF); otherwise t_multires=10.
     spatial_resolutions : tuple[int, ...]
-        Multi-res spatial grid sizes (default ``(64, 128)``).
+        Multi-res spatial grid sizes (default ``(64, 128, 256)``).
     time_resolutions : tuple[int, ...]
-        Multi-res temporal grid sizes (default ``(64, 128)``).
+        Multi-res temporal grid sizes (default ``(64, 128, 256)``).
     feat_dim : int
-        Feature channels per plane per resolution level (default 8).
+        Feature channels per plane per resolution level (default 16).
     mlp_hidden_dim : int
-        Hidden width of the MLP decoder (default 64).
+        Hidden width of the MLP decoder (default 128).
     mlp_num_hidden : int
         Number of hidden layers in the MLP decoder (default 2).
     fusion : str
@@ -86,10 +93,10 @@ class DeformModel_4DGS:
         self,
         is_blender: bool = False,
         is_6dof: bool = False,
-        spatial_resolutions: Sequence[int] = (64, 128),
-        time_resolutions: Sequence[int] = (64, 128),
-        feat_dim: int = 8,
-        mlp_hidden_dim: int = 64,
+        spatial_resolutions: Sequence[int] = (64, 128, 256),
+        time_resolutions: Sequence[int] = (64, 128, 256),
+        feat_dim: int = 16,
+        mlp_hidden_dim: int = 128,
         mlp_num_hidden: int = 2,
         fusion: str = "product",
     ) -> None:
@@ -100,6 +107,7 @@ class DeformModel_4DGS:
             mlp_hidden_dim=mlp_hidden_dim,
             mlp_num_hidden=mlp_num_hidden,
             fusion=fusion,
+            is_blender=is_blender,
             is_6dof=is_6dof,
         ).cuda()
         self.optimizer: Optional[torch.optim.Optimizer] = None

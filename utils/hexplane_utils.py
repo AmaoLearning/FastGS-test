@@ -1,12 +1,12 @@
 """
-Multi-resolution HexPlane deformation network, inspired by 4D Gaussian Splatting.
+Multi-resolution HexPlane deformation network — 4DGS paper reference config.
 
-Architecture:
-  6 learnable 2D feature planes for each (i, j) pair in {X, Y, Z, T}:
-      XY, XZ, XT, YZ, YT, ZT
-  at multiple spatial/temporal resolutions.
-  Features are sampled via bilinear interpolation, fused across planes,
-  then decoded by a lightweight MLP into (d_xyz, d_rotation, d_scaling).
+Architecture (matching Wu et al., "4D Gaussian Splatting", CVPR 2024):
+  1. Positional Encoding of raw xyz (multires=10 → 63-d) and t (multires=6/10 → 13/21-d)
+  2. Multi-resolution HexPlane grids (6 planes × L levels, feat_dim C)
+     with bilinear interpolation and product fusion across complementary pairs
+  3. Concatenation: [grid_feats, xyz_PE, t_PE]
+  4. MLP decoder → (d_xyz: 3, d_rotation: 4, d_scaling: 3)
 """
 
 from __future__ import annotations
@@ -17,6 +17,75 @@ from typing import List, Literal, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Positional Encoding (Fourier features)
+# ──────────────────────────────────────────────────────────────────────
+
+class PositionalEncoding(nn.Module):
+    """Fourier positional encoding identical to NeRF / DeformNetwork.
+
+    For input dimension *d* and *L* frequency bands:
+        output = [x, sin(2^0 π x), cos(2^0 π x), ..., sin(2^{L-1} π x), cos(2^{L-1} π x)]
+        output_dim = d + 2 * d * L  (when include_input=True)
+
+    Parameters
+    ----------
+    input_dims : int
+        Dimensionality of raw input (e.g. 3 for xyz, 1 for t).
+    num_freqs : int
+        Number of frequency bands *L*.
+    include_input : bool
+        Whether to prepend the raw input to the encoding.
+    log_sampling : bool
+        If True, frequencies are 2^{0..L-1}; otherwise linearly spaced.
+    """
+
+    def __init__(
+        self,
+        input_dims: int = 3,
+        num_freqs: int = 10,
+        include_input: bool = True,
+        log_sampling: bool = True,
+    ) -> None:
+        super().__init__()
+        self.input_dims = input_dims
+        self.num_freqs = num_freqs
+        self.include_input = include_input
+
+        if log_sampling:
+            freq_bands = 2.0 ** torch.linspace(0.0, num_freqs - 1, steps=num_freqs)
+        else:
+            freq_bands = torch.linspace(1.0, 2.0 ** (num_freqs - 1), steps=num_freqs)
+        # Register as buffer so it moves to GPU with the module
+        self.register_buffer("freq_bands", freq_bands)  # (L,)
+
+        self._out_dim = (1 + 2 * num_freqs) * input_dims if include_input else 2 * num_freqs * input_dims
+
+    @property
+    def out_dim(self) -> int:
+        return self._out_dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        x : ``(N, input_dims)``
+
+        Returns
+        -------
+        ``(N, out_dim)``
+        """
+        # x_scaled: (N, input_dims, L)
+        x_scaled = x.unsqueeze(-1) * self.freq_bands  # broadcast
+        # sin/cos: each (N, input_dims, L) → reshape to (N, input_dims * L)
+        sin_part = torch.sin(x_scaled).reshape(x.shape[0], -1)
+        cos_part = torch.cos(x_scaled).reshape(x.shape[0], -1)
+        parts = [sin_part, cos_part]
+        if self.include_input:
+            parts = [x] + parts
+        return torch.cat(parts, dim=-1)  # (N, out_dim)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -62,9 +131,9 @@ class HexPlaneField(nn.Module):
 
     def __init__(
         self,
-        spatial_resolutions: Sequence[int] = (64, 128),
-        time_resolutions: Sequence[int] = (64, 128),
-        feat_dim: int = 8,
+        spatial_resolutions: Sequence[int] = (64, 128, 256),
+        time_resolutions: Sequence[int] = (64, 128, 256),
+        feat_dim: int = 16,
         fusion: Literal["concat", "product"] = "product",
         init_scale: float = 0.1,
     ) -> None:
@@ -142,7 +211,6 @@ class HexPlaneField(nn.Module):
                 level_feats.append(torch.cat(plane_feats, dim=-1))  # (N, 6C)
             else:
                 # Product fusion: 3 complementary space–time pairs
-                # (XY, ZT), (XZ, YT), (XZ, ZT) → but canonical pairings:
                 # pair 0: XY(0) ⊙ ZT(5)
                 # pair 1: XZ(1) ⊙ YT(4)
                 # pair 2: XT(2) ⊙ YZ(3)
@@ -181,7 +249,7 @@ class HexPlaneField(nn.Module):
 # ──────────────────────────────────────────────────────────────────────
 
 class HexPlaneMLPDecoder(nn.Module):
-    """Lightweight MLP that maps fused HexPlane features to deformation outputs.
+    """MLP that maps [grid_feats, xyz_PE, t_PE] to deformation outputs.
 
     Output layout: ``(d_xyz: 3, d_rotation: 4, d_scaling: 3)`` = 10 dims.
     """
@@ -189,7 +257,7 @@ class HexPlaneMLPDecoder(nn.Module):
     def __init__(
         self,
         in_dim: int,
-        hidden_dim: int = 64,
+        hidden_dim: int = 128,
         num_hidden_layers: int = 2,
         out_dim: int = 10,
     ) -> None:
@@ -212,14 +280,17 @@ class HexPlaneMLPDecoder(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────────────
-#  Composite Network: HexPlane + MLP Decoder
+#  Composite Network: HexPlane + PE + MLP Decoder
 # ──────────────────────────────────────────────────────────────────────
 
 class HexPlaneDeformNetwork(nn.Module):
-    """4DGS-style deformation network: multi-resolution HexPlane → small MLP.
+    """4DGS-style deformation network: PE + multi-res HexPlane → MLP decoder.
 
-    Accepts raw (xyz, t) inputs, normalises them using a learnable or fixed
-    AABB, queries the HexPlane field, and decodes deformation outputs.
+    Accepts raw ``(xyz, t)`` inputs, computes positional encodings for both
+    spatial and temporal coordinates, queries the HexPlane feature field,
+    and concatenates ``[grid_feats, xyz_PE, t_PE]`` before the MLP decoder.
+
+    This matches the architecture in the 4DGS paper (Wu et al., CVPR 2024).
 
     Parameters
     ----------
@@ -229,6 +300,11 @@ class HexPlaneDeformNetwork(nn.Module):
         Multi-resolution grid sizes for the temporal axis.
     feat_dim : int
         Feature channels per plane per resolution level.
+    xyz_multires : int
+        Number of Fourier frequency bands for spatial PE (default 10, → 63-d).
+    t_multires : int
+        Number of Fourier frequency bands for temporal PE (default 6, → 13-d).
+        Use 6 for blender/D-NeRF scenes, 10 for real-world scenes.
     mlp_hidden_dim : int
         Hidden layer width for the MLP decoder.
     mlp_num_hidden : int
@@ -237,26 +313,37 @@ class HexPlaneDeformNetwork(nn.Module):
         HexPlane fusion strategy: ``"concat"`` or ``"product"``.
     init_scale : float
         Plane parameter initialisation scale.
+    is_blender : bool
+        If True, use t_multires=6 (matching DeformNetwork behaviour).
     is_6dof : bool
-        If True, output uses SE(3) representation (6-DoF) instead of direct
-        (d_xyz, d_rotation, d_scaling). *Currently not implemented — falls
-        back to direct output.*
+        Placeholder for SE(3) output mode (not yet implemented).
     """
 
     def __init__(
         self,
-        spatial_resolutions: Sequence[int] = (64, 128),
-        time_resolutions: Sequence[int] = (64, 128),
-        feat_dim: int = 8,
-        mlp_hidden_dim: int = 64,
+        spatial_resolutions: Sequence[int] = (64, 128, 256),
+        time_resolutions: Sequence[int] = (64, 128, 256),
+        feat_dim: int = 16,
+        xyz_multires: int = 10,
+        t_multires: int = 10,
+        mlp_hidden_dim: int = 128,
         mlp_num_hidden: int = 2,
         fusion: Literal["concat", "product"] = "product",
         init_scale: float = 0.1,
+        is_blender: bool = False,
         is_6dof: bool = False,
     ) -> None:
         super().__init__()
         self.is_6dof = is_6dof
+        self.is_blender = is_blender
 
+        # ── Positional encodings ──────────────────────────────────────
+        # Match original DeformNetwork: blender uses t_multires=6
+        _t_multires = 6 if is_blender else t_multires
+        self.pe_xyz = PositionalEncoding(input_dims=3, num_freqs=xyz_multires)
+        self.pe_t = PositionalEncoding(input_dims=1, num_freqs=_t_multires)
+
+        # ── HexPlane grids ────────────────────────────────────────────
         self.hexplane = HexPlaneField(
             spatial_resolutions=spatial_resolutions,
             time_resolutions=time_resolutions,
@@ -265,17 +352,18 @@ class HexPlaneDeformNetwork(nn.Module):
             init_scale=init_scale,
         )
 
-        # Output: (d_xyz: 3, d_rotation: 4, d_scaling: 3) = 10
-        out_dim = 10
+        # ── MLP decoder ──────────────────────────────────────────────
+        # Input = grid_feats + xyz_PE + t_PE
+        decoder_in_dim = self.hexplane.out_dim + self.pe_xyz.out_dim + self.pe_t.out_dim
+        out_dim = 10  # (d_xyz: 3, d_rotation: 4, d_scaling: 3)
         self.decoder = HexPlaneMLPDecoder(
-            in_dim=self.hexplane.out_dim,
+            in_dim=decoder_in_dim,
             hidden_dim=mlp_hidden_dim,
             num_hidden_layers=mlp_num_hidden,
             out_dim=out_dim,
         )
 
-        # AABB for normalising xyz to [-1, 1]. Updated via set_aabb().
-        # Default: unit cube centered at origin
+        # ── AABB for normalising xyz to [-1, 1]. Updated via set_aabb().
         self.register_buffer("aabb_min", torch.tensor([-1.0, -1.0, -1.0]))
         self.register_buffer("aabb_max", torch.tensor([1.0, 1.0, 1.0]))
 
@@ -299,9 +387,7 @@ class HexPlaneDeformNetwork(nn.Module):
     def _normalise_xyzt(self, xyz: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """Normalise xyz to [-1, 1] using AABB; t is assumed already in [0, 1]
         and mapped to [-1, 1]."""
-        # xyz normalisation
         xyz_norm = 2.0 * (xyz - self.aabb_min) / (self.aabb_max - self.aabb_min + 1e-8) - 1.0
-        # t: [0, 1] → [-1, 1]
         t_norm = 2.0 * t - 1.0
         return torch.cat([xyz_norm, t_norm], dim=-1)  # (N, 4)
 
@@ -322,9 +408,17 @@ class HexPlaneDeformNetwork(nn.Module):
         d_rotation : ``(N, 4)``
         d_scaling  : ``(N, 3)``
         """
-        xyzt = self._normalise_xyzt(xyz, t)       # (N, 4)
-        feats = self.hexplane(xyzt)                # (N, F)
-        out = self.decoder(feats)                  # (N, 10)
+        # 1. Normalise → grid query
+        xyzt = self._normalise_xyzt(xyz, t)         # (N, 4)
+        grid_feats = self.hexplane(xyzt)             # (N, grid_dim)
+
+        # 2. Positional encoding of raw inputs
+        xyz_pe = self.pe_xyz(xyz)                    # (N, 63) for multires=10
+        t_pe = self.pe_t(t)                          # (N, 13) for multires=6
+
+        # 3. Concatenate and decode
+        decoder_input = torch.cat([grid_feats, xyz_pe, t_pe], dim=-1)
+        out = self.decoder(decoder_input)            # (N, 10)
 
         d_xyz = out[:, :3]
         d_rotation = out[:, 3:7]
