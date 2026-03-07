@@ -61,6 +61,9 @@ class ModelParams(ParamGroup):
         self.is_blender = False
         self.is_6dof = False
 
+        # deformation network type: "mlp" (original) or "4dgs" (HexPlane)
+        self.deform_type = "mlp"
+
         # optical flow loss（使用形变场有限差分 + diff-flow-rasterization）
         self.use_flow_loss = False  # 是否启用投影光流损失
         self.use_flow_mask = False  # 是否启用光流掩码引导致密化（可独立于 flow loss 使用）

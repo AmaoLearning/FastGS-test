@@ -10,7 +10,7 @@
 #
 
 import torch
-from scene import Scene, DeformModel
+from scene import Scene, DeformModel, DeformModel_4DGS
 import os
 from tqdm import tqdm
 from os import makedirs
@@ -305,7 +305,11 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
-        deform = DeformModel(dataset.is_blender, dataset.is_6dof)
+        _deform_type = getattr(dataset, "deform_type", "mlp")
+        if _deform_type == "4dgs":
+            deform = DeformModel_4DGS(is_blender=dataset.is_blender, is_6dof=dataset.is_6dof)
+        else:
+            deform = DeformModel(dataset.is_blender, dataset.is_6dof)
         deform.load_weights(dataset.model_path)
 
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]

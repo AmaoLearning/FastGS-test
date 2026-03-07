@@ -16,7 +16,7 @@ from random import randint
 from utils.loss_utils import l1_loss, ssim, kl_divergence, l2_loss
 from gaussian_renderer import render_fastgs, network_gui
 import sys
-from scene import Scene, GaussianModel, DeformModel
+from scene import Scene, GaussianModel, DeformModel, DeformModel_4DGS
 from utils.general_utils import safe_state, get_linear_noise_func
 import uuid
 from tqdm import tqdm
@@ -43,7 +43,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
     safe_state(quiet) # fix random seeds
     tb_writer = prepare_output_and_logger(dataset, opt, pipe)
     gaussians = GaussianModel(dataset.sh_degree)
-    deform = DeformModel(dataset.is_blender, dataset.is_6dof)
+
+    # ── Select deformation network ──
+    _deform_type = getattr(dataset, "deform_type", "mlp")
+    if _deform_type == "4dgs":
+        deform = DeformModel_4DGS(is_blender=dataset.is_blender, is_6dof=dataset.is_6dof)
+        print("[INFO] Using 4DGS HexPlane deformation network")
+    else:
+        deform = DeformModel(dataset.is_blender, dataset.is_6dof)
     deform.train_setting(opt)
 
     # torch.compile: fuse small Linear+ReLU kernels in the deform MLP to
@@ -58,6 +65,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
 
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt, args)
+
+    # ── Set AABB for HexPlane normalisation (4DGS only) ──
+    if _deform_type == "4dgs" and hasattr(deform, "set_aabb"):
+        deform.set_aabb(gaussians.get_xyz.detach(), padding=0.1)
+        print("[INFO] HexPlane AABB set from initial point cloud")
 
     # Initialize async image prefetch pipeline (lazy mode only)
     if scene._lazy_mode:
@@ -288,6 +300,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
         # Log final total loss (after all auxiliary losses are added)
         if tb_writer and iteration % 100 == 0:
             tb_writer.add_scalar('train_loss_patches/total_loss_final', loss.item(), iteration)
+
+        # ── HexPlane regularisation (4DGS only) ──
+        if _deform_type == "4dgs" and iteration >= opt.warm_up:
+            _tv_loss = deform.get_tv_loss()
+            _l1_loss = deform.get_l1_loss()
+            loss = loss + 1e-3 * _tv_loss + 1e-4 * _l1_loss
+            if tb_writer and iteration % 100 == 0:
+                tb_writer.add_scalar('train_loss_patches/hexplane_tv', _tv_loss.item(), iteration)
+                tb_writer.add_scalar('train_loss_patches/hexplane_l1', _l1_loss.item(), iteration)
 
         if _enable_phase_timer:
             torch.cuda.synchronize()

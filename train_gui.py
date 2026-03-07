@@ -16,7 +16,7 @@ from random import randint
 from utils.loss_utils import l1_loss, ssim, kl_divergence
 from gaussian_renderer import render_fastgs, network_gui
 import sys
-from scene import Scene, GaussianModel, DeformModel
+from scene import Scene, GaussianModel, DeformModel, DeformModel_4DGS
 from utils.general_utils import safe_state, get_linear_noise_func
 import uuid
 import tqdm
@@ -95,11 +95,19 @@ class GUI:
 
         self.tb_writer = prepare_output_and_logger(dataset)
         self.gaussians = GaussianModel(dataset.sh_degree)
-        self.deform = DeformModel(is_blender=dataset.is_blender, is_6dof=dataset.is_6dof)
+        _deform_type = getattr(dataset, "deform_type", "mlp")
+        if _deform_type == "4dgs":
+            self.deform = DeformModel_4DGS(is_blender=dataset.is_blender, is_6dof=dataset.is_6dof)
+        else:
+            self.deform = DeformModel(is_blender=dataset.is_blender, is_6dof=dataset.is_6dof)
         self.deform.train_setting(opt)
 
         self.scene = Scene(dataset, self.gaussians)
         self.gaussians.training_setup(opt, args)
+
+        # Set AABB for HexPlane normalisation (4DGS only)
+        if _deform_type == "4dgs" and hasattr(self.deform, "set_aabb"):
+            self.deform.set_aabb(self.gaussians.get_xyz.detach(), padding=0.1)
 
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         self.background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
