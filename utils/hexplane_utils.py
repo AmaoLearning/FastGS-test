@@ -12,7 +12,7 @@ Architecture (matching Wu et al., "4D Gaussian Splatting", CVPR 2024):
 from __future__ import annotations
 
 import math
-from typing import List, Literal, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -134,7 +134,7 @@ class HexPlaneField(nn.Module):
         spatial_resolutions: Sequence[int] = (64, 128, 256),
         time_resolutions: Sequence[int] = (64, 128, 256),
         feat_dim: int = 16,
-        fusion: Literal["concat", "product"] = "product",
+        fusion: str = "product",
         init_scale: float = 0.1,
     ) -> None:
         super().__init__()
@@ -328,7 +328,7 @@ class HexPlaneDeformNetwork(nn.Module):
         t_multires: int = 10,
         mlp_hidden_dim: int = 128,
         mlp_num_hidden: int = 2,
-        fusion: Literal["concat", "product"] = "product",
+        fusion: str = "product",
         init_scale: float = 0.1,
         is_blender: bool = False,
         is_6dof: bool = False,
