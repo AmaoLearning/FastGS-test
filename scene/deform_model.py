@@ -140,25 +140,29 @@ class DeformModel_4DGS:
             list(self.deform.pe_xyz.parameters())
             + list(self.deform.pe_t.parameters())
         )
+        # Read LR params — fall back to sensible defaults if not present
+        _plane_lr_init = getattr(training_args, "hex_plane_lr_init", 0.02)
+        _plane_lr_final = getattr(training_args, "hex_plane_lr_final", 0.002)
+        _mlp_lr_init = getattr(training_args, "hex_mlp_lr_init", 0.001)
+        _mlp_lr_final = getattr(training_args, "hex_mlp_lr_final", 0.00001)
+
         l = [
-            {"params": plane_params, "lr": 0.02, "name": "deform_planes"},
-            {"params": mlp_params + pe_params, "lr": 0.001, "name": "deform_mlp"},
+            {"params": plane_params, "lr": _plane_lr_init, "name": "deform_planes"},
+            {"params": mlp_params + pe_params, "lr": _mlp_lr_init, "name": "deform_mlp"},
         ]
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
 
         # Independent LR schedulers for planes and MLP.
-        # Planes: 0.02 → 0.002  (10× decay, stays in the high-lr regime)
-        # MLP:    0.001 → 0.00001  (100× decay, standard NeRF-MLP schedule)
         _max_steps = training_args.deform_lr_max_steps
         self._plane_lr_func = get_expon_lr_func(
-            lr_init=0.02,
-            lr_final=0.002,
+            lr_init=_plane_lr_init,
+            lr_final=_plane_lr_final,
             lr_delay_mult=0.01,
             max_steps=_max_steps,
         )
         self._mlp_lr_func = get_expon_lr_func(
-            lr_init=0.001,
-            lr_final=0.00001,
+            lr_init=_mlp_lr_init,
+            lr_final=_mlp_lr_final,
             lr_delay_mult=0.01,
             max_steps=_max_steps,
         )

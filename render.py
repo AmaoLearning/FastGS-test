@@ -307,7 +307,18 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         _deform_type = getattr(dataset, "deform_type", "mlp")
         if _deform_type == "4dgs":
-            deform = DeformModel_4DGS(is_blender=dataset.is_blender, is_6dof=dataset.is_6dof)
+            _s_res = tuple(int(x) for x in dataset.hex_spatial_res.split(","))
+            _t_res = tuple(int(x) for x in dataset.hex_time_res.split(","))
+            deform = DeformModel_4DGS(
+                is_blender=dataset.is_blender,
+                is_6dof=dataset.is_6dof,
+                spatial_resolutions=_s_res,
+                time_resolutions=_t_res,
+                feat_dim=dataset.hex_feat_dim,
+                mlp_hidden_dim=dataset.hex_mlp_hidden,
+                mlp_num_hidden=dataset.hex_mlp_layers,
+                fusion=dataset.hex_fusion,
+            )
         else:
             deform = DeformModel(dataset.is_blender, dataset.is_6dof)
         deform.load_weights(dataset.model_path)

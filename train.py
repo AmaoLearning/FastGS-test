@@ -54,9 +54,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
     # ── Select deformation network ──
     _deform_type = getattr(dataset, "deform_type", "mlp")
     if _deform_type == "4dgs":
-        deform = DeformModel_4DGS(is_blender=dataset.is_blender, is_6dof=dataset.is_6dof)
-        logger.info("Using 4DGS HexPlane deformation network")
-        print("[INFO] Using 4DGS HexPlane deformation network")
+        _s_res = tuple(int(x) for x in dataset.hex_spatial_res.split(","))
+        _t_res = tuple(int(x) for x in dataset.hex_time_res.split(","))
+        deform = DeformModel_4DGS(
+            is_blender=dataset.is_blender,
+            is_6dof=dataset.is_6dof,
+            spatial_resolutions=_s_res,
+            time_resolutions=_t_res,
+            feat_dim=dataset.hex_feat_dim,
+            mlp_hidden_dim=dataset.hex_mlp_hidden,
+            mlp_num_hidden=dataset.hex_mlp_layers,
+            fusion=dataset.hex_fusion,
+        )
+        logger.info("Using 4DGS HexPlane deformation network  spatial_res=%s  time_res=%s  feat_dim=%d  mlp=%dx%d  fusion=%s",
+                    _s_res, _t_res, dataset.hex_feat_dim, dataset.hex_mlp_hidden, dataset.hex_mlp_layers, dataset.hex_fusion)
+        print(f"[INFO] Using 4DGS HexPlane  spatial_res={_s_res}  time_res={_t_res}  feat_dim={dataset.hex_feat_dim}  mlp={dataset.hex_mlp_hidden}x{dataset.hex_mlp_layers}  fusion={dataset.hex_fusion}")
     else:
         deform = DeformModel(dataset.is_blender, dataset.is_6dof)
     deform.train_setting(opt)

@@ -6,3 +6,5 @@ launch.json
 settings.json
 
 output*
+trans/*
+*.7z

@@ -64,6 +64,15 @@ class ModelParams(ParamGroup):
         # deformation network type: "mlp" (original) or "4dgs" (HexPlane)
         self.deform_type = "mlp"
 
+        # HexPlane architecture (only effective when deform_type="4dgs")
+        # Comma-separated resolutions, e.g. "64,128,256" → 3 levels
+        self.hex_spatial_res = "64,128,256"
+        self.hex_time_res = "64,128,256"
+        self.hex_feat_dim = 16
+        self.hex_mlp_hidden = 128
+        self.hex_mlp_layers = 2
+        self.hex_fusion = "concat"
+
         # optical flow loss（使用形变场有限差分 + diff-flow-rasterization）
         self.use_flow_loss = False  # 是否启用投影光流损失
         self.use_flow_mask = False  # 是否启用光流掩码引导致密化（可独立于 flow loss 使用）
@@ -120,6 +129,12 @@ class OptimizationParams(ParamGroup):
         self.grad_thresh = 0.0002
         self.dense = 0.001
         self.mult = 0.5
+
+        # HexPlane learning rates (only effective when deform_type="4dgs")
+        self.hex_plane_lr_init = 0.02
+        self.hex_plane_lr_final = 0.002
+        self.hex_mlp_lr_init = 0.001
+        self.hex_mlp_lr_final = 0.00001
 
         # optical flow loss（投影光流监督损失，使用形变场有限差分）
         self.lambda_flow = 0.1  # 光流损失权重
