@@ -233,18 +233,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             d_xyz, d_rotation, d_scaling = deform.step(gaussians.get_xyz.detach(), time_input + ast_noise)
 
             # ── Soft dynamic-static separation ──
-            # Gate each Gaussian's deformation by a sigmoid of its normalised magnitude.
-            # Gaussians whose deformation is small relative to the global max are
-            # smoothly pushed toward zero (static), encouraging sparsity.
+            # Gate each Gaussian's deformation with a learnable dynamic probability.
             if dataset.use_dynamic_sep:
-                with torch.no_grad():
-                    _mag = d_xyz.detach().norm(dim=-1, keepdim=True)       # (N,1)
-                    _max_mag = _mag.max().clamp(min=1e-8)
-                    _normalised = _mag / _max_mag                         # [0, 1]
-                    _k = dataset.dynamic_sep_k
-                    _thr = dataset.dynamic_sep_thresh
-                    _dynamic_prob = torch.sigmoid(_k * (_normalised - _thr))  # (N,1)
-                # prob is detached; gradients still flow through d_xyz etc.
+                # No deformation-magnitude prior: probability is learned directly
+                # from per-Gaussian dynamic logits.
+                _dynamic_prob = gaussians.get_dynamic_prob
                 d_xyz = _dynamic_prob * d_xyz
                 d_rotation = _dynamic_prob * d_rotation
                 d_scaling = _dynamic_prob * d_scaling
