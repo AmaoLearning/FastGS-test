@@ -232,6 +232,54 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
 
             d_xyz, d_rotation, d_scaling = deform.step(gaussians.get_xyz.detach(), time_input + ast_noise)
 
+            # ── Soft dynamic-static separation ──
+            # Gate each Gaussian's deformation by a sigmoid of its normalised magnitude.
+            # Gaussians whose deformation is small relative to the global max are
+            # smoothly pushed toward zero (static), encouraging sparsity.
+            if dataset.use_dynamic_sep:
+                with torch.no_grad():
+                    _mag = d_xyz.detach().norm(dim=-1, keepdim=True)       # (N,1)
+                    _max_mag = _mag.max().clamp(min=1e-8)
+                    _normalised = _mag / _max_mag                         # [0, 1]
+                    _k = dataset.dynamic_sep_k
+                    _thr = dataset.dynamic_sep_thresh
+                    _dynamic_prob = torch.sigmoid(_k * (_normalised - _thr))  # (N,1)
+                # prob is detached; gradients still flow through d_xyz etc.
+                d_xyz = _dynamic_prob * d_xyz
+                d_rotation = _dynamic_prob * d_rotation
+                d_scaling = _dynamic_prob * d_scaling
+
+            # ── Deformation distribution histogram (optional) ──
+            if (dataset.log_deform_hist
+                    and tb_writer
+                    and iteration % 3000 == 0):
+                with torch.no_grad():
+                    _hist_mag = d_xyz.detach().norm(dim=-1)  # (N,)
+                    tb_writer.add_histogram('deform/magnitude', _hist_mag, iteration)
+                    tb_writer.add_scalar('deform/mag_max', _hist_mag.max().item(), iteration)
+                    tb_writer.add_scalar('deform/mag_mean', _hist_mag.mean().item(), iteration)
+                    tb_writer.add_scalar('deform/mag_median', _hist_mag.median().item(), iteration)
+                    # Also log dynamic_prob stats when dynamic sep is active
+                    if dataset.use_dynamic_sep:
+                        tb_writer.add_histogram('deform/dynamic_prob', _dynamic_prob.squeeze(-1), iteration)
+                        _static_ratio = (_dynamic_prob < 0.5).float().mean().item()
+                        tb_writer.add_scalar('deform/static_ratio', _static_ratio, iteration)
+                    try:
+                        import matplotlib
+                        matplotlib.use('Agg')
+                        import matplotlib.pyplot as plt
+                        fig, ax = plt.subplots(1, 1, figsize=(8, 4))
+                        ax.hist(_hist_mag.cpu().numpy(), bins=100, color='steelblue', edgecolor='none')
+                        ax.set_xlabel('Deformation magnitude')
+                        ax.set_ylabel('Count')
+                        ax.set_title(f'Iter {iteration}  N={_hist_mag.shape[0]}  '
+                                     f'max={_hist_mag.max().item():.4f}  mean={_hist_mag.mean().item():.4f}')
+                        fig.tight_layout()
+                        tb_writer.add_figure('deform/magnitude_hist', fig, iteration)
+                        plt.close(fig)
+                    except ImportError:
+                        pass  # matplotlib not available, skip figure
+
         if _enable_phase_timer:
             torch.cuda.synchronize()
             _phase_accum["deform"] += time.perf_counter() - _t0

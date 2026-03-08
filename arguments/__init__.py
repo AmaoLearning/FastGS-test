@@ -73,6 +73,12 @@ class ModelParams(ParamGroup):
         self.hex_mlp_layers = 2
         self.hex_fusion = "concat"
 
+        # soft dynamic-static separation
+        self.use_dynamic_sep = False   # 启用软动静分离：根据形变幅度混合形变与零向量
+        self.dynamic_sep_k = 10.0      # sigmoid 温度系数（越大越尖锐）
+        self.dynamic_sep_thresh = 0.1  # 归一化幅度的软阈值（占 max 的比例）
+        self.log_deform_hist = False   # 每隄3000轮记录全局形变分布柱状图
+
         # optical flow loss（使用形变场有限差分 + diff-flow-rasterization）
         self.use_flow_loss = False  # 是否启用投影光流损失
         self.use_flow_mask = False  # 是否启用光流掩码引导致密化（可独立于 flow loss 使用）
