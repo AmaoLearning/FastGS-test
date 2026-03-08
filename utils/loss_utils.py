@@ -19,6 +19,23 @@ def l1_loss(network_output, gt):
     return torch.abs((network_output - gt)).mean()
 
 
+def binary_entropy_polarization_loss(prob: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Mean binary entropy over a batch of probabilities.
+
+    Minimising this loss pushes each element of *prob* toward 0 or 1,
+    producing a bimodal (polarised) distribution.
+
+    Args:
+        prob: Tensor of shape ``(N, 1)`` or ``(N,)`` with values in ``(0, 1)``.
+        eps: Clamping margin to avoid ``log(0)``.
+
+    Returns:
+        Scalar mean binary entropy.
+    """
+    p = prob.clamp(eps, 1.0 - eps)
+    return -(p * p.log() + (1.0 - p) * (1.0 - p).log()).mean()
+
+
 def kl_divergence(rho, rho_hat):
     rho_hat = torch.mean(torch.sigmoid(rho_hat), 0)
     rho = torch.tensor([rho] * len(rho_hat)).cuda()

@@ -115,6 +115,7 @@ class OptimizationParams(ParamGroup):
         self.scaling_lr = 0.005
         self.rotation_lr = 0.001
         self.dynamic_prob_lr = 0.001
+        self.lambda_dynamic_polar = 0.01  # entropy-minimization weight to polarize dynamic_prob toward 0/1
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
         self.densification_interval = 500

@@ -15,7 +15,7 @@ import logging
 import traceback
 import torch
 from random import randint
-from utils.loss_utils import l1_loss, ssim, kl_divergence, l2_loss
+from utils.loss_utils import l1_loss, ssim, kl_divergence, l2_loss, binary_entropy_polarization_loss
 from gaussian_renderer import render_fastgs, network_gui
 import sys
 from scene import Scene, GaussianModel, DeformModel, DeformModel_4DGS
@@ -382,6 +382,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             if tb_writer and iteration % 100 == 0:
                 tb_writer.add_scalar('train_loss_patches/hexplane_tv', _tv_loss.item(), iteration)
                 tb_writer.add_scalar('train_loss_patches/hexplane_l1', _l1_loss.item(), iteration)
+
+        # ── Dynamic-prob entropy polarisation loss ──
+        # Minimise binary entropy to push dynamic_prob toward 0 or 1.
+        if dataset.use_dynamic_sep and opt.lambda_dynamic_polar > 0:
+            _polar_loss = binary_entropy_polarization_loss(gaussians.get_dynamic_prob)
+            loss = loss + opt.lambda_dynamic_polar * _polar_loss
+            if tb_writer and iteration % 100 == 0:
+                tb_writer.add_scalar('train_loss_patches/dynamic_polar', _polar_loss.item(), iteration)
 
         if _enable_phase_timer:
             torch.cuda.synchronize()
