@@ -93,6 +93,14 @@ class GaussianModel:
     def get_dynamic_prob(self):
         return torch.sigmoid(self._dynamic_logit)
 
+    def get_dynamic_prob_t(self, temperature: float = 1.0) -> torch.Tensor:
+        """Dynamic probability with temperature-scaled sigmoid.
+
+        As *temperature* → 0 the sigmoid approaches a step function,
+        producing near-binary outputs (0 or 1).
+        """
+        return torch.sigmoid(self._dynamic_logit / max(temperature, 1e-8))
+
     def get_covariance(self, scaling_modifier=1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
 

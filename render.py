@@ -27,9 +27,13 @@ import time
 
 
 def _apply_dynamic_gate(gaussians, d_xyz, d_rotation, d_scaling, use_dynamic_sep):
-    """Gate deformations by learnable per-Gaussian dynamic probability."""
+    """Gate deformations by learnable per-Gaussian dynamic probability.
+
+    At inference time we use the final (low) temperature to produce near-binary
+    gating, effectively hard-separating static and dynamic Gaussians.
+    """
     if use_dynamic_sep:
-        prob = gaussians.get_dynamic_prob  # sigmoid(_dynamic_logit), (N, 1)
+        prob = gaussians.get_dynamic_prob_t(temperature=0.05)  # near-binary at inference
         return prob * d_xyz, prob * d_rotation, prob * d_scaling
     return d_xyz, d_rotation, d_scaling
 

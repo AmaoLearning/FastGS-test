@@ -234,10 +234,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
 
             # ── Soft dynamic-static separation ──
             # Gate each Gaussian's deformation with a learnable dynamic probability.
+            # Temperature annealing: sigmoid(logit / tau) with tau decaying over
+            # training, gradually sharpening the soft gate toward a hard 0/1 mask.
             if dataset.use_dynamic_sep:
-                # No deformation-magnitude prior: probability is learned directly
-                # from per-Gaussian dynamic logits.
-                _dynamic_prob = gaussians.get_dynamic_prob
+                _temp_progress = max(0.0, min(1.0, (iteration - opt.warm_up) / max(1, opt.iterations - opt.warm_up)))
+                _dyn_temp = opt.dynamic_sep_temp_init * (opt.dynamic_sep_temp_final / max(opt.dynamic_sep_temp_init, 1e-8)) ** _temp_progress
+                _dynamic_prob = gaussians.get_dynamic_prob_t(_dyn_temp)
                 d_xyz = _dynamic_prob * d_xyz
                 d_rotation = _dynamic_prob * d_rotation
                 d_scaling = _dynamic_prob * d_scaling
@@ -257,6 +259,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                         tb_writer.add_histogram('deform/dynamic_prob', _dynamic_prob.squeeze(-1), iteration)
                         _static_ratio = (_dynamic_prob < 0.5).float().mean().item()
                         tb_writer.add_scalar('deform/static_ratio', _static_ratio, iteration)
+                        tb_writer.add_scalar('deform/dynamic_sep_temp', _dyn_temp, iteration)
                     try:
                         import matplotlib
                         matplotlib.use('Agg')
