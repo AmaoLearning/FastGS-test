@@ -122,9 +122,10 @@ class OptimizationParams(ParamGroup):
         self.scaling_lr = 0.005
         self.rotation_lr = 0.001
         self.dynamic_prob_lr = 0.001
-        self.lambda_dynamic_polar = 0.01  # entropy-minimization weight to polarize dynamic_prob toward 0/1
         self.lambda_dynamic_sparse = 0.01  # sparsity prior: push dynamic_prob toward 0 (most are static)
         self.lambda_gate_deform = 0.1      # gate-deform consistency: large raw deform → high dynamic_prob
+        self.lambda_flow_dynamic = 0.1     # flow-supervised dynamic prob (render prob map vs flow GT)
+        self.flow_dynamic_thresh = 3.0     # flow magnitude (px) mapping to target=1 for dynamic supervision
         self.dynamic_sep_temp_init = 1.0   # sigmoid temperature at start (soft)
         self.dynamic_sep_temp_final = 0.05 # sigmoid temperature at end (near-binary)
         self.percent_dense = 0.01

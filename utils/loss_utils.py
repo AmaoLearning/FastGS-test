@@ -19,6 +19,41 @@ def l1_loss(network_output, gt):
     return torch.abs((network_output - gt)).mean()
 
 
+def flow_dynamic_supervision_loss(
+    prob_map: torch.Tensor,
+    flow_gt: torch.Tensor,
+    flow_mask: torch.Tensor,
+    flow_thresh: float = 3.0,
+) -> torch.Tensor:
+    """Supervised dynamic-prob loss using optical flow magnitude as soft target.
+
+    For each pixel, the target dynamic probability is derived from the GT flow
+    magnitude:  ``target = clamp(||flow_gt|| / flow_thresh, 0, 1)``.
+
+    A masked BCE loss is computed between the rendered prob map and this target.
+
+    Args:
+        prob_map: (1, H, W) or (3, H, W)  Alpha-blended dynamic prob image.
+        flow_gt:  (2, H, W)  Ground-truth optical flow.
+        flow_mask: (1, H, W) boolean validity mask.
+        flow_thresh: Flow magnitude (px) that maps to target=1.  Motions below
+            this threshold get a proportionally lower target.
+    """
+    # Soft target from flow magnitude
+    flow_mag = flow_gt.norm(dim=0, keepdim=True)           # (1, H, W)
+    target = (flow_mag / max(flow_thresh, 1e-6)).clamp(0, 1)  # (1, H, W)
+
+    pred = prob_map[:1]  # take first channel, (1, H, W)
+    pred = pred.clamp(1e-6, 1.0 - 1e-6)  # numerical safety for BCE
+
+    mask = flow_mask[:1].bool() if flow_mask is not None else torch.ones_like(pred, dtype=torch.bool)
+    valid = mask.sum()
+    if valid == 0:
+        return pred.new_zeros(())
+
+    return F.binary_cross_entropy(pred[mask], target[mask])
+
+
 def dynamic_sparsity_loss(prob: torch.Tensor) -> torch.Tensor:
     """Sparsity prior: encourage most Gaussians to be static (prob → 0).
 

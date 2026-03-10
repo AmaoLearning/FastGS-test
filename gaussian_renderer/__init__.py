@@ -17,6 +17,84 @@ from utils.rigid_utils import from_homogenous, to_homogenous
 from diff_gaussian_rasterization_fastgs import GaussianRasterizationSettings, GaussianRasterizer
 
 
+def render_dynamic_prob_map(
+    viewpoint_camera,
+    pc: GaussianModel,
+    dynamic_prob: torch.Tensor,
+    pipe,
+    mult: float,
+    d_xyz,
+    d_rotation,
+    d_scaling,
+    is_6dof: bool = False,
+    scaling_modifier: float = 1.0,
+):
+    """Alpha-blend per-Gaussian *dynamic_prob* into a ``(1, H, W)`` image.
+
+    Geometry is detached so only *dynamic_prob* receives gradients.
+    Background is black (0) — empty pixels are treated as static.
+    """
+    colors_precomp = dynamic_prob.expand(-1, 3)  # (N, 3), gradient → logit
+
+    # Detached geometry
+    if is_6dof:
+        if torch.is_tensor(d_xyz):
+            means3D = from_homogenous(
+                torch.bmm(d_xyz, to_homogenous(pc.get_xyz).unsqueeze(-1)).squeeze(-1)
+            ).detach()
+        else:
+            means3D = pc.get_xyz.detach()
+    else:
+        means3D = (pc.get_xyz + d_xyz).detach()
+
+    opacity = pc.get_opacity.detach()
+    scales = (pc.get_scaling + d_scaling).detach()
+    rotations = (pc.get_rotation + d_rotation).detach()
+
+    bg = torch.zeros(3, device="cuda")
+    screenspace_points = torch.zeros(
+        (means3D.shape[0], 4), dtype=means3D.dtype, device="cuda"
+    )
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+    metric_map = torch.zeros(
+        int(viewpoint_camera.image_height) * int(viewpoint_camera.image_width),
+        dtype=torch.int, device="cuda",
+    )
+
+    raster_settings = GaussianRasterizationSettings(
+        image_height=int(viewpoint_camera.image_height),
+        image_width=int(viewpoint_camera.image_width),
+        tanfovx=tanfovx,
+        tanfovy=tanfovy,
+        bg=bg,
+        scale_modifier=scaling_modifier,
+        viewmatrix=viewpoint_camera.world_view_transform,
+        projmatrix=viewpoint_camera.full_proj_transform,
+        sh_degree=0,
+        campos=viewpoint_camera.camera_center,
+        mult=mult,
+        prefiltered=False,
+        debug=False,
+        get_flag=None,
+        metric_map=metric_map,
+    )
+    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+
+    rendered, _, _, _ = rasterizer(
+        means3D=means3D,
+        means2D=screenspace_points,
+        dc=None,
+        shs=None,
+        colors_precomp=colors_precomp,
+        opacities=opacity,
+        scales=scales,
+        rotations=rotations,
+        cov3D_precomp=None,
+    )
+    return rendered[:1]  # (1, H, W)
+
+
 def quaternion_multiply(q1, q2):
     w1, x1, y1, z1 = q1[..., 0], q1[..., 1], q1[..., 2], q1[..., 3]
     w2, x2, y2, z2 = q2[..., 0], q2[..., 1], q2[..., 2], q2[..., 3]

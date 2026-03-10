@@ -16,9 +16,9 @@ import traceback
 import torch
 from random import randint
 from utils.loss_utils import (l1_loss, ssim, kl_divergence, l2_loss,
-                              binary_entropy_polarization_loss,
-                              dynamic_sparsity_loss, gate_deform_consistency_loss)
-from gaussian_renderer import render_fastgs, network_gui
+                              dynamic_sparsity_loss, gate_deform_consistency_loss,
+                              flow_dynamic_supervision_loss)
+from gaussian_renderer import render_fastgs, render_dynamic_prob_map, network_gui
 import sys
 from scene import Scene, GaussianModel, DeformModel, DeformModel_4DGS
 from utils.general_utils import safe_state, get_linear_noise_func
@@ -91,7 +91,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
 
     # ── Optical Flow Loss Setup (deform finite-diff → diff-flow-rasterization) ──
     # flow infrastructure is needed when EITHER flow loss or flow mask is enabled
-    _need_flow = dataset.use_flow_loss or dataset.use_flow_mask
+    _need_flow = dataset.use_flow_loss or dataset.use_flow_mask or (
+        dataset.use_dynamic_sep and opt.lambda_flow_dynamic > 0
+    )
     flow_helper = None
     flow_loss_fn = None
     if _need_flow:
@@ -372,7 +374,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 print(f"[Iter {iteration}] flow loss = {flow_loss.item():.6f}")
             if tb_writer and iteration % 100 == 0:
                 tb_writer.add_scalar('train_loss_patches/flow_loss', flow_loss.item(), iteration)
-        
+
         # Log final total loss (after all auxiliary losses are added)
         if tb_writer and iteration % 100 == 0:
             tb_writer.add_scalar('train_loss_patches/total_loss_final', loss.item(), iteration)
@@ -386,27 +388,41 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 tb_writer.add_scalar('train_loss_patches/hexplane_tv', _tv_loss.item(), iteration)
                 tb_writer.add_scalar('train_loss_patches/hexplane_l1', _l1_loss.item(), iteration)
 
-        # ── Dynamic-prob entropy polarisation loss (legacy, keep for ablation) ──
-        if dataset.use_dynamic_sep and opt.lambda_dynamic_polar > 0:
-            _polar_loss = binary_entropy_polarization_loss(gaussians.get_dynamic_prob)
-            loss = loss + opt.lambda_dynamic_polar * _polar_loss
-            if tb_writer and iteration % 100 == 0:
-                tb_writer.add_scalar('train_loss_patches/dynamic_polar', _polar_loss.item(), iteration)
+        # ── Dynamic-static separation losses ──
+        # All dynamic_logit supervision is grouped here for clarity.
+        #   1) Sparsity prior: mean(p)         → push all prob toward 0
+        #   2) Gate-deform:   (1-p)*||d_raw||  → push large-deform prob toward 1
+        #   3) Flow supervision: BCE(prob_map, flow_mag/τ) → pixel-level GT
+        if dataset.use_dynamic_sep and iteration >= opt.warm_up:
+            # (1) Sparsity prior
+            if opt.lambda_dynamic_sparse > 0:
+                _sparse_loss = dynamic_sparsity_loss(_dynamic_prob)
+                loss = loss + opt.lambda_dynamic_sparse * _sparse_loss
+                if tb_writer and iteration % 100 == 0:
+                    tb_writer.add_scalar('train_loss_patches/dynamic_sparse', _sparse_loss.item(), iteration)
 
-        # ── Loss 1: Dynamic sparsity prior — push prob toward 0 (most Gaussians are static) ──
-        if dataset.use_dynamic_sep and opt.lambda_dynamic_sparse > 0 and iteration >= opt.warm_up:
-            _sparse_loss = dynamic_sparsity_loss(_dynamic_prob)
-            loss = loss + opt.lambda_dynamic_sparse * _sparse_loss
-            if tb_writer and iteration % 100 == 0:
-                tb_writer.add_scalar('train_loss_patches/dynamic_sparse', _sparse_loss.item(), iteration)
+            # (2) Gate-deform consistency
+            if opt.lambda_gate_deform > 0 and torch.is_tensor(_d_xyz_raw):
+                _gate_loss = gate_deform_consistency_loss(_dynamic_prob, _d_xyz_raw)
+                loss = loss + opt.lambda_gate_deform * _gate_loss
+                if tb_writer and iteration % 100 == 0:
+                    tb_writer.add_scalar('train_loss_patches/gate_deform', _gate_loss.item(), iteration)
 
-        # ── Loss 2: Gate-deform consistency — large raw deform ⇒ high dynamic_prob ──
-        if (dataset.use_dynamic_sep and opt.lambda_gate_deform > 0
-                and iteration >= opt.warm_up and torch.is_tensor(_d_xyz_raw)):
-            _gate_loss = gate_deform_consistency_loss(_dynamic_prob, _d_xyz_raw)
-            loss = loss + opt.lambda_gate_deform * _gate_loss
-            if tb_writer and iteration % 100 == 0:
-                tb_writer.add_scalar('train_loss_patches/gate_deform', _gate_loss.item(), iteration)
+            # (3) Flow-supervised dynamic probability
+            if (opt.lambda_flow_dynamic > 0
+                    and flow_loss is not None
+                    and flow_gt is not None):
+                _prob_map = render_dynamic_prob_map(
+                    viewpoint_cam, gaussians, _dynamic_prob,
+                    pipe, opt.mult, d_xyz, d_rotation, d_scaling,
+                    dataset.is_6dof,
+                )
+                _flow_dyn_loss = flow_dynamic_supervision_loss(
+                    _prob_map, flow_gt, flow_mask, opt.flow_dynamic_thresh,
+                )
+                loss = loss + opt.lambda_flow_dynamic * _flow_dyn_loss
+                if tb_writer and iteration % 100 == 0:
+                    tb_writer.add_scalar('train_loss_patches/flow_dynamic', _flow_dyn_loss.item(), iteration)
 
         if _enable_phase_timer:
             torch.cuda.synchronize()
@@ -607,6 +623,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
     logger.info("Dash time: %.2fs", total_time)
     print(f"Gaussian number: {gaussians._xyz.shape[0]}")
     print(f"Dash time: {total_time:.2f}s")
+
+    # Flush & close TensorBoard writer so all events are written to disk
+    if tb_writer is not None:
+        tb_writer.flush()
+        tb_writer.close()
 
 
 def prepare_output_and_logger(dataset, opt, pipe):
