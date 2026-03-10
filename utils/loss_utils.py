@@ -24,34 +24,42 @@ def flow_dynamic_supervision_loss(
     flow_gt: torch.Tensor,
     flow_mask: torch.Tensor,
     flow_thresh: float = 3.0,
+    invalid_weight: float = 0.2,
+    target_gamma: float = 1.5,
 ) -> torch.Tensor:
-    """Supervised dynamic-prob loss using optical flow magnitude as soft target.
+    """Flow-supervised dynamic-prob loss with soft consistency weighting.
 
-    For each pixel, the target dynamic probability is derived from the GT flow
-    magnitude:  ``target = clamp(||flow_gt|| / flow_thresh, 0, 1)``.
-
-    A masked BCE loss is computed between the rendered prob map and this target.
+    Best-practice choices here:
+      1) Use flow magnitude as *soft* dynamic target.
+      2) Keep consistency info as confidence (weight), not hard masking.
+         This avoids supervision holes while still down-weighting unreliable areas.
 
     Args:
-        prob_map: (1, H, W) or (3, H, W)  Alpha-blended dynamic prob image.
-        flow_gt:  (2, H, W)  Ground-truth optical flow.
-        flow_mask: (1, H, W) boolean validity mask.
-        flow_thresh: Flow magnitude (px) that maps to target=1.  Motions below
-            this threshold get a proportionally lower target.
+        prob_map: (1, H, W) or (3, H, W), rendered dynamic probability map.
+        flow_gt: (2, H, W), GT optical flow.
+        flow_mask: (1, H, W) bool/float consistency mask, optional.
+        flow_thresh: Motion scale (px) used in target normalization.
+        invalid_weight: Minimum weight for low-confidence pixels in [0, 1].
+        target_gamma: Gamma > 1 suppresses tiny motions; < 1 amplifies them.
     """
-    # Soft target from flow magnitude
-    flow_mag = flow_gt.norm(dim=0, keepdim=True)           # (1, H, W)
-    target = (flow_mag / max(flow_thresh, 1e-6)).clamp(0, 1)  # (1, H, W)
+    pred = prob_map[:1].clamp(1e-6, 1.0 - 1e-6)  # (1, H, W)
 
-    pred = prob_map[:1]  # take first channel, (1, H, W)
-    pred = pred.clamp(1e-6, 1.0 - 1e-6)  # numerical safety for BCE
+    # Soft target from motion magnitude; gamma suppresses camera/noise micro-motion.
+    flow_mag = flow_gt.norm(dim=0, keepdim=True)  # (1, H, W)
+    target = (flow_mag / max(flow_thresh, 1e-6)).clamp(0, 1)
+    target = target.pow(max(target_gamma, 1e-6))
 
-    mask = flow_mask[:1].bool() if flow_mask is not None else torch.ones_like(pred, dtype=torch.bool)
-    valid = mask.sum()
-    if valid == 0:
-        return pred.new_zeros(())
+    # Confidence weight map: avoid hard holes by assigning a non-zero floor weight.
+    if flow_mask is None:
+        conf = torch.ones_like(target)
+    else:
+        conf = flow_mask[:1].float().clamp(0.0, 1.0)
+    base_w = float(max(0.0, min(1.0, invalid_weight)))
+    weight = base_w + (1.0 - base_w) * conf
 
-    return F.binary_cross_entropy(pred[mask], target[mask])
+    bce = F.binary_cross_entropy(pred, target, reduction="none")
+    wsum = weight.sum().clamp_min(1e-6)
+    return (bce * weight).sum() / wsum
 
 
 def dynamic_sparsity_loss(prob: torch.Tensor) -> torch.Tensor:

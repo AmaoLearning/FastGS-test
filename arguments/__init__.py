@@ -126,6 +126,8 @@ class OptimizationParams(ParamGroup):
         self.lambda_gate_deform = 0.1      # gate-deform consistency: large raw deform → high dynamic_prob
         self.lambda_flow_dynamic = 0.1     # flow-supervised dynamic prob (render prob map vs flow GT)
         self.flow_dynamic_thresh = 3.0     # flow magnitude (px) mapping to target=1 for dynamic supervision
+        self.flow_dynamic_invalid_weight = 0.2  # non-zero weight for inconsistent pixels (avoid holes)
+        self.flow_dynamic_target_gamma = 1.5    # suppress micro-motion noise in flow->target mapping
         self.dynamic_sep_temp_init = 1.0   # sigmoid temperature at start (soft)
         self.dynamic_sep_temp_final = 0.05 # sigmoid temperature at end (near-binary)
         self.percent_dense = 0.01

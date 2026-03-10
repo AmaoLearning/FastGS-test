@@ -418,7 +418,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                     dataset.is_6dof,
                 )
                 _flow_dyn_loss = flow_dynamic_supervision_loss(
-                    _prob_map, flow_gt, flow_mask, opt.flow_dynamic_thresh,
+                    _prob_map,
+                    flow_gt,
+                    flow_mask,
+                    opt.flow_dynamic_thresh,
+                    opt.flow_dynamic_invalid_weight,
+                    opt.flow_dynamic_target_gamma,
                 )
                 loss = loss + opt.lambda_flow_dynamic * _flow_dyn_loss
                 if tb_writer and iteration % 100 == 0:
