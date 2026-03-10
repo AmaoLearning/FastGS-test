@@ -16,6 +16,7 @@ dependencies:
   - tqdm
   - plyfile
   - pip:
+    - "numpy<2.0.0"
     - websockets
     - opencv-python
     - imageio

@@ -74,18 +74,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
         deform = DeformModel(dataset.is_blender, dataset.is_6dof)
     deform.train_setting(opt)
 
-    # torch.compile: fuse small Linear+ReLU kernels in the deform MLP to
-    # reduce per-layer kernel launch overhead (~8 layers × 5μs ≈ 40μs/iter).
-    # Uses 'default' mode (inductor, no CUDA graphs) to tolerate dynamic
-    # shapes during densification.  Guards against older PyTorch (<2.0).
-    try:
-        deform.deform = torch.compile(deform.deform, mode="default", dynamic=True)
-        logger.info("Deform network compiled with torch.compile (inductor)")
-        print("[INFO] Deform network compiled with torch.compile (inductor)")
-    except Exception as _e:
-        logger.info("torch.compile unavailable: %s, using eager mode", _e)
-        print(f"[INFO] torch.compile unavailable: {_e}, using eager mode")
-
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt, args)
 
