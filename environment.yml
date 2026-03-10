@@ -22,6 +22,7 @@ dependencies:
     - imageio
     - lpips
     - scipy
+    - tensorboard
     - submodules/diff-gaussian-rasterization_fastgs
     - submodules/diff-flow-rasterization
     - submodules/simple-knn
