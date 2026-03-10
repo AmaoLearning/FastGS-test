@@ -38,7 +38,7 @@ import random
 from utils.fast_utils import compute_gaussian_score_fastgs, sampling_cameras
 from utils.flow_rasterizer import FlowRasterizerHelper, OpticalFlowLoss
 from utils.optic_flow_utils import load_precomputed_flow
-from utils.cluster_utils import cluster_dynamic_gaussians
+from utils.cluster_utils import cluster_dynamic_gaussians, render_cluster_pseudocolor
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: bool = False,
@@ -527,6 +527,36 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                     )
                     # Store labels on gaussians for downstream use
                     gaussians._cluster_labels = cluster_result["labels"]
+
+                    # ── Debug: pseudo-color render of cluster labels ──
+                    # cam00 defaults to test set; use test cameras for viewpoint
+                    _test_cams = scene.getTestCameras()
+                    _debug_cam = None
+                    for _c in _test_cams:
+                        if 'cam00' in _c.image_name and float(_c.fid.item()) < 1e-4:
+                            _debug_cam = _c
+                            break
+                    if _debug_cam is None:  # fallback: first camera with fid ~= 0
+                        _sorted = sorted(_test_cams, key=lambda c: c.fid.item())
+                        _debug_cam = _sorted[0]
+                    scene.ensure_cameras_loaded([_debug_cam])
+                    _vis_path = os.path.join(
+                        dataset.model_path, "cluster",
+                        f"cluster_vis_iter{iteration}.png")
+                    render_cluster_pseudocolor(
+                        gaussians,
+                        labels=cluster_result["labels"],
+                        viewpoint_cam=_debug_cam,
+                        deform=deform,
+                        pipe=pipe,
+                        bg_color=background,
+                        mult=opt.mult,
+                        is_6dof=dataset.is_6dof,
+                        save_path=_vis_path,
+                        tb_writer=tb_writer,
+                        iteration=iteration,
+                    )
+                    scene.release_cameras([_debug_cam])
             
             
             if iteration < opt.iterations:

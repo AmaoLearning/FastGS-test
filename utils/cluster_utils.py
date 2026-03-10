@@ -336,3 +336,155 @@ def cluster_dynamic_gaussians(
         "n_dynamic": n_dynamic,
         "metrics": metrics,
     }
+
+
+# ---------------------------------------------------------------------------
+# Debug pseudo-color render
+# ---------------------------------------------------------------------------
+
+# 8 high-contrast colors (Tab10-inspired) for cluster visualisation
+_CLUSTER_PALETTE = torch.tensor([
+    [1.00, 0.20, 0.20],   # red
+    [0.20, 0.60, 1.00],   # blue
+    [0.17, 0.80, 0.27],   # green
+    [1.00, 0.60, 0.00],   # orange
+    [0.60, 0.30, 0.90],   # purple
+    [0.00, 0.80, 0.80],   # cyan
+    [0.96, 0.80, 0.00],   # yellow
+    [0.96, 0.40, 0.70],   # pink
+], dtype=torch.float32)  # (8, 3)
+
+_STATIC_COLOR = torch.tensor([0.15, 0.15, 0.15], dtype=torch.float32)  # dark grey
+
+
+def render_cluster_pseudocolor(
+    gaussians,
+    labels: torch.Tensor,
+    viewpoint_cam,
+    deform,
+    pipe,
+    bg_color: torch.Tensor,
+    mult: float,
+    is_6dof: bool = False,
+    save_path: Optional[str] = None,
+    tb_writer=None,
+    iteration: int = 0,
+) -> torch.Tensor:
+    """Render a pseudo-color image where each dynamic cluster has a distinct colour.
+
+    Static Gaussians (label == -1) are rendered dark grey.
+    Dynamic Gaussians are coloured by their cluster label (0..K-1).
+
+    The function temporarily hijacks the rendering pipeline by calling the
+    rasterizer directly with ``colors_precomp`` instead of SH features,
+    leaving the original GaussianModel untouched.
+
+    Args:
+        gaussians: GaussianModel with clustering labels.
+        labels: (N,) int32 tensor, -1 = static, >=0 = cluster id.
+        viewpoint_cam: Camera object (cam00, fid=0).
+        deform: Deformation network.
+        pipe: PipelineParams.
+        bg_color: Background colour tensor (3,) on GPU.
+        mult: FastGS mult parameter.
+        is_6dof: Whether this is a 6-DoF scene.
+        save_path: If provided, save the rendered image as PNG.
+        tb_writer: Optional TensorBoard writer.
+        iteration: Current training iteration.
+
+    Returns:
+        rendered_image – (3, H, W) float tensor in [0, 1].
+    """
+    import math
+    import os
+    from diff_gaussian_rasterization_fastgs import (
+        GaussianRasterizationSettings,
+        GaussianRasterizer,
+    )
+    from utils.rigid_utils import from_homogenous, to_homogenous
+
+    N = gaussians.get_xyz.shape[0]
+
+    # ── 1. Build per-Gaussian pseudo colour ──
+    palette = _CLUSTER_PALETTE.to(device="cuda")  # (8, 3)
+    static_c = _STATIC_COLOR.to(device="cuda")    # (3,)
+
+    colors = static_c.unsqueeze(0).expand(N, 3).clone()  # default: dark grey
+    for c_id in range(palette.shape[0]):
+        mask = labels == c_id
+        if mask.any():
+            colors[mask] = palette[c_id]
+
+    # ── 2. Compute deformation at viewpoint time ──
+    with torch.no_grad():
+        fid = viewpoint_cam.fid
+        xyz = gaussians.get_xyz
+        time_input = fid.unsqueeze(0).expand(N, -1)
+        d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input)
+
+        if is_6dof and torch.is_tensor(d_xyz):
+            means3D = from_homogenous(
+                torch.bmm(d_xyz, to_homogenous(xyz).unsqueeze(-1)).squeeze(-1))
+        elif torch.is_tensor(d_xyz):
+            means3D = xyz + d_xyz
+        else:
+            means3D = xyz
+
+        scales = gaussians.get_scaling + (d_scaling if torch.is_tensor(d_scaling) else 0)
+        rotations = gaussians.get_rotation + (d_rotation if torch.is_tensor(d_rotation) else 0)
+        opacity = gaussians.get_opacity
+
+    # ── 3. Set up rasterizer ──
+    tanfovx = math.tan(viewpoint_cam.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_cam.FoVy * 0.5)
+    H, W = int(viewpoint_cam.image_height), int(viewpoint_cam.image_width)
+
+    screenspace_points = torch.zeros(N, 4, dtype=torch.float32, device="cuda")
+    metric_map = torch.zeros(H * W, dtype=torch.int, device="cuda")
+
+    raster_settings = GaussianRasterizationSettings(
+        image_height=H,
+        image_width=W,
+        tanfovx=tanfovx,
+        tanfovy=tanfovy,
+        bg=bg_color,
+        scale_modifier=1.0,
+        viewmatrix=viewpoint_cam.world_view_transform,
+        projmatrix=viewpoint_cam.full_proj_transform,
+        sh_degree=0,  # irrelevant — using colors_precomp
+        campos=viewpoint_cam.camera_center,
+        mult=mult,
+        prefiltered=False,
+        debug=False,
+        get_flag=None,
+        metric_map=metric_map,
+    )
+
+    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+
+    # ── 4. Rasterize with precomputed colors ──
+    with torch.no_grad():
+        rendered_image, _, _, _ = rasterizer(
+            means3D=means3D,
+            means2D=screenspace_points,
+            opacities=opacity,
+            colors_precomp=colors,  # (N, 3) — bypass SH entirely
+            scales=scales,
+            rotations=rotations,
+        )
+
+    rendered_image = rendered_image.clamp(0.0, 1.0)
+
+    # ── 5. Save / log ──
+    if save_path is not None:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        import torchvision
+        torchvision.utils.save_image(rendered_image, save_path)
+        _msg = f"[CLUSTER-VIS] Pseudo-color render saved to {save_path}"
+        logger.info(_msg)
+        print(_msg)
+
+    if tb_writer is not None:
+        tb_writer.add_image("cluster/pseudocolor", rendered_image, iteration)
+
+    return rendered_image
