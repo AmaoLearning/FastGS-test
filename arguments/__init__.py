@@ -77,6 +77,13 @@ class ModelParams(ParamGroup):
         self.use_dynamic_sep = False   # 启用软动静分离：使用可学习动态概率混合形变与零向量
         self.log_deform_hist = False   # 每隔3000轮记录全局形变分布柱状图
 
+        # dynamic Gaussian clustering (after first final_prune)
+        self.cluster_n_clusters = 8        # KMeans 聚类数
+        self.cluster_dynamic_thresh = 0.5  # 动态概率阈值，仅 prob > thresh 的高斯参与聚类
+        self.cluster_w_xyz = 1.0           # 聚类特征权重：3D 位置
+        self.cluster_w_color = 0.5         # 聚类特征权重：SH 0阶 (RGB)
+        self.cluster_w_motion = 1.0        # 聚类特征权重：历史平均形变
+
         # optical flow loss（使用形变场有限差分 + diff-flow-rasterization）
         self.use_flow_loss = False  # 是否启用投影光流损失
         self.use_flow_mask = False  # 是否启用光流掩码引导致密化（可独立于 flow loss 使用）

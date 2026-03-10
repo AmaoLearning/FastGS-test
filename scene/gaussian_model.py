@@ -45,6 +45,8 @@ class GaussianModel:
         self.xyz_gradient_accum_abs = torch.empty(0)
         self.flow_loss_accum = torch.empty(0)
         self.flow_denom = torch.empty(0)
+        self._deform_accum = torch.empty(0)   # (N, 3) accumulated d_xyz
+        self._deform_denom = torch.empty(0)   # (N, 1) count
 
         self.optimizer = None
         self.shoptimizer = None
@@ -134,6 +136,8 @@ class GaussianModel:
         dynamic_logits = torch.zeros((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda")
         self._dynamic_logit = nn.Parameter(dynamic_logits.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self._deform_accum = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
+        self._deform_denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
     def training_setup(self, training_args, args):
         self.percent_dense = training_args.percent_dense
@@ -142,6 +146,8 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.flow_loss_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.flow_denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self._deform_accum = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
+        self._deform_denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
         self.spatial_lr_scale = 5
 
@@ -336,6 +342,8 @@ class GaussianModel:
         self.xyz_gradient_accum_abs = self.xyz_gradient_accum_abs[valid_points_mask]
         self.flow_loss_accum = self.flow_loss_accum[valid_points_mask]
         self.flow_denom = self.flow_denom[valid_points_mask]
+        self._deform_accum = self._deform_accum[valid_points_mask]
+        self._deform_denom = self._deform_denom[valid_points_mask]
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
@@ -383,6 +391,13 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
         self._dynamic_logit = optimizable_tensors["dynamic_logit"]
 
+        # Extend global deform accumulators for newly added Gaussians
+        _n_new = new_xyz.shape[0]
+        self._deform_accum = torch.cat([self._deform_accum,
+                                         torch.zeros(_n_new, 3, device="cuda")], dim=0)
+        self._deform_denom = torch.cat([self._deform_denom,
+                                         torch.zeros(_n_new, 1, device="cuda")], dim=0)
+
         self.zero_accums()
 
     def zero_accums(self):
@@ -392,6 +407,22 @@ class GaussianModel:
         self.flow_loss_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.flow_denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        # NOTE: do NOT reset _deform_accum/_deform_denom here — they accumulate globally
+
+    def reset_deform_accums(self):
+        """Reset deformation history accumulators (call after clustering)."""
+        self._deform_accum = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
+        self._deform_denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+
+    def add_deform_stats(self, d_xyz: torch.Tensor) -> None:
+        """Accumulate per-Gaussian deformation for motion history."""
+        self._deform_accum += d_xyz.detach()
+        self._deform_denom += 1
+
+    def get_mean_deform(self) -> torch.Tensor:
+        """Return per-Gaussian mean deformation (N, 3). Zero if no history."""
+        denom = self._deform_denom.clamp(min=1)
+        return self._deform_accum / denom
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]

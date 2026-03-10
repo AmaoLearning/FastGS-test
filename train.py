@@ -38,6 +38,7 @@ import random
 from utils.fast_utils import compute_gaussian_score_fastgs, sampling_cameras
 from utils.flow_rasterizer import FlowRasterizerHelper, OpticalFlowLoss
 from utils.optic_flow_utils import load_precomputed_flow
+from utils.cluster_utils import cluster_dynamic_gaussians
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: bool = False,
@@ -165,6 +166,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
         print(f"[PROFILE] Will capture {profile_steps} iterations starting at iter {profile_start}")
         print(f"[PROFILE] Trace output: {trace_dir}")
         print(f"[PROFILE] Phase timer enabled — prints breakdown every {_PHASE_REPORT_INTERVAL} iters")
+    _clustering_done = False  # ensures dynamic clustering runs only once
 
     for iteration in range(1, opt.iterations + 1):
         # Start profiler at the designated iteration
@@ -275,6 +277,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                         plt.close(fig)
                     except ImportError:
                         pass  # matplotlib not available, skip figure
+
+            # Accumulate deformation history for clustering motion features
+            if torch.is_tensor(d_xyz) and dataset.use_dynamic_sep:
+                gaussians.add_deform_stats(d_xyz)
 
         if _enable_phase_timer:
             torch.cuda.synchronize()
@@ -498,6 +504,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 scene.release_cameras(camlist)
 
                 gaussians.final_prune_fastgs(min_opacity = 0.1, pruning_score = pruning_score)
+
+                # ── Dynamic Gaussian clustering (once, after first final_prune) ──
+                if (dataset.use_dynamic_sep
+                        and not _clustering_done
+                        and iteration > opt.final_prune_from_iter):
+                    _clustering_done = True
+                    _cluster_save = os.path.join(
+                        dataset.model_path, "cluster",
+                        f"cluster_iter{iteration}.npz")
+                    cluster_result = cluster_dynamic_gaussians(
+                        gaussians,
+                        dynamic_thresh=dataset.cluster_dynamic_thresh,
+                        n_clusters=dataset.cluster_n_clusters,
+                        w_xyz=dataset.cluster_w_xyz,
+                        w_color=dataset.cluster_w_color,
+                        w_motion=dataset.cluster_w_motion,
+                        temperature=_dyn_temp if '_dyn_temp' in dir() else 1.0,
+                        tb_writer=tb_writer,
+                        iteration=iteration,
+                        save_path=_cluster_save,
+                    )
+                    # Store labels on gaussians for downstream use
+                    gaussians._cluster_labels = cluster_result["labels"]
             
             
             if iteration < opt.iterations:
