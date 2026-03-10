@@ -15,7 +15,9 @@ import logging
 import traceback
 import torch
 from random import randint
-from utils.loss_utils import l1_loss, ssim, kl_divergence, l2_loss, binary_entropy_polarization_loss
+from utils.loss_utils import (l1_loss, ssim, kl_divergence, l2_loss,
+                              binary_entropy_polarization_loss,
+                              dynamic_sparsity_loss, gate_deform_consistency_loss)
 from gaussian_renderer import render_fastgs, network_gui
 import sys
 from scene import Scene, GaussianModel, DeformModel, DeformModel_4DGS
@@ -214,6 +216,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
 
         if iteration < opt.warm_up:
             d_xyz, d_rotation, d_scaling = 0.0, 0.0, 0.0
+            _d_xyz_raw = 0.0
         else:
             N = gaussians.get_xyz.shape[0]
             time_input = fid.unsqueeze(0).expand(N, -1)
@@ -226,6 +229,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             # Gate each Gaussian's deformation with a learnable dynamic probability.
             # Temperature annealing: sigmoid(logit / tau) with tau decaying over
             # training, gradually sharpening the soft gate toward a hard 0/1 mask.
+            # Keep raw deformation for gate-deform consistency loss & accumulation.
+            _d_xyz_raw = d_xyz  # (N, 3), unmodified output from deform network
             if dataset.use_dynamic_sep:
                 _temp_progress = max(0.0, min(1.0, (iteration - opt.warm_up) / max(1, opt.iterations - opt.warm_up)))
                 _dyn_temp = opt.dynamic_sep_temp_init * (opt.dynamic_sep_temp_final / max(opt.dynamic_sep_temp_init, 1e-8)) ** _temp_progress
@@ -266,9 +271,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                     except ImportError:
                         pass  # matplotlib not available, skip figure
 
-            # Accumulate deformation history for clustering motion features
+            # Accumulate RAW (pre-gate) deformation for clustering & pseudo-labels.
+            # Using gated d_xyz would undercount motion for prob≈0.5 Gaussians.
             if torch.is_tensor(d_xyz) and dataset.use_dynamic_sep:
-                gaussians.add_deform_stats(d_xyz)
+                gaussians.add_deform_stats(_d_xyz_raw)
 
         if _enable_phase_timer:
             torch.cuda.synchronize()
@@ -380,13 +386,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 tb_writer.add_scalar('train_loss_patches/hexplane_tv', _tv_loss.item(), iteration)
                 tb_writer.add_scalar('train_loss_patches/hexplane_l1', _l1_loss.item(), iteration)
 
-        # ── Dynamic-prob entropy polarisation loss ──
-        # Minimise binary entropy to push dynamic_prob toward 0 or 1.
+        # ── Dynamic-prob entropy polarisation loss (legacy, keep for ablation) ──
         if dataset.use_dynamic_sep and opt.lambda_dynamic_polar > 0:
             _polar_loss = binary_entropy_polarization_loss(gaussians.get_dynamic_prob)
             loss = loss + opt.lambda_dynamic_polar * _polar_loss
             if tb_writer and iteration % 100 == 0:
                 tb_writer.add_scalar('train_loss_patches/dynamic_polar', _polar_loss.item(), iteration)
+
+        # ── Loss 1: Dynamic sparsity prior — push prob toward 0 (most Gaussians are static) ──
+        if dataset.use_dynamic_sep and opt.lambda_dynamic_sparse > 0 and iteration >= opt.warm_up:
+            _sparse_loss = dynamic_sparsity_loss(_dynamic_prob)
+            loss = loss + opt.lambda_dynamic_sparse * _sparse_loss
+            if tb_writer and iteration % 100 == 0:
+                tb_writer.add_scalar('train_loss_patches/dynamic_sparse', _sparse_loss.item(), iteration)
+
+        # ── Loss 2: Gate-deform consistency — large raw deform ⇒ high dynamic_prob ──
+        if (dataset.use_dynamic_sep and opt.lambda_gate_deform > 0
+                and iteration >= opt.warm_up and torch.is_tensor(_d_xyz_raw)):
+            _gate_loss = gate_deform_consistency_loss(_dynamic_prob, _d_xyz_raw)
+            loss = loss + opt.lambda_gate_deform * _gate_loss
+            if tb_writer and iteration % 100 == 0:
+                tb_writer.add_scalar('train_loss_patches/gate_deform', _gate_loss.item(), iteration)
 
         if _enable_phase_timer:
             torch.cuda.synchronize()

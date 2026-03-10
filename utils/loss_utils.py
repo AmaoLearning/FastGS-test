@@ -19,6 +19,29 @@ def l1_loss(network_output, gt):
     return torch.abs((network_output - gt)).mean()
 
 
+def dynamic_sparsity_loss(prob: torch.Tensor) -> torch.Tensor:
+    """Sparsity prior: encourage most Gaussians to be static (prob → 0).
+
+    L_sparse = mean(p_i)
+    """
+    return prob.mean()
+
+
+def gate_deform_consistency_loss(
+    prob: torch.Tensor,
+    d_xyz_raw: torch.Tensor,
+) -> torch.Tensor:
+    """Gate–deform consistency: if raw deformation is large, prob must be high.
+
+    L_gate = mean( (1 - p_i) * ||stop_grad(d_xyz_raw_i)||_2 )
+
+    The stop-gradient on d_xyz_raw ensures this loss only trains dynamic_logit
+    without disturbing the deformation network.
+    """
+    deform_mag = d_xyz_raw.detach().norm(dim=-1, keepdim=True)  # (N, 1)
+    return ((1.0 - prob) * deform_mag).mean()
+
+
 def binary_entropy_polarization_loss(prob: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """Mean binary entropy over a batch of probabilities.
 
