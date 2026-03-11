@@ -42,10 +42,10 @@ def flow_dynamic_supervision_loss(
         invalid_weight: Minimum weight for low-confidence pixels in [0, 1].
         target_gamma: Gamma > 1 suppresses tiny motions; < 1 amplifies them.
     """
-    pred = prob_map[:1].clamp(1e-6, 1.0 - 1e-6)  # (1, H, W)
+    pred = prob_map[:1].float().clamp(1e-6, 1.0 - 1e-6)  # (1, H, W)
 
     # Soft target from motion magnitude; gamma suppresses camera/noise micro-motion.
-    flow_mag = flow_gt.norm(dim=0, keepdim=True)  # (1, H, W)
+    flow_mag = flow_gt.float().norm(dim=0, keepdim=True)  # (1, H, W)
     target = (flow_mag / max(flow_thresh, 1e-6)).clamp(0, 1)
     target = target.pow(max(target_gamma, 1e-6))
 
