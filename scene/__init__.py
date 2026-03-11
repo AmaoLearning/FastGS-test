@@ -56,7 +56,7 @@ class Scene:
         self._prefetch_ready: Optional[Tuple[int, int, torch.cuda.Event]] = None
         self._viewpoint_stack: list = []  # for non-lazy random sampling
 
-        load_flow = getattr(args, 'use_flow_loss', False)
+        load_flow = getattr(args, 'use_flow_loss', False) or getattr(args, 'use_flow_mask', False) or getattr(args, 'use_dynamic_sep', False)
         self._load_flow: bool = load_flow
 
         # Number of *temporal* frames (used for time_interval in velocity
