@@ -39,7 +39,7 @@ class GaussianModel:
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
-        self._dynamic_logit = torch.empty(0)
+        self._is_static = torch.empty(0)  # bool (N,1): True = static (SfM), False = dynamic (random init)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.xyz_gradient_accum_abs = torch.empty(0)
@@ -92,16 +92,14 @@ class GaussianModel:
         return self.opacity_activation(self._opacity)
 
     @property
-    def get_dynamic_prob(self):
-        return torch.sigmoid(self._dynamic_logit)
+    def get_is_static(self) -> torch.Tensor:
+        """Boolean mask (N, 1): True for static Gaussians."""
+        return self._is_static.bool()
 
-    def get_dynamic_prob_t(self, temperature: float = 1.0) -> torch.Tensor:
-        """Dynamic probability with temperature-scaled sigmoid.
-
-        As *temperature* → 0 the sigmoid approaches a step function,
-        producing near-binary outputs (0 or 1).
-        """
-        return torch.sigmoid(self._dynamic_logit / max(temperature, 1e-8))
+    @property
+    def get_is_dynamic(self) -> torch.Tensor:
+        """Boolean mask (N, 1): True for dynamic Gaussians."""
+        return ~self._is_static.bool()
 
     def get_covariance(self, scaling_modifier=1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
@@ -110,34 +108,60 @@ class GaussianModel:
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
-    def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float):
+    def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float,
+                        num_dynamic_gaussians: int = 0):
+        """Initialise Gaussians from SfM point cloud (static) + random points (dynamic).
+
+        Following GauFRe (Liang et al., 2024): SfM points are labelled *static*,
+        randomly-sampled points inside the scene AABB are labelled *dynamic*.
+        The ``_is_static`` flag is a **fixed** boolean — it never receives gradients.
+        """
         self.spatial_lr_scale = 5
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
         fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
-        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
-        features[:, :3, 0] = fused_color
+        n_static = fused_point_cloud.shape[0]
+
+        # ── Random dynamic Gaussians inside scene AABB ──
+        if num_dynamic_gaussians > 0:
+            aabb_min = fused_point_cloud.min(dim=0).values
+            aabb_max = fused_point_cloud.max(dim=0).values
+            dyn_xyz = torch.rand(num_dynamic_gaussians, 3, device="cuda") * (aabb_max - aabb_min) + aabb_min
+            dyn_color = RGB2SH(torch.full((num_dynamic_gaussians, 3), 0.5, device="cuda"))  # neutral grey
+            all_xyz = torch.cat([fused_point_cloud, dyn_xyz], dim=0)
+            all_color = torch.cat([fused_color, dyn_color], dim=0)
+        else:
+            all_xyz = fused_point_cloud
+            all_color = fused_color
+
+        n_total = all_xyz.shape[0]
+        features = torch.zeros((n_total, 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+        features[:, :3, 0] = all_color
         features[:, 3:, 1:] = 0.0
 
-        print("Number of points at initialisation : ", fused_point_cloud.shape[0])
+        print(f"Number of points at initialisation: {n_total}  (static={n_static}, dynamic={num_dynamic_gaussians})")
 
-        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
+        dist2 = torch.clamp_min(distCUDA2(all_xyz), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
-        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+        rots = torch.zeros((n_total, 4), device="cuda")
         rots[:, 0] = 1
 
-        opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        opacities = inverse_sigmoid(0.1 * torch.ones((n_total, 1), dtype=torch.float, device="cuda"))
 
-        self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
+        self._xyz = nn.Parameter(all_xyz.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True))
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
-        dynamic_logits = torch.zeros((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda")
-        self._dynamic_logit = nn.Parameter(dynamic_logits.requires_grad_(True))
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        self._deform_accum = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
-        self._deform_denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+
+        # _is_static: fixed label, NOT an nn.Parameter, no gradient
+        is_static = torch.ones((n_total, 1), dtype=torch.float, device="cuda")
+        is_static[n_static:] = 0.0  # dynamic Gaussians
+        self._is_static = is_static
+
+        self.max_radii2D = torch.zeros((n_total,), device="cuda")
+        self._deform_accum = torch.zeros((n_total, 3), device="cuda")
+        self._deform_denom = torch.zeros((n_total, 1), device="cuda")
 
     def training_setup(self, training_args, args):
         self.percent_dense = training_args.percent_dense
@@ -157,7 +181,6 @@ class GaussianModel:
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
-            {'params': [self._dynamic_logit], 'lr': training_args.dynamic_prob_lr, "name": "dynamic_logit"}
         ]
         sh_l = [{'params': [self._features_rest], 'lr': args.highfeature_lr / 20.0, "name": "f_rest"}]
 
@@ -184,7 +207,7 @@ class GaussianModel:
         for i in range(self._features_rest.shape[1] * self._features_rest.shape[2]):
             l.append('f_rest_{}'.format(i))
         l.append('opacity')
-        l.append('dynamic_logit')
+        l.append('is_static')
         for i in range(self._scaling.shape[1]):
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
@@ -199,14 +222,14 @@ class GaussianModel:
         f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
-        dynamic_logits = self._dynamic_logit.detach().cpu().numpy()
+        is_static = self._is_static.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, dynamic_logits, scale, rotation), axis=1)
+        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, is_static, scale, rotation), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -224,10 +247,14 @@ class GaussianModel:
                         np.asarray(plydata.elements[0]["y"]),
                         np.asarray(plydata.elements[0]["z"])), axis=1)
         opacities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
-        if "dynamic_logit" in plydata.elements[0].data.dtype.names:
-            dynamic_logits = np.asarray(plydata.elements[0]["dynamic_logit"])[..., np.newaxis]
+        if "is_static" in plydata.elements[0].data.dtype.names:
+            is_static = np.asarray(plydata.elements[0]["is_static"])[..., np.newaxis]
+        elif "dynamic_logit" in plydata.elements[0].data.dtype.names:
+            # Legacy: convert old dynamic_logit → is_static (logit < 0 → static)
+            _dl = np.asarray(plydata.elements[0]["dynamic_logit"])[..., np.newaxis]
+            is_static = (_dl < 0.0).astype(np.float32)
         else:
-            dynamic_logits = np.zeros((xyz.shape[0], 1), dtype=np.float32)
+            is_static = np.ones((xyz.shape[0], 1), dtype=np.float32)  # default: all static
 
         features_dc = np.zeros((xyz.shape[0], 3, 1))
         features_dc[:, 0, 0] = np.asarray(plydata.elements[0]["f_dc_0"])
@@ -260,9 +287,7 @@ class GaussianModel:
             torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(
                 True))
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._dynamic_logit = nn.Parameter(
-            torch.tensor(dynamic_logits, dtype=torch.float, device="cuda").requires_grad_(True)
-        )
+        self._is_static = torch.tensor(is_static, dtype=torch.float, device="cuda")  # fixed label, no gradient
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
 
@@ -336,7 +361,8 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
-        self._dynamic_logit = optimizable_tensors["dynamic_logit"]
+
+        self._is_static = self._is_static[valid_points_mask]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
         self.xyz_gradient_accum_abs = self.xyz_gradient_accum_abs[valid_points_mask]
@@ -373,14 +399,13 @@ class GaussianModel:
         return optimizable_tensors
 
     def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
-                              new_rotation, new_dynamic_logit):
+                              new_rotation, new_is_static):
         d = {"xyz": new_xyz,
              "f_dc": new_features_dc,
              "f_rest": new_features_rest,
              "opacity": new_opacities,
              "scaling": new_scaling,
-             "rotation": new_rotation,
-             "dynamic_logit": new_dynamic_logit}
+             "rotation": new_rotation}
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -389,7 +414,9 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
-        self._dynamic_logit = optimizable_tensors["dynamic_logit"]
+
+        # _is_static is NOT in optimizer — concatenate directly
+        self._is_static = torch.cat([self._is_static, new_is_static], dim=0)
 
         # Extend global deform accumulators for newly added Gaussians
         _n_new = new_xyz.shape[0]
@@ -444,9 +471,9 @@ class GaussianModel:
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N, 1, 1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N, 1, 1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N, 1)
-        new_dynamic_logit = self._dynamic_logit[selected_pts_mask].repeat(N, 1)
+        new_is_static = self._is_static[selected_pts_mask].repeat(N, 1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_dynamic_logit)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_is_static)
 
         prune_filter = torch.cat(
             (selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
@@ -465,10 +492,10 @@ class GaussianModel:
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
-        new_dynamic_logit = self._dynamic_logit[selected_pts_mask]
+        new_is_static = self._is_static[selected_pts_mask]
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
-                       new_rotation, new_dynamic_logit)
+                       new_rotation, new_is_static)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom
@@ -503,9 +530,9 @@ class GaussianModel:
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
-        new_dynamic_logit = self._dynamic_logit[selected_pts_mask].repeat(N,1)
+        new_is_static = self._is_static[selected_pts_mask].repeat(N,1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_dynamic_logit)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_is_static)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -520,9 +547,9 @@ class GaussianModel:
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
-        new_dynamic_logit = self._dynamic_logit[selected_pts_mask]
+        new_is_static = self._is_static[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_dynamic_logit)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_is_static)
 
     def densify_and_prune_fastgs(self, max_screen_size, min_opacity, extent, radii, args, importance_score = None, pruning_score = None, flow_mask = None):
         

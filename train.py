@@ -15,7 +15,7 @@ import logging
 import traceback
 import torch
 from random import randint
-from utils.loss_utils import l1_loss, ssim, kl_divergence, l2_loss, binary_entropy_polarization_loss
+from utils.loss_utils import l1_loss, ssim, kl_divergence, l2_loss
 from gaussian_renderer import render_fastgs, network_gui
 import sys
 from scene import Scene, GaussianModel, DeformModel, DeformModel_4DGS
@@ -222,17 +222,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
 
             d_xyz, d_rotation, d_scaling = deform.step(gaussians.get_xyz.detach(), time_input + ast_noise)
 
-            # ── Soft dynamic-static separation ──
-            # Gate each Gaussian's deformation with a learnable dynamic probability.
-            # Temperature annealing: sigmoid(logit / tau) with tau decaying over
-            # training, gradually sharpening the soft gate toward a hard 0/1 mask.
-            if dataset.use_dynamic_sep:
-                _temp_progress = max(0.0, min(1.0, (iteration - opt.warm_up) / max(1, opt.iterations - opt.warm_up)))
-                _dyn_temp = opt.dynamic_sep_temp_init * (opt.dynamic_sep_temp_final / max(opt.dynamic_sep_temp_init, 1e-8)) ** _temp_progress
-                _dynamic_prob = gaussians.get_dynamic_prob_t(_dyn_temp)
-                d_xyz = _dynamic_prob * d_xyz
-                d_rotation = _dynamic_prob * d_rotation
-                d_scaling = _dynamic_prob * d_scaling
+            # ── GauFRe-style static/dynamic separation ──
+            # Zero out deformations for static Gaussians (from SfM).
+            # Only dynamic Gaussians (randomly initialised) receive deformation.
+            if gaussians._is_static.any():
+                _is_dynamic = gaussians.get_is_dynamic.float()  # (N, 1)
+                d_xyz = _is_dynamic * d_xyz
+                d_rotation = _is_dynamic * d_rotation
+                d_scaling = _is_dynamic * d_scaling
 
             # ── Deformation distribution histogram (optional) ──
             if (dataset.log_deform_hist
@@ -244,12 +241,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                     tb_writer.add_scalar('deform/mag_max', _hist_mag.max().item(), iteration)
                     tb_writer.add_scalar('deform/mag_mean', _hist_mag.mean().item(), iteration)
                     tb_writer.add_scalar('deform/mag_median', _hist_mag.median().item(), iteration)
-                    # Also log dynamic_prob stats when dynamic sep is active
-                    if dataset.use_dynamic_sep:
-                        tb_writer.add_histogram('deform/dynamic_prob', _dynamic_prob.squeeze(-1), iteration)
-                        _static_ratio = (_dynamic_prob < 0.5).float().mean().item()
-                        tb_writer.add_scalar('deform/static_ratio', _static_ratio, iteration)
-                        tb_writer.add_scalar('deform/dynamic_sep_temp', _dyn_temp, iteration)
+                    # Log static/dynamic ratio
+                    _n_static = gaussians.get_is_static.sum().item()
+                    _n_total = gaussians.get_xyz.shape[0]
+                    tb_writer.add_scalar('deform/static_ratio', _n_static / max(_n_total, 1), iteration)
                     try:
                         import matplotlib
                         matplotlib.use('Agg')
@@ -267,7 +262,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                         pass  # matplotlib not available, skip figure
 
             # Accumulate deformation history for clustering motion features
-            if torch.is_tensor(d_xyz) and dataset.use_dynamic_sep:
+            if torch.is_tensor(d_xyz):
                 gaussians.add_deform_stats(d_xyz)
 
         if _enable_phase_timer:
@@ -380,14 +375,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 tb_writer.add_scalar('train_loss_patches/hexplane_tv', _tv_loss.item(), iteration)
                 tb_writer.add_scalar('train_loss_patches/hexplane_l1', _l1_loss.item(), iteration)
 
-        # ── Dynamic-prob entropy polarisation loss ──
-        # Minimise binary entropy to push dynamic_prob toward 0 or 1.
-        if dataset.use_dynamic_sep and opt.lambda_dynamic_polar > 0:
-            _polar_loss = binary_entropy_polarization_loss(gaussians.get_dynamic_prob)
-            loss = loss + opt.lambda_dynamic_polar * _polar_loss
-            if tb_writer and iteration % 100 == 0:
-                tb_writer.add_scalar('train_loss_patches/dynamic_polar', _polar_loss.item(), iteration)
-
         if _enable_phase_timer:
             torch.cuda.synchronize()
             _phase_accum["loss_fwd"] += time.perf_counter() - _t0
@@ -494,21 +481,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 gaussians.final_prune_fastgs(min_opacity = 0.1, pruning_score = pruning_score)
 
                 # ── Dynamic Gaussian clustering (once, after first final_prune) ──
-                if (dataset.use_dynamic_sep
-                        and not _clustering_done
-                        and iteration > opt.final_prune_from_iter):
+                if (not _clustering_done
+                        and iteration > opt.final_prune_from_iter
+                        and dataset.num_dynamic_gaussians > 0):
                     _clustering_done = True
                     _cluster_save = os.path.join(
                         dataset.model_path, "cluster",
                         f"cluster_iter{iteration}.npz")
                     cluster_result = cluster_dynamic_gaussians(
                         gaussians,
-                        dynamic_thresh=dataset.cluster_dynamic_thresh,
                         n_clusters=dataset.cluster_n_clusters,
                         w_xyz=dataset.cluster_w_xyz,
                         w_color=dataset.cluster_w_color,
                         w_motion=dataset.cluster_w_motion,
-                        temperature=_dyn_temp if '_dyn_temp' in dir() else 1.0,
                         tb_writer=tb_writer,
                         iteration=iteration,
                         save_path=_cluster_save,

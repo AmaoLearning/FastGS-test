@@ -73,13 +73,12 @@ class ModelParams(ParamGroup):
         self.hex_mlp_layers = 2
         self.hex_fusion = "concat"
 
-        # soft dynamic-static separation
-        self.use_dynamic_sep = False   # 启用软动静分离：使用可学习动态概率混合形变与零向量
+        # GauFRe-style static/dynamic separation (initialisation-based)
+        self.num_dynamic_gaussians = 100000  # 随机初始化的动态高斯数量 (0 = 全部来自 SfM，即全静态)
         self.log_deform_hist = False   # 每隔3000轮记录全局形变分布柱状图
 
         # dynamic Gaussian clustering (after first final_prune)
         self.cluster_n_clusters = 8        # KMeans 聚类数
-        self.cluster_dynamic_thresh = 0.5  # 动态概率阈值，仅 prob > thresh 的高斯参与聚类
         self.cluster_w_xyz = 1.0           # 聚类特征权重：3D 位置
         self.cluster_w_color = 0.5         # 聚类特征权重：SH 0阶 (RGB)
         self.cluster_w_motion = 1.0        # 聚类特征权重：历史平均形变
@@ -121,10 +120,6 @@ class OptimizationParams(ParamGroup):
         self.opacity_lr = 0.05
         self.scaling_lr = 0.005
         self.rotation_lr = 0.001
-        self.dynamic_prob_lr = 0.001
-        self.lambda_dynamic_polar = 0.01  # entropy-minimization weight to polarize dynamic_prob toward 0/1
-        self.dynamic_sep_temp_init = 1.0   # sigmoid temperature at start (soft)
-        self.dynamic_sep_temp_final = 0.05 # sigmoid temperature at end (near-binary)
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
         self.densification_interval = 500

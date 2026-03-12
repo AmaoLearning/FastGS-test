@@ -148,24 +148,23 @@ def _silhouette_sampled(features: np.ndarray, labels: np.ndarray, k: int,
 
 def cluster_dynamic_gaussians(
     gaussians,
-    dynamic_thresh: float = 0.5,
     n_clusters: int = 8,
     w_xyz: float = 1.0,
     w_color: float = 0.5,
     w_motion: float = 1.0,
-    temperature: float = 1.0,
     tb_writer=None,
     iteration: int = 0,
     save_path: Optional[str] = None,
 ) -> Dict[str, object]:
     """Cluster dynamic Gaussians and return results.
 
+    Uses the fixed ``_is_static`` label (GauFRe-style) to identify dynamic
+    Gaussians instead of a probability threshold.
+
     Args:
         gaussians: GaussianModel instance.
-        dynamic_thresh: Probability threshold for selecting dynamic Gaussians.
         n_clusters: Number of KMeans clusters.
         w_xyz / w_color / w_motion: Feature weights.
-        temperature: Sigmoid temperature for dynamic prob.
         tb_writer: Optional TensorBoard writer.
         iteration: Current training iteration (for logging).
         save_path: If provided, save cluster labels as .npz.
@@ -180,16 +179,12 @@ def cluster_dynamic_gaussians(
     t_start = time.perf_counter()
     N = gaussians.get_xyz.shape[0]
 
-    # ── 1. Select dynamic Gaussians ──
+    # ── 1. Select dynamic Gaussians via fixed _is_static label ──
     with torch.no_grad():
-        if hasattr(gaussians, 'get_dynamic_prob_t'):
-            dyn_prob = gaussians.get_dynamic_prob_t(temperature).squeeze(-1)  # (N,)
-        else:
-            dyn_prob = gaussians.get_dynamic_prob.squeeze(-1)
-        dynamic_mask = dyn_prob > dynamic_thresh  # boolean (N,)
+        dynamic_mask = gaussians.get_is_dynamic.squeeze(-1)  # (N,) bool
         n_dynamic = int(dynamic_mask.sum().item())
 
-    _msg = f"[CLUSTER] Selecting dynamic Gaussians: {n_dynamic}/{N} (thresh={dynamic_thresh:.2f})"
+    _msg = f"[CLUSTER] Selecting dynamic Gaussians: {n_dynamic}/{N}"
     logger.info(_msg)
     print(_msg)
 
