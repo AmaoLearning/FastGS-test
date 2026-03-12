@@ -228,8 +228,15 @@ def cluster_dynamic_gaussians(
 
     try:
         import faiss
-        # Use single GPU (device 0)
+
+        # Free PyTorch cached memory before faiss allocates GPU buffers
+        torch.cuda.empty_cache()
+
+        # Use single GPU (device 0) with limited temp memory (256 MB)
+        # Default is ~1.5 GB which causes OOM on large scenes (e.g. 100k+ total Gaussians)
         res = faiss.StandardGpuResources()
+        res.setTempMemory(256 * 1024 * 1024)  # 256 MB
+
         kmeans = faiss.Clustering(feat_dim, n_clusters)
         kmeans.niter = 30
         kmeans.verbose = True
@@ -238,15 +245,23 @@ def cluster_dynamic_gaussians(
         # Build a flat L2 index on GPU
         cfg = faiss.GpuIndexFlatConfig()
         cfg.device = 0
-        gpu_index = faiss.GpuIndexFlatL2(res, feat_dim, cfg)
+        cfg.useFloat16 = True  # halve GPU memory for the index
+        try:
+            gpu_index = faiss.GpuIndexFlatL2(res, feat_dim, cfg)
+            kmeans.train(features, gpu_index)
+            _, labels_np = gpu_index.search(features, 1)
+        except RuntimeError as gpu_err:
+            # GPU allocation still failed — fall back to CPU
+            _warn = f"[CLUSTER] GPU KMeans OOM, falling back to CPU: {gpu_err}"
+            logger.warning(_warn)
+            print(_warn)
+            cpu_index = faiss.IndexFlatL2(feat_dim)
+            kmeans.train(features, cpu_index)
+            _, labels_np = cpu_index.search(features, 1)
 
-        kmeans.train(features, gpu_index)
-
-        # Assign labels
-        _, labels_np = gpu_index.search(features, 1)
         labels_np = labels_np.squeeze(-1).astype(np.int32)  # (M,)
     except ImportError:
-        _err = "[CLUSTER] faiss-gpu not installed. Install with: pip install faiss-gpu"
+        _err = "[CLUSTER] faiss not installed. Install with: pip install faiss-gpu (or faiss-cpu)"
         logger.error(_err)
         print(_err)
         labels_full = torch.full((N,), -1, dtype=torch.int32, device="cuda")
