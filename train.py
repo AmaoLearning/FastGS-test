@@ -315,69 +315,78 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
             tb_writer.add_scalar('train_stats/num_gaussians', gaussians._xyz.shape[0], iteration)
 
-        # ── Optical Flow Loss (deform finite-diff → projected flow → GT comparison) ──
-        # Runs when EITHER flow loss or flow mask is enabled (mask needs per-gaussian error)
-        flow_loss = None
+        # ── Shared flow data loading ──
+        # Decouple flow loading from individual loss paths:
+        #   - flow_loss / flow_mask:  gated by flow_loss_from_iter & flow_loss_interval
+        #   - flow_dynamic (BCE):     active every iteration from warm_up onward
         flow_gt = None
         flow_mask = None
-        per_gaussian_flow_error = None
-        if (_need_flow
+        _flow_need_for_loss = (
+            (_need_flow_loss or _need_flow_mask)
             and flow_helper is not None
             and iteration >= opt.flow_loss_from_iter
             and iteration % opt.flow_loss_interval == 0
             and iteration >= opt.warm_up
             and torch.is_tensor(d_xyz)
-            and viewpoint_cam.has_flow):
-            # On-demand flow loading (consistency + magnitude mask)
+            and viewpoint_cam.has_flow
+        )
+        _flow_need_for_dyn = (
+            _need_flow_dyn
+            and iteration >= opt.warm_up
+            and torch.is_tensor(d_xyz)
+            and viewpoint_cam.has_flow
+        )
+        if _flow_need_for_loss or _flow_need_for_dyn:
             viewpoint_cam.load_flow(
                 device='cuda',
                 flow_magnitude_thresh=opt.flow_magnitude_thresh,
             )
             flow_gt = viewpoint_cam.flow_fwd  # [2, H, W]
-
-            # Flow mask (forward-backward consistency + magnitude threshold)
             flow_mask = viewpoint_cam.flow_mask  # [1, H, W] bool or None
             if flow_mask is None:
                 flow_mask = torch.ones(1, flow_gt.shape[1], flow_gt.shape[2],
                                        dtype=torch.bool, device=flow_gt.device)
 
-            # Compute projected flow only when needed by flow_loss or flow_mask paths.
-            if _need_flow_loss or _need_flow_mask:
-                # 光流 GT = 帧间像素位移，对应 3D 量是位置形变差 d_xyz(t+dt) - d_xyz(t)
-                N = gaussians.get_xyz.shape[0]
-                time_input = fid.unsqueeze(0).expand(N, -1)
-                d_xyz_next, _, _ = deform.step(
-                    gaussians.get_xyz.detach(),
-                    time_input + ast_noise + time_interval
+        # ── Optical Flow Loss (deform finite-diff → projected flow → GT comparison) ──
+        # Gated by flow_loss_from_iter & flow_loss_interval; independent of flow_dynamic.
+        flow_loss = None
+        per_gaussian_flow_error = None
+        if _flow_need_for_loss and flow_gt is not None:
+            # 光流 GT = 帧间像素位移，对应 3D 量是位置形变差 d_xyz(t+dt) - d_xyz(t)
+            N = gaussians.get_xyz.shape[0]
+            time_input = fid.unsqueeze(0).expand(N, -1)
+            d_xyz_next, _, _ = deform.step(
+                gaussians.get_xyz.detach(),
+                time_input + ast_noise + time_interval
+            )
+            displacement3D = d_xyz_next - d_xyz  # [N, 3], 3D 位移, gradient → deform
+
+            deformed_means3D = gaussians.get_xyz + d_xyz
+            flow_pred, _, _ = flow_helper.render_flow(
+                gaussians=gaussians,
+                velocity3D=displacement3D,
+                viewpoint_camera=viewpoint_cam,
+                override_means3D=deformed_means3D,
+                detach_geometry=opt.detach_flow_geometry,
+            )
+            flow_loss = flow_loss_fn(flow_pred, flow_gt.float(), flow_mask.float())
+
+            # Per-gaussian flow error for densification mask.
+            if _need_flow_mask and flow_loss.requires_grad and displacement3D.requires_grad:
+                [flow_grad] = torch.autograd.grad(
+                    flow_loss, displacement3D, retain_graph=True
                 )
-                displacement3D = d_xyz_next - d_xyz  # [N, 3], 3D 位移, gradient → deform
+                per_gaussian_flow_error = flow_grad.detach().norm(dim=-1, keepdim=True)
 
-                deformed_means3D = gaussians.get_xyz + d_xyz
-                flow_pred, _, _ = flow_helper.render_flow(
-                    gaussians=gaussians,
-                    velocity3D=displacement3D,
-                    viewpoint_camera=viewpoint_cam,
-                    override_means3D=deformed_means3D,
-                    detach_geometry=opt.detach_flow_geometry,
-                )
-                flow_loss = flow_loss_fn(flow_pred, flow_gt.float(), flow_mask.float())
+            # Only use use_flow_loss to control deformation flow loss.
+            if _need_flow_loss:
+                loss = loss + opt.lambda_flow * flow_loss
 
-                # Per-gaussian flow error for densification mask.
-                if _need_flow_mask and flow_loss.requires_grad and displacement3D.requires_grad:
-                    [flow_grad] = torch.autograd.grad(
-                        flow_loss, displacement3D, retain_graph=True
-                    )
-                    per_gaussian_flow_error = flow_grad.detach().norm(dim=-1, keepdim=True)
-
-                # Only use use_flow_loss to control deformation flow loss.
-                if _need_flow_loss:
-                    loss = loss + opt.lambda_flow * flow_loss
-
-                if _need_flow_loss and iteration % 1000 == 0:
-                    logger.info("[Iter %d] flow loss = %.6f", iteration, flow_loss.item())
-                    print(f"[Iter {iteration}] flow loss = {flow_loss.item():.6f}")
-                if _need_flow_loss and tb_writer and iteration % 100 == 0:
-                    tb_writer.add_scalar('train_loss_patches/flow_loss', flow_loss.item(), iteration)
+            if _need_flow_loss and iteration % 1000 == 0:
+                logger.info("[Iter %d] flow loss = %.6f", iteration, flow_loss.item())
+                print(f"[Iter {iteration}] flow loss = {flow_loss.item():.6f}")
+            if _need_flow_loss and tb_writer and iteration % 100 == 0:
+                tb_writer.add_scalar('train_loss_patches/flow_loss', flow_loss.item(), iteration)
 
         # Log final total loss (after all auxiliary losses are added)
         if tb_writer and iteration % 100 == 0:
