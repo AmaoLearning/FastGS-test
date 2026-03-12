@@ -451,6 +451,22 @@ class GaussianModel:
         denom = self._deform_denom.clamp(min=1)
         return self._deform_accum / denom
 
+    def get_lazy_dynamic_mask(self, motion_thresh: float, min_obs: int = 500) -> torch.Tensor:
+        """Return (N,) bool mask: True for dynamic Gaussians that are NOT moving enough.
+
+        Only flags Gaussians that:
+          1. are labelled dynamic (_is_static == 0)
+          2. have accumulated enough deformation observations (>= min_obs)
+          3. have mean deformation magnitude below *motion_thresh*
+
+        These are candidates for pruning ("lazy dynamics").
+        """
+        is_dynamic = self.get_is_dynamic.squeeze(-1)  # (N,) bool
+        has_history = (self._deform_denom.squeeze(-1) >= min_obs)
+        mean_mag = self.get_mean_deform().norm(dim=-1)  # (N,)
+        lazy = mean_mag < motion_thresh
+        return is_dynamic & has_history & lazy
+
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
@@ -551,7 +567,9 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_is_static)
 
-    def densify_and_prune_fastgs(self, max_screen_size, min_opacity, extent, radii, args, importance_score = None, pruning_score = None, flow_mask = None):
+    def densify_and_prune_fastgs(self, max_screen_size, min_opacity, extent, radii, args,
+                                   importance_score=None, pruning_score=None, flow_mask=None,
+                                   motion_prune_thresh: float = 0.0, motion_prune_min_obs: int = 500):
         
         ''' 
             Densification and Pruning based on FastGS criteria:
@@ -613,6 +631,14 @@ class GaussianModel:
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
 
+        # 方案B: prune dynamic Gaussians that are not moving enough ("lazy dynamics")
+        if motion_prune_thresh > 0:
+            lazy_mask = self.get_lazy_dynamic_mask(motion_prune_thresh, min_obs=motion_prune_min_obs)
+            n_lazy = int(lazy_mask.sum().item())
+            if n_lazy > 0:
+                print(f"  [Motion Prune] densify stage: {n_lazy} lazy dynamic Gaussians flagged")
+            prune_mask = torch.logical_or(prune_mask, lazy_mask)
+
         scores = 1 - pruning_score 
         to_remove = torch.sum(prune_mask)
         remove_budget = int(0.5 * to_remove)  # single GPU→CPU sync
@@ -639,13 +665,24 @@ class GaussianModel:
         # driver-level cache purge (~1-5ms stall). The caching allocator
         # already reuses freed blocks efficiently.
 
-    def final_prune_fastgs(self, min_opacity, pruning_score = None):
+    def final_prune_fastgs(self, min_opacity, pruning_score=None,
+                            motion_prune_thresh: float = 0.0, motion_prune_min_obs: int = 500):
         """Final-stage pruning: remove Gaussians based on opacity and multi-view consistency.
         In the final stage we remove Gaussians that have low opacity or that are flagged by
-        our multi-view reconstruction consistency metric (provided as `pruning_score`)."""
+        our multi-view reconstruction consistency metric (provided as ``pruning_score``).
+        Also prunes lazy dynamic Gaussians (方案B) when motion_prune_thresh > 0."""
         prune_mask = (self.get_opacity < min_opacity).squeeze() 
         scores_mask = pruning_score > 0.9
         final_prune = torch.logical_or(prune_mask, scores_mask)
+
+        # 方案B: prune lazy dynamic Gaussians
+        if motion_prune_thresh > 0:
+            lazy_mask = self.get_lazy_dynamic_mask(motion_prune_thresh, min_obs=motion_prune_min_obs)
+            n_lazy = int(lazy_mask.sum().item())
+            if n_lazy > 0:
+                print(f"  [Motion Prune] final stage: {n_lazy} lazy dynamic Gaussians flagged")
+            final_prune = torch.logical_or(final_prune, lazy_mask)
+
         self.prune_points(final_prune)
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):

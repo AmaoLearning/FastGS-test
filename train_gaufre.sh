@@ -1,10 +1,12 @@
 # Neur3D Dataset
-python train.py -s /remote-home/panyicheng/datasets/Neu3D/coffee_martini -m output_gaufre/coffee_martini --eval --iterations 30000 --lazy_load --deform_type 4dgs --log_deform_hist --num_dynamic_gaussians 100000 --cluster_w_xyz 1 --cluster_w_color 0.5 --cluster_w_motion 0.5
-python train.py -s /remote-home/panyicheng/datasets/Neu3D/cook_spinach -m output_gaufre/cook_spinach --eval --iterations 30000 --lazy_load --deform_type 4dgs --log_deform_hist --num_dynamic_gaussians 100000 --cluster_w_xyz 1 --cluster_w_color 0.5 --cluster_w_motion 0.5
-python train.py -s /remote-home/panyicheng/datasets/Neu3D/cut_roasted_beef -m output_gaufre/cut_roasted_beef --eval --iterations 30000 --lazy_load --deform_type 4dgs --log_deform_hist --num_dynamic_gaussians 100000 --cluster_w_xyz 1 --cluster_w_color 0.5 --cluster_w_motion 0.5
-python train.py -s /remote-home/panyicheng/datasets/Neu3D/flame_steak -m output_gaufre/flame_steak --eval --iterations 30000 --lazy_load --deform_type 4dgs --log_deform_hist --num_dynamic_gaussians 100000 --cluster_w_xyz 1 --cluster_w_color 0.5 --cluster_w_motion 0.5
-python train.py -s /remote-home/panyicheng/datasets/Neu3D/sear_steak -m output_gaufre/sear_steak --eval --iterations 30000 --lazy_load --deform_type 4dgs --log_deform_hist --num_dynamic_gaussians 100000 --cluster_w_xyz 1 --cluster_w_color 0.5 --cluster_w_motion 0.5
-python train.py -s /remote-home/panyicheng/datasets/Neu3D/flame_salmon_1 -m output_gaufre/flame_salmon_1 --eval --iterations 30000 --lazy_load --deform_type 4dgs --log_deform_hist --num_dynamic_gaussians 100000 --cluster_w_xyz 1 --cluster_w_color 0.5 --cluster_w_motion 0.5
+GAUFRE_ARGS="--num_dynamic_gaussians 100000 --cluster_w_xyz 1 --cluster_w_color 0.5 --cluster_w_motion 0.5 --lambda_motion_hinge 0.1 --motion_hinge_tau_scale 1e-3 --motion_prune_tau_scale 1e-3 --motion_prune_min_obs 500"
+
+python train.py -s /remote-home/panyicheng/datasets/Neu3D/coffee_martini -m output_gaufre/coffee_martini --eval --iterations 30000 --lazy_load --deform_type 4dgs --log_deform_hist ${GAUFRE_ARGS}
+python train.py -s /remote-home/panyicheng/datasets/Neu3D/cook_spinach -m output_gaufre/cook_spinach --eval --iterations 30000 --lazy_load --deform_type 4dgs --log_deform_hist ${GAUFRE_ARGS}
+python train.py -s /remote-home/panyicheng/datasets/Neu3D/cut_roasted_beef -m output_gaufre/cut_roasted_beef --eval --iterations 30000 --lazy_load --deform_type 4dgs --log_deform_hist ${GAUFRE_ARGS}
+python train.py -s /remote-home/panyicheng/datasets/Neu3D/flame_steak -m output_gaufre/flame_steak --eval --iterations 30000 --lazy_load --deform_type 4dgs --log_deform_hist ${GAUFRE_ARGS}
+python train.py -s /remote-home/panyicheng/datasets/Neu3D/sear_steak -m output_gaufre/sear_steak --eval --iterations 30000 --lazy_load --deform_type 4dgs --log_deform_hist ${GAUFRE_ARGS}
+python train.py -s /remote-home/panyicheng/datasets/Neu3D/flame_salmon_1 -m output_gaufre/flame_salmon_1 --eval --iterations 30000 --lazy_load --deform_type 4dgs --log_deform_hist ${GAUFRE_ARGS}
 
 python render.py -m output_gaufre/coffee_martini --mode render --skip_train
 python render.py -m output_gaufre/cook_spinach --mode render --skip_train

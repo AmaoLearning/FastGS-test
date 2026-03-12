@@ -15,7 +15,7 @@ import logging
 import traceback
 import torch
 from random import randint
-from utils.loss_utils import l1_loss, ssim, kl_divergence, l2_loss
+from utils.loss_utils import l1_loss, ssim, kl_divergence, l2_loss, motion_hinge_loss
 from gaussian_renderer import render_fastgs, network_gui
 import sys
 from scene import Scene, GaussianModel, DeformModel, DeformModel_4DGS
@@ -289,6 +289,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
         ssim_loss = 1.0 - fast_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss
 
+        # ── 方案A: motion hinge loss (force dynamic Gaussians to move) ──
+        if (opt.lambda_motion_hinge > 0
+                and torch.is_tensor(d_xyz)
+                and iteration >= opt.warm_up
+                and gaussians._is_static.numel() > 0):
+            _hinge_tau = scene.cameras_extent * opt.motion_hinge_tau_scale
+            _hinge = motion_hinge_loss(d_xyz, gaussians.get_is_dynamic, _hinge_tau)
+            loss = loss + opt.lambda_motion_hinge * _hinge
+            if tb_writer and iteration % 100 == 0:
+                tb_writer.add_scalar('train_loss_patches/motion_hinge', _hinge.item(), iteration)
+
         # ── Inline TensorBoard logging (training_report is commented out) ──
         if tb_writer and iteration % 100 == 0:
             tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
@@ -461,7 +472,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                                                 args = opt,
                                                 importance_score = importance_score,
                                                 pruning_score = pruning_score,
-                                                flow_mask = flow_mask)
+                                                flow_mask = flow_mask,
+                                                motion_prune_thresh = scene.cameras_extent * opt.motion_prune_tau_scale,
+                                                motion_prune_min_obs = opt.motion_prune_min_obs)
 
                 if iteration % opt.opacity_reset_interval == 0 or (
                         dataset.white_background and iteration == opt.densify_from_iter):
@@ -478,7 +491,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 _, pruning_score = compute_gaussian_score_fastgs(camlist, gaussians, pipe, background, opt, d_xyz, d_rotation, d_scaling, dataset.is_6dof)
                 scene.release_cameras(camlist)
 
-                gaussians.final_prune_fastgs(min_opacity = 0.1, pruning_score = pruning_score)
+                gaussians.final_prune_fastgs(min_opacity = 0.1, pruning_score = pruning_score,
+                                              motion_prune_thresh = scene.cameras_extent * opt.motion_prune_tau_scale,
+                                              motion_prune_min_obs = opt.motion_prune_min_obs)
 
                 # ── Dynamic Gaussian clustering (once, after first final_prune) ──
                 if (not _clustering_done

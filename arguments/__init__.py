@@ -159,6 +159,15 @@ class OptimizationParams(ParamGroup):
         # flow-based densification mask（用光流拟合质量控制致密化）
         self.flow_loss_thresh = 0.001  # 光流损失阈值（固定阈值模式）
         self.flow_loss_percentile = 70  # 自适应阈值百分比，-1 表示使用固定阈值，0-100 表示使用自适应阈值（如 70 表示约 70% 低损失高斯通过筛选）
+
+        # ── GauFRe motion constraints (方案 A+B) ──
+        # A: hinge loss — penalise dynamic Gaussians whose |d_xyz| < tau
+        self.lambda_motion_hinge = 0.1  # hinge loss weight (0 = disabled)
+        self.motion_hinge_tau_scale = 1e-3  # tau = scene_extent * this
+        # B: lazy-dynamic pruning — prune dynamic Gaussians with low mean motion
+        #    Uses the same tau as threshold; OR'd with opacity mask in densify/final prune
+        self.motion_prune_tau_scale = 1e-3  # motion_prune_thresh = scene_extent * this
+        self.motion_prune_min_obs = 500  # minimum deform observations before pruning applies
         super().__init__(parser, "Optimization Parameters", sentinel)
 
 

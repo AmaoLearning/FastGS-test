@@ -64,6 +64,26 @@ def velocity_temporal_smoothness_loss(
     return smooth_loss
 
 
+def motion_hinge_loss(d_xyz: torch.Tensor, is_dynamic: torch.Tensor, tau: float) -> torch.Tensor:
+    """Hinge loss: penalise dynamic Gaussians whose deformation magnitude < tau.
+
+    L = (1/N_dyn) * sum_i max(0, tau - ||d_xyz_i||)
+
+    Args:
+        d_xyz: (N, 3) deformation vectors (with gradient to deform network).
+        is_dynamic: (N, 1) bool mask, True for dynamic Gaussians.
+        tau: minimum expected deformation magnitude.
+
+    Returns:
+        Scalar loss (0 if no dynamic Gaussians).
+    """
+    dyn_mask = is_dynamic.squeeze(-1)  # (N,)
+    if not dyn_mask.any():
+        return torch.tensor(0.0, device=d_xyz.device)
+    mag = d_xyz[dyn_mask].norm(dim=-1)  # (M,)
+    return torch.clamp(tau - mag, min=0.0).mean()
+
+
 def gaussian(window_size, sigma):
     gauss = torch.Tensor([exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)])
     return gauss / gauss.sum()
