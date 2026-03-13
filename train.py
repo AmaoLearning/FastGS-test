@@ -17,7 +17,8 @@ import torch
 from random import randint
 from utils.loss_utils import (l1_loss, ssim, kl_divergence, l2_loss,
                               dynamic_sparsity_loss, gate_deform_consistency_loss,
-                              flow_dynamic_supervision_loss)
+                              flow_dynamic_supervision_loss,
+                              binary_entropy_polarization_loss)
 from gaussian_renderer import render_fastgs, render_dynamic_prob_map, network_gui
 import sys
 from scene import Scene, GaussianModel, DeformModel, DeformModel_4DGS
@@ -405,7 +406,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
         # All dynamic_logit supervision is grouped here for clarity.
         #   1) Sparsity prior: mean(p)         → push all prob toward 0
         #   2) Gate-deform:   (1-p)*||d_raw||  → push large-deform prob toward 1
-        #   3) Flow supervision: BCE(prob_map, flow_mag/τ) → pixel-level GT
+        #   3) Polarization:  H(p)            → push prob away from 0.5 toward 0/1
+        #   4) Flow supervision: BCE(prob_map, flow_mag/τ) → pixel-level GT
         if dataset.use_dynamic_sep and iteration >= opt.warm_up:
             # (1) Sparsity prior
             if opt.lambda_dynamic_sparse > 0:
@@ -421,7 +423,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 if tb_writer and iteration % 100 == 0:
                     tb_writer.add_scalar('train_loss_patches/gate_deform', _gate_loss.item(), iteration)
 
-            # (3) Flow-supervised dynamic probability
+            # (3) Binary-entropy polarization
+            if opt.lambda_dynamic_polarize > 0:
+                _polar_loss = binary_entropy_polarization_loss(_dynamic_prob)
+                loss = loss + opt.lambda_dynamic_polarize * _polar_loss
+                if tb_writer and iteration % 100 == 0:
+                    tb_writer.add_scalar('train_loss_patches/dynamic_polarize', _polar_loss.item(), iteration)
+
+            # (4) Flow-supervised dynamic probability
             if _need_flow_dyn and flow_gt is not None:
                 _prob_map = render_dynamic_prob_map(
                     viewpoint_cam, gaussians, _dynamic_prob,

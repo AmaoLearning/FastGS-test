@@ -121,15 +121,6 @@ class OptimizationParams(ParamGroup):
         self.opacity_lr = 0.05
         self.scaling_lr = 0.005
         self.rotation_lr = 0.001
-        self.dynamic_prob_lr = 0.001
-        self.lambda_dynamic_sparse = 0.01  # sparsity prior: push dynamic_prob toward 0 (most are static)
-        self.lambda_gate_deform = 0.1      # gate-deform consistency: large raw deform → high dynamic_prob
-        self.lambda_flow_dynamic = 0.1     # flow-supervised dynamic prob (render prob map vs flow GT)
-        self.flow_dynamic_thresh = 3.0     # flow magnitude (px) mapping to target=1 for dynamic supervision
-        self.flow_dynamic_invalid_weight = 0.2  # non-zero weight for inconsistent pixels (avoid holes)
-        self.flow_dynamic_target_gamma = 1.5    # suppress micro-motion noise in flow->target mapping
-        self.dynamic_sep_temp_init = 1.0   # sigmoid temperature at start (soft)
-        self.dynamic_sep_temp_final = 0.05 # sigmoid temperature at end (near-binary)
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
         self.densification_interval = 500
@@ -169,6 +160,18 @@ class OptimizationParams(ParamGroup):
         # flow-based densification mask（用光流拟合质量控制致密化）
         self.flow_loss_thresh = 0.001  # 光流损失阈值（固定阈值模式）
         self.flow_loss_percentile = 70  # 自适应阈值百分比，-1 表示使用固定阈值，0-100 表示使用自适应阈值（如 70 表示约 70% 低损失高斯通过筛选）
+        
+        # dynamic logits
+        self.dynamic_prob_lr = 0.001
+        self.lambda_dynamic_sparse = 0.01  # sparsity prior: push dynamic_prob toward 0 (most are static)
+        self.lambda_gate_deform = 0.1      # gate-deform consistency: large raw deform → high dynamic_prob
+        self.lambda_dynamic_polarize = 0.01  # binary-entropy polarization: push dynamic_prob away from 0.5 toward 0/1
+        self.lambda_flow_dynamic = 0.1     # flow-supervised dynamic prob (render prob map vs flow GT)
+        self.flow_dynamic_thresh = 3.0     # flow magnitude (px) mapping to target=1 for dynamic supervision
+        self.flow_dynamic_invalid_weight = 0.2  # non-zero weight for inconsistent pixels (avoid holes)
+        self.flow_dynamic_target_gamma = 1.5    # suppress micro-motion noise in flow->target mapping
+        self.dynamic_sep_temp_init = 1.0   # sigmoid temperature at start (soft)
+        self.dynamic_sep_temp_final = 0.05 # sigmoid temperature at end (near-binary)
         super().__init__(parser, "Optimization Parameters", sentinel)
 
 
