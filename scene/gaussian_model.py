@@ -586,8 +586,22 @@ class GaussianModel:
         grads_abs = self.xyz_gradient_accum_abs / self.denom
         grads_abs[grads_abs.isnan()] = 0.0
 
-        grad_qualifiers = torch.where(torch.norm(grad_vars, dim=-1) >= args.grad_thresh, True, False)
-        grad_qualifiers_abs = torch.where(torch.norm(grads_abs, dim=-1) >= args.grad_abs_thresh, True, False)
+        grad_norm = torch.norm(grad_vars, dim=-1)
+        grad_abs_norm = torch.norm(grads_abs, dim=-1)
+
+        # Separate thresholds for static/dynamic Gaussians. Dynamic thresholds
+        # are intentionally higher to reduce dynamic densification.
+        if self._is_static.numel() > 0:
+            is_dynamic = self.get_is_dynamic.squeeze(-1)
+            grad_thresh = torch.full_like(grad_norm, float(args.grad_thresh))
+            grad_abs_thresh = torch.full_like(grad_abs_norm, float(args.grad_abs_thresh))
+            grad_thresh[is_dynamic] = float(getattr(args, 'grad_thresh_dynamic', args.grad_thresh))
+            grad_abs_thresh[is_dynamic] = float(getattr(args, 'grad_abs_thresh_dynamic', args.grad_abs_thresh))
+            grad_qualifiers = grad_norm >= grad_thresh
+            grad_qualifiers_abs = grad_abs_norm >= grad_abs_thresh
+        else:
+            grad_qualifiers = grad_norm >= args.grad_thresh
+            grad_qualifiers_abs = grad_abs_norm >= args.grad_abs_thresh
         clone_qualifiers = torch.max(self.get_scaling, dim=1).values <= args.dense*extent
         split_qualifiers = torch.max(self.get_scaling, dim=1).values > args.dense*extent
 

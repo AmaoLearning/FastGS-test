@@ -271,7 +271,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             _t0 = time.perf_counter()
 
         # Render
-        render_pkg_re = render_fastgs(viewpoint_cam, gaussians, pipe, background, opt.mult, d_xyz, d_rotation, d_scaling, dataset.is_6dof)
+        # During warm-up, train with static Gaussians only (ignore dynamics).
+        opacity_override = None
+        if iteration < opt.warm_up and gaussians._is_static.numel() > 0:
+            opacity_override = gaussians.get_opacity * gaussians.get_is_static.float()
+        render_pkg_re = render_fastgs(
+            viewpoint_cam,
+            gaussians,
+            pipe,
+            background,
+            opt.mult,
+            d_xyz,
+            d_rotation,
+            d_scaling,
+            dataset.is_6dof,
+            opacity_override=opacity_override,
+        )
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg_re["render"], render_pkg_re[
             "viewspace_points"], render_pkg_re["visibility_filter"], render_pkg_re["radii"]
         # depth = render_pkg_re["depth"]

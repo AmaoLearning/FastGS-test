@@ -29,7 +29,7 @@ def quaternion_multiply(q1, q2):
     return torch.stack((w, x, y, z), dim=-1)
 
 def render_fastgs(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, mult, d_xyz, d_rotation, d_scaling, is_6dof=False,
-           scaling_modifier=1.0, override_color=None, get_flag=None, metric_map = None):
+           scaling_modifier=1.0, override_color=None, get_flag=None, metric_map = None, opacity_override=None):
     """
     Render the scene.
 
@@ -80,7 +80,7 @@ def render_fastgs(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Ten
                 torch.bmm(d_xyz, to_homogenous(pc.get_xyz).unsqueeze(-1)).squeeze(-1))
     else:
         means3D = pc.get_xyz + d_xyz
-    opacity = pc.get_opacity
+    opacity = opacity_override if opacity_override is not None else pc.get_opacity
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.

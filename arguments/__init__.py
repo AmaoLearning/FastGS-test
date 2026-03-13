@@ -137,6 +137,10 @@ class OptimizationParams(ParamGroup):
         self.highfeature_lr = 0.005
         self.lowfeature_lr = 0.0025
         self.grad_thresh = 0.0002
+        # Separate densification thresholds for dynamic Gaussians.
+        # Set higher than static thresholds to reduce dynamic densification.
+        self.grad_thresh_dynamic = 0.0004
+        self.grad_abs_thresh_dynamic = 0.0012
         self.dense = 0.001
         self.mult = 0.5
 
