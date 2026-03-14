@@ -304,9 +304,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 device='cuda',
                 flow_magnitude_thresh=opt.flow_magnitude_thresh,
                 use_consistency_mask=(not opt.disable_flow_dynamic_mask),
-                enable_preload_cache=opt.enable_flow_preload_cache,
-                preload_cache_size=opt.flow_preload_cache_size,
-                preload_cache_device=opt.flow_preload_cache_device,
+                enable_preload_cache=dataset.enable_flow_preload_cache,
+                preload_cache_size=dataset.flow_preload_cache_size,
+                preload_cache_device=dataset.flow_preload_cache_device,
             )
             flow_gt = viewpoint_cam.flow_fwd  # [2, H, W]
             flow_mask = viewpoint_cam.flow_mask  # [1, H, W] bool or None
