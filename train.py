@@ -357,9 +357,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
 
             # (4) Flow-supervised dynamic probability
             if _need_flow_dyn and flow_gt is not None:
+                _d_xyz_fd = d_xyz.detach() if (opt.detach_flow_dynamic_geometry and torch.is_tensor(d_xyz)) else d_xyz
+                _d_rotation_fd = d_rotation.detach() if (opt.detach_flow_dynamic_geometry and torch.is_tensor(d_rotation)) else d_rotation
+                _d_scaling_fd = d_scaling.detach() if (opt.detach_flow_dynamic_geometry and torch.is_tensor(d_scaling)) else d_scaling
                 _prob_map = render_dynamic_prob_map(
                     viewpoint_cam, gaussians, _dynamic_prob,
-                    pipe, opt.mult, d_xyz, d_rotation, d_scaling,
+                    pipe, opt.mult, _d_xyz_fd, _d_rotation_fd, _d_scaling_fd,
                     dataset.is_6dof,
                 )
                 _flow_dyn_mask = None if opt.disable_flow_dynamic_mask else flow_mask
