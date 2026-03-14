@@ -10,12 +10,74 @@
 #
 
 import os
+from collections import OrderedDict
 from typing import Optional
 import torch
 from torch import nn
 import numpy as np
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix
 from utils.optic_flow_utils import forward_backward_consistency_check
+
+
+_FLOW_PRELOAD_CACHE = OrderedDict()
+
+
+def _normalize_cache_device(cache_device: str) -> str:
+    dev = str(cache_device).lower()
+    if dev == "gpu":
+        dev = "cuda"
+    if dev.startswith('cuda') and not torch.cuda.is_available():
+        dev = 'cpu'
+    return dev
+
+
+def _flow_cache_key(flow_fwd_path: Optional[str], flow_bwd_path: Optional[str], cache_device: str):
+    return (flow_fwd_path or "", flow_bwd_path or "", cache_device)
+
+
+def _get_cached_flow(flow_fwd_path: Optional[str], flow_bwd_path: Optional[str], cache_device: str):
+    key = _flow_cache_key(flow_fwd_path, flow_bwd_path, cache_device)
+    cached = _FLOW_PRELOAD_CACHE.get(key)
+    if cached is not None:
+        _FLOW_PRELOAD_CACHE.move_to_end(key)
+    return cached
+
+
+def _put_cached_flow(flow_fwd_path: Optional[str], flow_bwd_path: Optional[str], cache_device: str, flow_fwd_tensor, flow_bwd_tensor, cache_size: int):
+    if cache_size <= 0:
+        return
+    key = _flow_cache_key(flow_fwd_path, flow_bwd_path, cache_device)
+    _FLOW_PRELOAD_CACHE[key] = (flow_fwd_tensor, flow_bwd_tensor)
+    _FLOW_PRELOAD_CACHE.move_to_end(key)
+    while len(_FLOW_PRELOAD_CACHE) > cache_size:
+        _FLOW_PRELOAD_CACHE.popitem(last=False)
+
+
+def preload_flow_cache_from_tensors(
+    flow_fwd_path: Optional[str],
+    flow_bwd_path: Optional[str],
+    flow_fwd_tensor: Optional[torch.Tensor],
+    flow_bwd_tensor: Optional[torch.Tensor],
+    cache_device: str = 'cpu',
+    cache_size: int = 0,
+) -> None:
+    """Preload a flow pair into global LRU cache from pre-fetched tensors.
+
+    Intended for Scene lazy DataLoader path: workers prefetch flow in the same
+    camera order as images, then main process pushes them into cache here.
+    """
+    if cache_size <= 0:
+        return
+    dev = _normalize_cache_device(cache_device)
+    fwd = None
+    bwd = None
+    if flow_fwd_tensor is not None and flow_fwd_tensor.numel() > 0:
+        fwd = flow_fwd_tensor.contiguous().to(dtype=torch.float16, device=dev, non_blocking=True)
+    if flow_bwd_tensor is not None and flow_bwd_tensor.numel() > 0:
+        bwd = flow_bwd_tensor.contiguous().to(dtype=torch.float16, device=dev, non_blocking=True)
+    if fwd is None and bwd is None:
+        return
+    _put_cached_flow(flow_fwd_path, flow_bwd_path, dev, fwd, bwd, cache_size)
 
 
 class Camera(nn.Module):
@@ -91,7 +153,15 @@ class Camera(nn.Module):
         """该相机是否有光流文件可供加载。"""
         return self.flow_fwd_path is not None
 
-    def load_flow(self, device: str = 'cuda', flow_magnitude_thresh: float = 0.0) -> None:
+    def load_flow(
+        self,
+        device: str = 'cuda',
+        flow_magnitude_thresh: float = 0.0,
+        use_consistency_mask: bool = True,
+        enable_preload_cache: bool = False,
+        preload_cache_size: int = 0,
+        preload_cache_device: str = 'cpu',
+    ) -> None:
         """按需从磁盘加载光流到指定设备，并计算组合掩码。
 
         组合掩码 = 前后一致性掩码 & 模长阈值掩码：
@@ -102,18 +172,34 @@ class Camera(nn.Module):
         """
         if self.flow_fwd is not None:
             return  # 已加载
-        if self.flow_fwd_path is not None and os.path.exists(self.flow_fwd_path):
-            arr = np.load(self.flow_fwd_path)            # [H, W, 2]
-            self.flow_fwd = torch.from_numpy(arr).permute(2, 0, 1).to(
-                dtype=torch.float16, device=device)       # [2, H, W] fp16
-        if self.flow_bwd_path is not None and os.path.exists(self.flow_bwd_path):
+
+        cache_device = _normalize_cache_device(preload_cache_device)
+
+        flow_fwd_cached = None
+        flow_bwd_cached = None
+        if enable_preload_cache and preload_cache_size > 0:
+            cached = _get_cached_flow(self.flow_fwd_path, self.flow_bwd_path, cache_device)
+            if cached is not None:
+                flow_fwd_cached, flow_bwd_cached = cached
+
+        if flow_fwd_cached is None and self.flow_fwd_path is not None and os.path.exists(self.flow_fwd_path):
+            arr = np.load(self.flow_fwd_path)  # [H, W, 2]
+            flow_fwd_cached = torch.from_numpy(arr).permute(2, 0, 1).contiguous().to(dtype=torch.float16, device=cache_device)
+        if flow_bwd_cached is None and self.flow_bwd_path is not None and os.path.exists(self.flow_bwd_path):
             arr = np.load(self.flow_bwd_path)
-            self.flow_bwd = torch.from_numpy(arr).permute(2, 0, 1).to(
-                dtype=torch.float16, device=device)
+            flow_bwd_cached = torch.from_numpy(arr).permute(2, 0, 1).contiguous().to(dtype=torch.float16, device=cache_device)
+
+        if enable_preload_cache and preload_cache_size > 0 and (flow_fwd_cached is not None or flow_bwd_cached is not None):
+            _put_cached_flow(self.flow_fwd_path, self.flow_bwd_path, cache_device, flow_fwd_cached, flow_bwd_cached, preload_cache_size)
+
+        if flow_fwd_cached is not None:
+            self.flow_fwd = flow_fwd_cached if flow_fwd_cached.device.type == torch.device(device).type and flow_fwd_cached.device.index == torch.device(device).index else flow_fwd_cached.to(device=device, non_blocking=True)
+        if flow_bwd_cached is not None:
+            self.flow_bwd = flow_bwd_cached if flow_bwd_cached.device.type == torch.device(device).type and flow_bwd_cached.device.index == torch.device(device).index else flow_bwd_cached.to(device=device, non_blocking=True)
 
         # ── 1. Forward-Backward Consistency Mask ──
         consistency_mask = None
-        if self.flow_fwd is not None and self.flow_bwd is not None:
+        if use_consistency_mask and self.flow_fwd is not None and self.flow_bwd is not None:
             mask_f32 = forward_backward_consistency_check(
                 self.flow_fwd.float(), self.flow_bwd.float(),
                 # 使用函数默认严格参数 alpha1=0.005, alpha2=0.2
@@ -273,21 +359,45 @@ class LazyCamera(nn.Module):
     def has_flow(self) -> bool:
         return self.flow_fwd_path is not None
 
-    def load_flow(self, device: str = "cuda", flow_magnitude_thresh: float = 0.0) -> None:
+    def load_flow(
+        self,
+        device: str = "cuda",
+        flow_magnitude_thresh: float = 0.0,
+        use_consistency_mask: bool = True,
+        enable_preload_cache: bool = False,
+        preload_cache_size: int = 0,
+        preload_cache_device: str = 'cpu',
+    ) -> None:
         """同 Camera.load_flow — 一致性 + 模长组合掩码。"""
         if self.flow_fwd is not None:
             return
-        if self.flow_fwd_path is not None and os.path.exists(self.flow_fwd_path):
+
+        cache_device = _normalize_cache_device(preload_cache_device)
+
+        flow_fwd_cached = None
+        flow_bwd_cached = None
+        if enable_preload_cache and preload_cache_size > 0:
+            cached = _get_cached_flow(self.flow_fwd_path, self.flow_bwd_path, cache_device)
+            if cached is not None:
+                flow_fwd_cached, flow_bwd_cached = cached
+
+        if flow_fwd_cached is None and self.flow_fwd_path is not None and os.path.exists(self.flow_fwd_path):
             arr = np.load(self.flow_fwd_path)
-            self.flow_fwd = torch.from_numpy(arr).permute(2, 0, 1).to(
-                dtype=torch.float16, device=device)
-        if self.flow_bwd_path is not None and os.path.exists(self.flow_bwd_path):
+            flow_fwd_cached = torch.from_numpy(arr).permute(2, 0, 1).contiguous().to(dtype=torch.float16, device=cache_device)
+        if flow_bwd_cached is None and self.flow_bwd_path is not None and os.path.exists(self.flow_bwd_path):
             arr = np.load(self.flow_bwd_path)
-            self.flow_bwd = torch.from_numpy(arr).permute(2, 0, 1).to(
-                dtype=torch.float16, device=device)
+            flow_bwd_cached = torch.from_numpy(arr).permute(2, 0, 1).contiguous().to(dtype=torch.float16, device=cache_device)
+
+        if enable_preload_cache and preload_cache_size > 0 and (flow_fwd_cached is not None or flow_bwd_cached is not None):
+            _put_cached_flow(self.flow_fwd_path, self.flow_bwd_path, cache_device, flow_fwd_cached, flow_bwd_cached, preload_cache_size)
+
+        if flow_fwd_cached is not None:
+            self.flow_fwd = flow_fwd_cached if flow_fwd_cached.device.type == torch.device(device).type and flow_fwd_cached.device.index == torch.device(device).index else flow_fwd_cached.to(device=device, non_blocking=True)
+        if flow_bwd_cached is not None:
+            self.flow_bwd = flow_bwd_cached if flow_bwd_cached.device.type == torch.device(device).type and flow_bwd_cached.device.index == torch.device(device).index else flow_bwd_cached.to(device=device, non_blocking=True)
 
         consistency_mask = None
-        if self.flow_fwd is not None and self.flow_bwd is not None:
+        if use_consistency_mask and self.flow_fwd is not None and self.flow_bwd is not None:
             mask_f32 = forward_backward_consistency_check(
                 self.flow_fwd.float(), self.flow_bwd.float(),
             )

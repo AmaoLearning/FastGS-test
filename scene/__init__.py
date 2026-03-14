@@ -51,10 +51,19 @@ class Scene:
         self._load2gpu_on_the_fly: bool = getattr(args, 'load2gpu_on_the_fly', False)
         self._lazy_data_iter = None
         self._gpu_image_buffers: Optional[List[torch.Tensor]] = None
+        self._lazy_cameras: Optional[List] = None
         self._active_buf_idx: int = 0
         self._dma_stream: Optional[torch.cuda.Stream] = None
         self._prefetch_ready: Optional[Tuple[int, int, torch.cuda.Event]] = None
         self._viewpoint_stack: list = []  # for non-lazy random sampling
+
+        self._lazy_num_workers: int = int(getattr(args, 'lazy_num_workers', 8))
+        self._lazy_prefetch_factor: int = int(getattr(args, 'lazy_prefetch_factor', 4))
+        self._lazy_image_buffer_count: int = max(2, int(getattr(args, 'lazy_image_buffer_count', 2)))
+        self._lazy_prefetch_flow_to_cache: bool = bool(getattr(args, 'lazy_prefetch_flow_to_cache', False))
+        self._enable_flow_preload_cache: bool = bool(getattr(args, 'enable_flow_preload_cache', False))
+        self._flow_preload_cache_size: int = int(getattr(args, 'flow_preload_cache_size', 0))
+        self._flow_preload_cache_device: str = str(getattr(args, 'flow_preload_cache_device', 'cpu'))
 
         load_flow = getattr(args, 'use_flow_loss', False) or getattr(args, 'use_flow_mask', False) or getattr(args, 'use_dynamic_sep', False)
         self._load_flow: bool = load_flow
@@ -170,8 +179,8 @@ class Scene:
 
     def setup_lazy_dataloader(
         self,
-        num_workers: int = 8,
-        prefetch_factor: int = 4,
+        num_workers: Optional[int] = None,
+        prefetch_factor: Optional[int] = None,
         scale: float = 1.0,
     ) -> None:
         """Initialize the async image prefetch pipeline.
@@ -181,14 +190,26 @@ class Scene:
         is pre-allocated so that training iterations incur **zero**
         ``cudaMalloc`` / ``cudaFree``.
 
-        **Flow data is NOT prefetched here.** Flow files are loaded
-        on-demand only on the ~10% of iterations that compute flow loss,
-        via ``Camera.load_flow()`` / ``Camera.unload_flow()``.  This avoids
-        wasting 90% of worker bandwidth on unused flow I/O.
+        Flow prefetching is optional. When ``lazy_prefetch_flow_to_cache`` is
+        enabled and flow cache is enabled, DataLoader workers also load flow
+        files and the main process pre-warms the flow cache in the same camera
+        order as images.
         """
         from utils.dataload_utils import create_camera_dataloader, InfiniteDataLoader
 
+        if num_workers is None:
+            num_workers = self._lazy_num_workers
+        if prefetch_factor is None:
+            prefetch_factor = self._lazy_prefetch_factor
+
         cameras = self.getTrainCameras(scale)
+        self._lazy_cameras = cameras
+        _prefetch_flow = (
+            self._lazy_prefetch_flow_to_cache
+            and self._load_flow
+            and self._enable_flow_preload_cache
+            and self._flow_preload_cache_size > 0
+        )
         _dl = create_camera_dataloader(
             cameras,
             batch_size=1,
@@ -197,7 +218,7 @@ class Scene:
             pin_memory=True,
             persistent_workers=True,
             shuffle=True,
-            load_flow=False,   # Never load flow in DataLoader — on-demand only
+            load_flow=_prefetch_flow,
         )
         self._lazy_data_iter = InfiniteDataLoader(_dl)
 
@@ -208,18 +229,24 @@ class Scene:
         if len(resolutions) == 1:
             w, h = resolutions.pop()
             self._gpu_image_buffers = [
-                torch.empty(3, h, w, dtype=torch.float32, device="cuda"),
-                torch.empty(3, h, w, dtype=torch.float32, device="cuda"),
+                torch.empty(3, h, w, dtype=torch.float32, device="cuda")
+                for _ in range(self._lazy_image_buffer_count)
             ]
             self._dma_stream = torch.cuda.Stream()
             # Pre-fill: DMA the first batch so the first
             # next_train_camera() call never stalls on a cold buffer.
             self._kick_prefetch()
             n_with_flow = sum(1 for c in cameras if c.has_flow)
-            flow_info = f", flow_files={n_with_flow}/{len(cameras)} (on-demand)" if n_with_flow > 0 else ""
+            if n_with_flow > 0:
+                if _prefetch_flow:
+                    flow_info = f", flow_files={n_with_flow}/{len(cameras)} (prefetch->cache:{self._flow_preload_cache_device}, size={self._flow_preload_cache_size})"
+                else:
+                    flow_info = f", flow_files={n_with_flow}/{len(cameras)} (on-demand)"
+            else:
+                flow_info = ""
             print(f"[INFO] Lazy DataLoader: {len(cameras)} cameras, "
                   f"{num_workers} workers, prefetch={prefetch_factor}, "
-                  f"GPU double-buffer={w}x{h} (zero-alloc, DMA overlap){flow_info}")
+                  f"GPU image-buffers={len(self._gpu_image_buffers)}x{w}x{h} (zero-alloc, DMA overlap){flow_info}")
         else:
             print(f"[INFO] Lazy DataLoader: {len(cameras)} cameras, "
                   f"{num_workers} workers, prefetch={prefetch_factor}, "
@@ -239,11 +266,27 @@ class Scene:
                 event (captures previous compute on the target buffer)
                 to avoid a WAR hazard.
         """
-        _batch_idx, _batch_img, _, _ = next(self._lazy_data_iter)
+        _batch_idx, _batch_img, _batch_flow_fwd, _batch_flow_bwd = next(self._lazy_data_iter)
         cam_idx = _batch_idx.item()
         pinned_img = _batch_img.squeeze(0)          # [3,H,W] pinned CPU
 
-        next_buf = 1 - self._active_buf_idx
+        if (self._lazy_prefetch_flow_to_cache
+                and self._enable_flow_preload_cache
+                and self._flow_preload_cache_size > 0
+                and self._lazy_cameras is not None
+                and (_batch_flow_fwd.numel() > 0 or _batch_flow_bwd.numel() > 0)):
+            from scene.cameras import preload_flow_cache_from_tensors
+            _cam = self._lazy_cameras[cam_idx]
+            preload_flow_cache_from_tensors(
+                getattr(_cam, 'flow_fwd_path', None),
+                getattr(_cam, 'flow_bwd_path', None),
+                _batch_flow_fwd,
+                _batch_flow_bwd,
+                cache_device=self._flow_preload_cache_device,
+                cache_size=self._flow_preload_cache_size,
+            )
+
+        next_buf = (self._active_buf_idx + 1) % len(self._gpu_image_buffers)
         with torch.cuda.stream(self._dma_stream):
             if wait_event is not None:
                 self._dma_stream.wait_event(wait_event)
@@ -262,9 +305,9 @@ class Scene:
         * **Lazy mode** — pulls from the async DataLoader and copies the
           pre-fetched pinned tensor into the persistent GPU buffer (or
           falls back to ``.to('cuda')`` for mixed-resolution datasets).
-          Flow data is NOT handled here; it is loaded on-demand in
-          ``train.py`` via ``Camera.load_flow()`` only on flow-loss
-          iterations.
+          Flow tensors can also be optionally pre-warmed into cache here
+          (same DataLoader order), while the actual ``Camera.load_flow()``
+          in ``train.py`` keeps ownership of per-iteration flow tensors.
         * **Eager mode** — pops a random camera from an internal
           ``viewpoint_stack`` that auto-refills each epoch.
         """

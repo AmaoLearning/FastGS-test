@@ -92,6 +92,14 @@ class ModelParams(ParamGroup):
         # lazy loading — N3V large-scale dataset (zero OOM)
         self.lazy_load = False
         self.num_images = 300  # number of frames per camera for N3V dataset
+        self.lazy_num_workers = 8
+        self.lazy_prefetch_factor = 6
+        self.lazy_image_buffer_count = 4  # number of persistent GPU image buffers (>=2)
+        self.lazy_prefetch_flow_to_cache = True  # use lazy DataLoader order to prewarm flow cache
+
+        self.enable_flow_preload_cache = True   # cache flow tensors on CPU to reduce repeated npy IO
+        self.flow_preload_cache_size = 64       # max number of cameras cached for flow preload (0 disables)
+        self.flow_preload_cache_device = "cuda"  # preload cache device: "cpu" or "cuda"/"cuda:0"
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):

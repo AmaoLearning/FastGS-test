@@ -39,8 +39,6 @@ except ImportError:
 
 import random
 from utils.fast_utils import compute_gaussian_score_fastgs, sampling_cameras
-from utils.flow_rasterizer import FlowRasterizerHelper, OpticalFlowLoss
-from utils.optic_flow_utils import load_precomputed_flow
 from utils.cluster_utils import cluster_dynamic_gaussians, render_cluster_pseudocolor
 
 
@@ -90,44 +88,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
     if scene._lazy_mode:
         scene.setup_lazy_dataloader()
 
-    # ── Optical Flow Setup ──
-    # Keep control paths decoupled:
-    #   - use_flow_loss    -> deformation flow loss only
-    #   - use_dynamic_sep  -> dynamic-logit flow supervision only (with lambda_flow_dynamic > 0)
-    _need_flow_loss = dataset.use_flow_loss
-    _need_flow_mask = dataset.use_flow_mask
+    # ── Optical Flow Setup (dynamic logits supervision only) ──
     _need_flow_dyn = dataset.use_dynamic_sep and opt.lambda_flow_dynamic > 0
-    _need_flow = _need_flow_loss or _need_flow_mask or _need_flow_dyn
-    flow_helper = None
-    flow_loss_fn = None
-    if _need_flow:
-        # 检查训练集是否有光流文件路径（延迟加载，此时不读取数组）
+    if _need_flow_dyn:
         any_has_flow = any(c.has_flow for c in scene.getTrainCameras())
         if any_has_flow:
-            flow_helper = FlowRasterizerHelper(
-                bg_color=torch.zeros(2, device="cuda"),
-                scale_modifier=1.0,
-                mult=opt.mult,
-                debug=False,
-            ).cuda()
-            flow_loss_fn = OpticalFlowLoss(
-                use_tv_loss=dataset.use_flow_tv_loss,
-                tv_weight=opt.flow_tv_weight,
-            )
             n_with_flow = sum(1 for c in scene.getTrainCameras() if c.has_flow)
             _flow_msg = f"Optical flow available for {n_with_flow}/{len(scene.getTrainCameras())} training cameras (lazy loading)"
             logger.info(_flow_msg)
             print(f"[INFO] {_flow_msg}")
         else:
-            _flow_warn = "Flow supervision requested but no flow files found, disabling flow-related paths."
+            _flow_warn = "Dynamic flow supervision requested but no flow files found, disabling flow_dynamic path."
             logger.warning(_flow_warn)
             print(f"[WARNING] {_flow_warn}")
-            dataset.use_flow_loss = False
-            dataset.use_flow_mask = False
-            _need_flow_loss = False
-            _need_flow_mask = False
             _need_flow_dyn = False
-            _need_flow = False
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -316,78 +290,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
             tb_writer.add_scalar('train_stats/num_gaussians', gaussians._xyz.shape[0], iteration)
 
-        # ── Shared flow data loading ──
-        # Decouple flow loading from individual loss paths:
-        #   - flow_loss / flow_mask:  gated by flow_loss_from_iter & flow_loss_interval
-        #   - flow_dynamic (BCE):     active every iteration from warm_up onward
+        # ── Flow data loading for dynamic logits supervision ──
         flow_gt = None
         flow_mask = None
-        _flow_need_for_loss = (
-            (_need_flow_loss or _need_flow_mask)
-            and flow_helper is not None
-            and iteration >= opt.flow_loss_from_iter
-            and iteration % opt.flow_loss_interval == 0
-            and iteration >= opt.warm_up
-            and torch.is_tensor(d_xyz)
-            and viewpoint_cam.has_flow
-        )
         _flow_need_for_dyn = (
             _need_flow_dyn
             and iteration >= opt.warm_up
             and torch.is_tensor(d_xyz)
             and viewpoint_cam.has_flow
         )
-        if _flow_need_for_loss or _flow_need_for_dyn:
+        if _flow_need_for_dyn:
             viewpoint_cam.load_flow(
                 device='cuda',
                 flow_magnitude_thresh=opt.flow_magnitude_thresh,
+                use_consistency_mask=(not opt.disable_flow_dynamic_mask),
+                enable_preload_cache=opt.enable_flow_preload_cache,
+                preload_cache_size=opt.flow_preload_cache_size,
+                preload_cache_device=opt.flow_preload_cache_device,
             )
             flow_gt = viewpoint_cam.flow_fwd  # [2, H, W]
             flow_mask = viewpoint_cam.flow_mask  # [1, H, W] bool or None
             if flow_mask is None:
                 flow_mask = torch.ones(1, flow_gt.shape[1], flow_gt.shape[2],
                                        dtype=torch.bool, device=flow_gt.device)
-
-        # ── Optical Flow Loss (deform finite-diff → projected flow → GT comparison) ──
-        # Gated by flow_loss_from_iter & flow_loss_interval; independent of flow_dynamic.
-        flow_loss = None
-        per_gaussian_flow_error = None
-        if _flow_need_for_loss and flow_gt is not None:
-            # 光流 GT = 帧间像素位移，对应 3D 量是位置形变差 d_xyz(t+dt) - d_xyz(t)
-            N = gaussians.get_xyz.shape[0]
-            time_input = fid.unsqueeze(0).expand(N, -1)
-            d_xyz_next, _, _ = deform.step(
-                gaussians.get_xyz.detach(),
-                time_input + ast_noise + time_interval
-            )
-            displacement3D = d_xyz_next - d_xyz  # [N, 3], 3D 位移, gradient → deform
-
-            deformed_means3D = gaussians.get_xyz + d_xyz
-            flow_pred, _, _ = flow_helper.render_flow(
-                gaussians=gaussians,
-                velocity3D=displacement3D,
-                viewpoint_camera=viewpoint_cam,
-                override_means3D=deformed_means3D,
-                detach_geometry=opt.detach_flow_geometry,
-            )
-            flow_loss = flow_loss_fn(flow_pred, flow_gt.float(), flow_mask.float())
-
-            # Per-gaussian flow error for densification mask.
-            if _need_flow_mask and flow_loss.requires_grad and displacement3D.requires_grad:
-                [flow_grad] = torch.autograd.grad(
-                    flow_loss, displacement3D, retain_graph=True
-                )
-                per_gaussian_flow_error = flow_grad.detach().norm(dim=-1, keepdim=True)
-
-            # Only use use_flow_loss to control deformation flow loss.
-            if _need_flow_loss:
-                loss = loss + opt.lambda_flow * flow_loss
-
-            if _need_flow_loss and iteration % 1000 == 0:
-                logger.info("[Iter %d] flow loss = %.6f", iteration, flow_loss.item())
-                print(f"[Iter {iteration}] flow loss = {flow_loss.item():.6f}")
-            if _need_flow_loss and tb_writer and iteration % 100 == 0:
-                tb_writer.add_scalar('train_loss_patches/flow_loss', flow_loss.item(), iteration)
 
         # Log final total loss (after all auxiliary losses are added)
         if tb_writer and iteration % 100 == 0:
@@ -508,10 +433,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
 
             # Densification
             if iteration < opt.densify_until_iter:
-                # 累积 flow loss 统计 (用于 densification 掩码)
-                if dataset.use_flow_mask and per_gaussian_flow_error is not None:
-                    gaussians.add_flow_loss_stats(per_gaussian_flow_error, visibility_filter)
-
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     my_viewpoint_stack = scene.getTrainCameras().copy()
@@ -520,23 +441,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                     scene.ensure_cameras_loaded(camlist)
                     importance_score, pruning_score = compute_gaussian_score_fastgs(camlist, gaussians, pipe, background, opt, d_xyz, d_rotation, d_scaling, dataset.is_6dof, DENSIFY=True)
                     scene.release_cameras(camlist)
-                    
-                    # 生成 flow_loss 掩码并传入 densification
-                    flow_mask = None
-                    if dataset.use_flow_mask and iteration >= opt.flow_loss_from_iter:
-                        flow_mask = gaussians.get_flow_loss_mask(
-                            opt.flow_loss_thresh, 
-                            adaptive_percentile=opt.flow_loss_percentile
-                        )
-                    
+
                     gaussians.densify_and_prune_fastgs(max_screen_size = size_threshold, 
                                                 min_opacity = 0.005, 
                                                 extent = scene.cameras_extent, 
                                                 radii=radii,
                                                 args = opt,
                                                 importance_score = importance_score,
-                                                pruning_score = pruning_score,
-                                                flow_mask = flow_mask)
+                                                pruning_score = pruning_score)
 
                 if iteration % opt.opacity_reset_interval == 0 or (
                         dataset.white_background and iteration == opt.densify_from_iter):
