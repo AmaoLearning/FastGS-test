@@ -437,10 +437,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                     pipe, opt.mult, d_xyz, d_rotation, d_scaling,
                     dataset.is_6dof,
                 )
+                _flow_dyn_mask = None if opt.disable_flow_dynamic_mask else flow_mask
                 _flow_dyn_loss = flow_dynamic_supervision_loss(
                     _prob_map,
                     flow_gt,
-                    flow_mask,
+                    _flow_dyn_mask,
                     opt.flow_dynamic_thresh,
                     opt.flow_dynamic_invalid_weight,
                     opt.flow_dynamic_target_gamma,

@@ -167,6 +167,7 @@ class OptimizationParams(ParamGroup):
         self.lambda_gate_deform = 0.1      # gate-deform consistency: large raw deform → high dynamic_prob
         self.lambda_dynamic_polarize = 0.01  # binary-entropy polarization: push dynamic_prob away from 0.5 toward 0/1
         self.lambda_flow_dynamic = 0.1     # flow-supervised dynamic prob (render prob map vs flow GT)
+        self.disable_flow_dynamic_mask = False  # disable forward-backward consistency mask only for flow_dynamic_supervision_loss
         self.flow_dynamic_thresh = 3.0     # flow magnitude (px) mapping to target=1 for dynamic supervision
         self.flow_dynamic_invalid_weight = 0.2  # non-zero weight for inconsistent pixels (avoid holes)
         self.flow_dynamic_target_gamma = 1.5    # suppress micro-motion noise in flow->target mapping
