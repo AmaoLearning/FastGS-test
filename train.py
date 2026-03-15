@@ -112,11 +112,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             hidden_channels=opt.classifier_hidden_channels,
             num_layers=opt.classifier_num_layers,
         ).cuda()
+        # torch.compile: fuse Conv→BN→ReLU kernels, reduce launch overhead
+        _dynamic_classifier = torch.compile(_dynamic_classifier, mode="reduce-overhead")
         _classifier_optimizer = torch.optim.Adam(
             _dynamic_classifier.parameters(),
             lr=opt.classifier_lr,
         )
-        _cls_msg = (f"DynamicClassifier2D created: hidden={opt.classifier_hidden_channels}, "
+        _cls_msg = (f"DynamicClassifier2D created (compiled): hidden={opt.classifier_hidden_channels}, "
                     f"layers={opt.classifier_num_layers}, lr={opt.classifier_lr}")
         logger.info(_cls_msg)
         print(f"[INFO] {_cls_msg}")

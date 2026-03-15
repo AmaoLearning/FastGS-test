@@ -94,7 +94,10 @@ def flow_classify_bce_loss(
     reliable_mask = (reliable_static | reliable_dynamic).float()
 
     # 3) Percentile binarisation → hard target
-    pct_val = torch.quantile(flow_mag.flatten(), binarize_percentile / 100.0)
+    # Use kthvalue (O(n) partial sort) instead of quantile (O(n log n) full sort)
+    _flat = flow_mag.flatten()
+    _k = max(1, min(int(binarize_percentile / 100.0 * _flat.numel()), _flat.numel()))
+    pct_val = _flat.kthvalue(_k).values
     binary_target = (flow_mag > pct_val).float()
     # Enforce consistency: reliable-region target must agree with threshold class
     binary_target = torch.where(reliable_dynamic, torch.ones_like(binary_target), binary_target)
