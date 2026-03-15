@@ -82,7 +82,7 @@ class ModelParams(ParamGroup):
         self.cluster_dynamic_thresh = 0.5  # 动态概率阈值，仅 prob > thresh 的高斯参与聚类
         self.cluster_w_xyz = 1.0           # 聚类特征权重：3D 位置
         self.cluster_w_color = 0.5         # 聚类特征权重：SH 0阶 (RGB)
-        self.cluster_w_motion = 1.0        # 聚类特征权重：历史平均形变
+        self.cluster_w_motion = 0.5        # 聚类特征权重：历史平均形变
 
         # optical flow loss（使用形变场有限差分 + diff-flow-rasterization）
         self.use_flow_loss = False  # 是否启用投影光流损失
@@ -186,6 +186,11 @@ class OptimizationParams(ParamGroup):
         self.flow_binarize_percentile = 50.0   # percentile (0-100) for flow magnitude binarization
         self.flow_dual_thresh_low = 0.5        # flow magnitude below this → reliable static
         self.flow_dual_thresh_high = 2.0       # flow magnitude above this → reliable dynamic
+
+        # 3D spatial KL regularization (SA4D-inspired)
+        self.lambda_spatial_kl = 0.05          # weight for 3D spatial KL regularization loss
+        self.spatial_kl_k = 8                 # number of nearest neighbors for KL
+        self.spatial_kl_interval = 100         # recompute KNN indices every N iterations
         super().__init__(parser, "Optimization Parameters", sentinel)
 
 

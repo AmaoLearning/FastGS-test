@@ -18,7 +18,8 @@ from random import randint
 from utils.loss_utils import (l1_loss, ssim, kl_divergence, l2_loss,
                               dynamic_sparsity_loss, gate_deform_consistency_loss,
                               flow_classify_bce_loss,
-                              binary_entropy_polarization_loss)
+                              binary_entropy_polarization_loss,
+                              spatial_kl_regularization_loss, compute_knn_indices)
 from utils.dynamic_classifier import DynamicClassifier2D
 from gaussian_renderer import render_fastgs, render_dynamic_prob_map, network_gui
 import sys
@@ -389,6 +390,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 loss = loss + opt.lambda_dynamic_polarize * _polar_loss
                 if tb_writer and iteration % 100 == 0:
                     tb_writer.add_scalar('train_loss_patches/dynamic_polarize', _polar_loss.item(), iteration)
+
+            # (3.5) 3D spatial KL regularization (SA4D-inspired)
+            #   Each Gaussian's dynamic_prob should be consistent with its k
+            #   nearest neighbors.  KNN indices are recomputed periodically
+            #   (expensive CPU call) and cached between updates.
+            if opt.lambda_spatial_kl > 0:
+                # Recompute KNN when stale or after densification/pruning
+                _N_cur = gaussians.get_xyz.shape[0]
+                if ('_knn_indices' not in dir() or _knn_indices is None
+                        or _knn_N != _N_cur
+                        or iteration % opt.spatial_kl_interval == 0):
+                    _knn_indices = compute_knn_indices(
+                        gaussians.get_xyz.detach(), k=opt.spatial_kl_k)
+                    _knn_N = _N_cur
+                _spatial_kl_loss = spatial_kl_regularization_loss(
+                    gaussians._dynamic_logit, _knn_indices,
+                    temperature=_dyn_temp,
+                )
+                loss = loss + opt.lambda_spatial_kl * _spatial_kl_loss
+                if tb_writer and iteration % 100 == 0:
+                    tb_writer.add_scalar('train_loss_patches/spatial_kl', _spatial_kl_loss.item(), iteration)
 
             # (4) Flow-supervised dynamic probability via 2D CNN classifier (SA4D-inspired)
             #     Pipeline: prob_map → CNN → logits → BCE(sigmoid(logits), binarised_flow)

@@ -113,6 +113,59 @@ def flow_classify_bce_loss(
     return (bce * reliable_mask).sum() / wsum
 
 
+def compute_knn_indices(xyz: torch.Tensor, k: int = 16) -> torch.Tensor:
+    """Compute k-nearest-neighbor indices via scipy cKDTree.
+
+    Runs on CPU (O(n log n) KD-tree build + O(n k log n) query).
+    Returns a CUDA ``LongTensor`` of shape ``(N, k)``.
+    """
+    from scipy.spatial import cKDTree
+    pts = xyz.detach().cpu().numpy()
+    tree = cKDTree(pts)
+    # k+1 because the closest point is the query itself
+    _, indices = tree.query(pts, k=k + 1, workers=-1)
+    indices = indices[:, 1:]  # drop self
+    return torch.from_numpy(indices).long().to(xyz.device)
+
+
+def spatial_kl_regularization_loss(
+    dynamic_logit: torch.Tensor,
+    knn_indices: torch.Tensor,
+    temperature: float = 1.0,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """3D spatial KL regularization (SA4D-inspired).
+
+    For each Gaussian *i* with probability ``p_i = sigmoid(logit_i / T)``,
+    compute the mean probability ``q_i`` of its *k* nearest neighbors,
+    then average the Bernoulli KL divergence:
+
+    .. math::
+
+        \\mathcal{L} = \\frac{1}{N} \\sum_i
+            \\mathrm{KL}\\bigl(\\mathrm{Bern}(p_i) \\|\n            \\mathrm{Bern}(q_i)\\bigr)
+
+    This encourages spatial consistency: nearby Gaussians should share
+    similar dynamic/static identity, suppressing isolated outliers.
+
+    Args:
+        dynamic_logit: ``(N, 1)`` raw logits.
+        knn_indices: ``(N, k)`` LongTensor of neighbor indices.
+        temperature: Sigmoid temperature (same as the gating temperature).
+        eps: Clamping margin to avoid ``log(0)``.
+    """
+    p = torch.sigmoid(dynamic_logit.squeeze(-1) / max(temperature, 1e-8))  # (N,)
+    p = p.clamp(eps, 1.0 - eps)
+
+    # Gather neighbor probabilities → mean
+    neighbor_p = p[knn_indices]              # (N, k)
+    q = neighbor_p.mean(dim=1).clamp(eps, 1.0 - eps)  # (N,)
+
+    # Bernoulli KL(p || q)
+    kl = p * (p.log() - q.log()) + (1.0 - p) * ((1.0 - p).log() - (1.0 - q).log())
+    return kl.mean()
+
+
 def dynamic_sparsity_loss(prob: torch.Tensor) -> torch.Tensor:
     """Sparsity prior: encourage most Gaussians to be static (prob → 0).
 
