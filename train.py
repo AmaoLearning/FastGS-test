@@ -121,6 +121,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
         logger.info(_cls_msg)
         print(f"[INFO] {_cls_msg}")
 
+    # ── Pre-warm flow cache before training loop ──
+    # Load up to flow_preload_cache_size flow pairs into cache during startup
+    # so the first warm_up→post-warmup transition doesn't stall on disk IO.
+    if _need_flow_dyn and dataset.enable_flow_preload_cache and dataset.flow_preload_cache_size > 0:
+        _prewarm_cams = [c for c in scene.getTrainCameras() if c.has_flow]
+        _prewarm_count = min(len(_prewarm_cams), dataset.flow_preload_cache_size)
+        if _prewarm_count > 0:
+            print(f"[INFO] Pre-warming flow cache with {_prewarm_count} cameras ...")
+            for _pw_cam in _prewarm_cams[:_prewarm_count]:
+                _pw_cam.load_flow(
+                    device='cpu',   # load to CPU first, will transfer on demand
+                    flow_magnitude_thresh=0.0,
+                    use_consistency_mask=False,
+                    enable_preload_cache=True,
+                    preload_cache_size=dataset.flow_preload_cache_size,
+                    preload_cache_device=dataset.flow_preload_cache_device,
+                )
+                _pw_cam.unload_flow()  # free per-camera tensors, cache retains them
+            print(f"[INFO] Flow cache pre-warmed: {_prewarm_count} entries")
+
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
