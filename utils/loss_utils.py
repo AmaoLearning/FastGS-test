@@ -62,6 +62,51 @@ def flow_dynamic_supervision_loss(
     return (bce * weight).sum() / wsum
 
 
+def flow_classify_bce_loss(
+    classifier_logits: torch.Tensor,
+    flow_gt: torch.Tensor,
+    binarize_percentile: float = 50.0,
+    dual_thresh_low: float = 0.5,
+    dual_thresh_high: float = 2.0,
+) -> torch.Tensor:
+    """BCE loss between 2D classifier logits and percentile-binarised optical flow.
+
+    Pipeline (SA4D-inspired):
+      1) ``flow_gt → norm → flow_mag``
+      2) Dual threshold → ``reliability_mask`` (clearly static ∪ clearly dynamic)
+      3) Percentile binarisation → ``binary_target`` (hard 0/1 label)
+      4) ``BCE_with_logits(logits, target)`` weighted by reliability mask
+
+    Args:
+        classifier_logits: ``(1, H, W)`` raw logits from :class:`DynamicClassifier2D`.
+        flow_gt: ``(2, H, W)`` optical flow (forward).
+        binarize_percentile: Percentile (0–100) of flow magnitude used as the
+            dynamic/static binarisation cut-off.
+        dual_thresh_low: Magnitude below this is treated as *reliably static*.
+        dual_thresh_high: Magnitude above this is treated as *reliably dynamic*.
+    """
+    # 1) Flow magnitude
+    flow_mag = flow_gt.float().norm(dim=0, keepdim=True)  # (1, H, W)
+
+    # 2) Dual-threshold reliability mask
+    reliable_static = flow_mag < dual_thresh_low     # definitely static
+    reliable_dynamic = flow_mag > dual_thresh_high   # definitely dynamic
+    reliable_mask = (reliable_static | reliable_dynamic).float()
+
+    # 3) Percentile binarisation → hard target
+    pct_val = torch.quantile(flow_mag.flatten(), binarize_percentile / 100.0)
+    binary_target = (flow_mag > pct_val).float()
+    # Enforce consistency: reliable-region target must agree with threshold class
+    binary_target = torch.where(reliable_dynamic, torch.ones_like(binary_target), binary_target)
+    binary_target = torch.where(reliable_static, torch.zeros_like(binary_target), binary_target)
+
+    # 4) Weighted BCE (logits → numerically stable)
+    logits = classifier_logits[:1].float()
+    bce = F.binary_cross_entropy_with_logits(logits, binary_target, reduction="none")
+    wsum = reliable_mask.sum().clamp_min(1.0)
+    return (bce * reliable_mask).sum() / wsum
+
+
 def dynamic_sparsity_loss(prob: torch.Tensor) -> torch.Tensor:
     """Sparsity prior: encourage most Gaussians to be static (prob → 0).
 

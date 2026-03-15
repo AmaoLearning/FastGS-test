@@ -17,8 +17,9 @@ import torch
 from random import randint
 from utils.loss_utils import (l1_loss, ssim, kl_divergence, l2_loss,
                               dynamic_sparsity_loss, gate_deform_consistency_loss,
-                              flow_dynamic_supervision_loss,
+                              flow_classify_bce_loss,
                               binary_entropy_polarization_loss)
+from utils.dynamic_classifier import DynamicClassifier2D
 from gaussian_renderer import render_fastgs, render_dynamic_prob_map, network_gui
 import sys
 from scene import Scene, GaussianModel, DeformModel, DeformModel_4DGS
@@ -102,6 +103,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             logger.warning(_flow_warn)
             print(f"[WARNING] {_flow_warn}")
             _need_flow_dyn = False
+
+    # ── 2D CNN Classifier for flow-supervised dynamic logits (SA4D-inspired) ──
+    _dynamic_classifier = None
+    _classifier_optimizer = None
+    if _need_flow_dyn:
+        _dynamic_classifier = DynamicClassifier2D(
+            hidden_channels=opt.classifier_hidden_channels,
+            num_layers=opt.classifier_num_layers,
+        ).cuda()
+        _classifier_optimizer = torch.optim.Adam(
+            _dynamic_classifier.parameters(),
+            lr=opt.classifier_lr,
+        )
+        _cls_msg = (f"DynamicClassifier2D created: hidden={opt.classifier_hidden_channels}, "
+                    f"layers={opt.classifier_num_layers}, lr={opt.classifier_lr}")
+        logger.info(_cls_msg)
+        print(f"[INFO] {_cls_msg}")
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -292,7 +310,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
 
         # ── Flow data loading for dynamic logits supervision ──
         flow_gt = None
-        flow_mask = None
         _flow_need_for_dyn = (
             _need_flow_dyn
             and iteration >= opt.warm_up
@@ -302,17 +319,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
         if _flow_need_for_dyn:
             viewpoint_cam.load_flow(
                 device='cuda',
-                flow_magnitude_thresh=opt.flow_magnitude_thresh,
-                use_consistency_mask=(not opt.disable_flow_dynamic_mask),
+                flow_magnitude_thresh=0.0,       # dual threshold handles reliability
+                use_consistency_mask=False,       # dual threshold replaces consistency mask
                 enable_preload_cache=dataset.enable_flow_preload_cache,
                 preload_cache_size=dataset.flow_preload_cache_size,
                 preload_cache_device=dataset.flow_preload_cache_device,
             )
             flow_gt = viewpoint_cam.flow_fwd  # [2, H, W]
-            flow_mask = viewpoint_cam.flow_mask  # [1, H, W] bool or None
-            if flow_mask is None:
-                flow_mask = torch.ones(1, flow_gt.shape[1], flow_gt.shape[2],
-                                       dtype=torch.bool, device=flow_gt.device)
 
         # Log final total loss (after all auxiliary losses are added)
         if tb_writer and iteration % 100 == 0:
@@ -332,7 +345,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
         #   1) Sparsity prior: mean(p)         → push all prob toward 0
         #   2) Gate-deform:   (1-p)*||d_raw||  → push large-deform prob toward 1
         #   3) Polarization:  H(p)            → push prob away from 0.5 toward 0/1
-        #   4) Flow supervision: BCE(prob_map, flow_mag/τ) → pixel-level GT
+        #   4) Flow classifier (SA4D): prob_map → CNN → BCE(logits, binarised_flow)
         if dataset.use_dynamic_sep and iteration >= opt.warm_up:
             # (1) Sparsity prior
             if opt.lambda_dynamic_sparse > 0:
@@ -355,28 +368,31 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 if tb_writer and iteration % 100 == 0:
                     tb_writer.add_scalar('train_loss_patches/dynamic_polarize', _polar_loss.item(), iteration)
 
-            # (4) Flow-supervised dynamic probability
-            if _need_flow_dyn and flow_gt is not None:
+            # (4) Flow-supervised dynamic probability via 2D CNN classifier (SA4D-inspired)
+            #     Pipeline: prob_map → CNN → logits → BCE(sigmoid(logits), binarised_flow)
+            if _need_flow_dyn and flow_gt is not None and _dynamic_classifier is not None:
                 _d_xyz_fd = d_xyz.detach() if (opt.detach_flow_dynamic_geometry and torch.is_tensor(d_xyz)) else d_xyz
                 _d_rotation_fd = d_rotation.detach() if (opt.detach_flow_dynamic_geometry and torch.is_tensor(d_rotation)) else d_rotation
                 _d_scaling_fd = d_scaling.detach() if (opt.detach_flow_dynamic_geometry and torch.is_tensor(d_scaling)) else d_scaling
+                # Step 1: Render 1D probability map (unchanged)
                 _prob_map = render_dynamic_prob_map(
                     viewpoint_cam, gaussians, _dynamic_prob,
                     pipe, opt.mult, _d_xyz_fd, _d_rotation_fd, _d_scaling_fd,
                     dataset.is_6dof,
                 )
-                _flow_dyn_mask = None if opt.disable_flow_dynamic_mask else flow_mask
-                _flow_dyn_loss = flow_dynamic_supervision_loss(
-                    _prob_map,
+                # Step 2: Pass through 2D CNN classifier
+                _classify_logits = _dynamic_classifier(_prob_map)
+                # Steps 3 & 4: Dual-threshold reliability + percentile binarisation + BCE
+                _flow_cls_loss = flow_classify_bce_loss(
+                    _classify_logits,
                     flow_gt,
-                    _flow_dyn_mask,
-                    opt.flow_dynamic_thresh,
-                    opt.flow_dynamic_invalid_weight,
-                    opt.flow_dynamic_target_gamma,
+                    binarize_percentile=opt.flow_binarize_percentile,
+                    dual_thresh_low=opt.flow_dual_thresh_low,
+                    dual_thresh_high=opt.flow_dual_thresh_high,
                 )
-                loss = loss + opt.lambda_flow_dynamic * _flow_dyn_loss
+                loss = loss + opt.lambda_flow_dynamic * _flow_cls_loss
                 if tb_writer and iteration % 100 == 0:
-                    tb_writer.add_scalar('train_loss_patches/flow_dynamic', _flow_dyn_loss.item(), iteration)
+                    tb_writer.add_scalar('train_loss_patches/flow_classify', _flow_cls_loss.item(), iteration)
 
         if _enable_phase_timer:
             torch.cuda.synchronize()
@@ -433,6 +449,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
                 deform.save_weights(args.model_path, iteration)
+                if _dynamic_classifier is not None:
+                    _dynamic_classifier.save_weights(args.model_path, iteration)
 
             # Densification
             if iteration < opt.densify_until_iter:
@@ -528,6 +546,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 deform.optimizer.step()
                 deform.optimizer.zero_grad(set_to_none=True)
                 gaussians.optimizer_step(iteration)
+                if _classifier_optimizer is not None:
+                    _classifier_optimizer.step()
+                    _classifier_optimizer.zero_grad(set_to_none=True)
 
             if _enable_phase_timer:
                 torch.cuda.synchronize()

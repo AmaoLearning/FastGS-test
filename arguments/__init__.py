@@ -174,14 +174,18 @@ class OptimizationParams(ParamGroup):
         self.lambda_dynamic_sparse = 0.01  # sparsity prior: push dynamic_prob toward 0 (most are static)
         self.lambda_gate_deform = 0.1      # gate-deform consistency: large raw deform → high dynamic_prob
         self.lambda_dynamic_polarize = 0.01  # binary-entropy polarization: push dynamic_prob away from 0.5 toward 0/1
-        self.lambda_flow_dynamic = 0.1     # flow-supervised dynamic prob (render prob map vs flow GT)
-        self.disable_flow_dynamic_mask = False  # disable forward-backward consistency mask only for flow_dynamic_supervision_loss
+        self.lambda_flow_dynamic = 0.1     # flow-supervised dynamic prob via 2D CNN classifier (SA4D-inspired)
         self.detach_flow_dynamic_geometry = True  # detach d_xyz/d_rotation/d_scaling in flow_dynamic branch to cut backward cost
-        self.flow_dynamic_thresh = 3.0     # flow magnitude (px) mapping to target=1 for dynamic supervision
-        self.flow_dynamic_invalid_weight = 0.2  # non-zero weight for inconsistent pixels (avoid holes)
-        self.flow_dynamic_target_gamma = 1.5    # suppress micro-motion noise in flow->target mapping
         self.dynamic_sep_temp_init = 1.0   # sigmoid temperature at start (soft)
         self.dynamic_sep_temp_final = 0.05 # sigmoid temperature at end (near-binary)
+
+        # 2D CNN classifier for flow-supervised dynamic logits (SA4D-inspired)
+        self.classifier_hidden_channels = 32   # hidden channels in Conv2d layers
+        self.classifier_num_layers = 3         # number of conv layers (>= 2)
+        self.classifier_lr = 0.001             # learning rate for classifier optimizer
+        self.flow_binarize_percentile = 50.0   # percentile (0-100) for flow magnitude binarization
+        self.flow_dual_thresh_low = 0.5        # flow magnitude below this → reliable static
+        self.flow_dual_thresh_high = 2.0       # flow magnitude above this → reliable dynamic
         super().__init__(parser, "Optimization Parameters", sentinel)
 
 
