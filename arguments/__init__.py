@@ -183,7 +183,6 @@ class OptimizationParams(ParamGroup):
         self.classifier_hidden_channels = 32   # hidden channels in Conv2d layers
         self.classifier_num_layers = 3         # number of conv layers (>= 2)
         self.classifier_lr = 0.001             # learning rate for classifier optimizer
-        self.flow_binarize_percentile = 50.0   # percentile (0-100) for flow magnitude binarization
         self.flow_dual_thresh_low = 30.0       # percentile (0-100): below this → reliable static
         self.flow_dual_thresh_high = 70.0      # percentile (0-100): above this → reliable dynamic
 

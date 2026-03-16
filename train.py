@@ -426,11 +426,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 )
                 # Step 2: Pass through 2D CNN classifier
                 _classify_logits = _dynamic_classifier(_prob_map)
-                # Steps 3 & 4: Dual-threshold reliability + percentile binarisation + BCE
+                # Steps 3 & 4: Dual-threshold reliability + BCE
                 _flow_cls_loss = flow_classify_bce_loss(
                     _classify_logits,
                     flow_gt,
-                    binarize_percentile=opt.flow_binarize_percentile,
                     dual_thresh_low=opt.flow_dual_thresh_low,
                     dual_thresh_high=opt.flow_dual_thresh_high,
                 )
