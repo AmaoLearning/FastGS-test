@@ -66,41 +66,47 @@ def flow_classify_bce_loss(
     classifier_logits: torch.Tensor,
     flow_gt: torch.Tensor,
     binarize_percentile: float = 50.0,
-    dual_thresh_low: float = 0.5,
-    dual_thresh_high: float = 2.0,
+    dual_thresh_low: float = 30.0,
+    dual_thresh_high: float = 70.0,
 ) -> torch.Tensor:
     """BCE loss between 2D classifier logits and percentile-binarised optical flow.
 
     Pipeline (SA4D-inspired):
       1) ``flow_gt → norm → flow_mag``
-      2) Dual threshold → ``reliability_mask`` (clearly static ∪ clearly dynamic)
+      2) Dual percentile threshold → ``reliability_mask``
       3) Percentile binarisation → ``binary_target`` (hard 0/1 label)
       4) ``BCE_with_logits(logits, target)`` weighted by reliability mask
+
+    All three percentile thresholds are resolved from a **single**
+    ``torch.sort`` call — O(n log n) once, then three O(1) index lookups.
 
     Args:
         classifier_logits: ``(1, H, W)`` raw logits from :class:`DynamicClassifier2D`.
         flow_gt: ``(2, H, W)`` optical flow (forward).
         binarize_percentile: Percentile (0–100) of flow magnitude used as the
             dynamic/static binarisation cut-off.
-        dual_thresh_low: Magnitude below this is treated as *reliably static*.
-        dual_thresh_high: Magnitude above this is treated as *reliably dynamic*.
+        dual_thresh_low: Percentile (0–100) below which pixels are *reliably static*.
+        dual_thresh_high: Percentile (0–100) above which pixels are *reliably dynamic*.
     """
     # 1) Flow magnitude
     flow_mag = flow_gt.float().norm(dim=0, keepdim=True)  # (1, H, W)
 
-    # 2) Dual-threshold reliability mask
-    reliable_static = flow_mag < dual_thresh_low     # definitely static
-    reliable_dynamic = flow_mag > dual_thresh_high   # definitely dynamic
+    # 2-3) Single sort → all three percentile values in one pass
+    _sorted = flow_mag.flatten().sort().values
+    _n = _sorted.numel()
+    _idx_lo = max(0, min(int(dual_thresh_low / 100.0 * _n), _n - 1))
+    _idx_mid = max(0, min(int(binarize_percentile / 100.0 * _n), _n - 1))
+    _idx_hi = max(0, min(int(dual_thresh_high / 100.0 * _n), _n - 1))
+    val_lo = _sorted[_idx_lo]
+    pct_val = _sorted[_idx_mid]
+    val_hi = _sorted[_idx_hi]
+
+    # Dual-percentile reliability mask
+    reliable_static = flow_mag < val_lo       # definitely static
+    reliable_dynamic = flow_mag > val_hi      # definitely dynamic
     reliable_mask = (reliable_static | reliable_dynamic).float()
 
-    # 3) Percentile binarisation → hard target
-    # torch.median has a dedicated CUDA O(n) kernel — fast path for the
-    # common default (50th percentile).  Fall back to torch.quantile for
-    # other percentiles.
-    if binarize_percentile == 50.0:
-        pct_val = flow_mag.median()
-    else:
-        pct_val = torch.quantile(flow_mag.flatten(), binarize_percentile / 100.0)
+    # Percentile binarisation → hard target
     binary_target = (flow_mag > pct_val).float()
     # Enforce consistency: reliable-region target must agree with threshold class
     binary_target = torch.where(reliable_dynamic, torch.ones_like(binary_target), binary_target)

@@ -184,8 +184,8 @@ class OptimizationParams(ParamGroup):
         self.classifier_num_layers = 3         # number of conv layers (>= 2)
         self.classifier_lr = 0.001             # learning rate for classifier optimizer
         self.flow_binarize_percentile = 50.0   # percentile (0-100) for flow magnitude binarization
-        self.flow_dual_thresh_low = 0.5        # flow magnitude below this → reliable static
-        self.flow_dual_thresh_high = 2.0       # flow magnitude above this → reliable dynamic
+        self.flow_dual_thresh_low = 30.0       # percentile (0-100): below this → reliable static
+        self.flow_dual_thresh_high = 70.0      # percentile (0-100): above this → reliable dynamic
 
         # 3D spatial KL regularization (SA4D-inspired)
         self.lambda_spatial_kl = 0.05          # weight for 3D spatial KL regularization loss
