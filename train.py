@@ -44,6 +44,86 @@ from utils.fast_utils import compute_gaussian_score_fastgs, sampling_cameras
 from utils.cluster_utils import cluster_dynamic_gaussians, render_cluster_pseudocolor
 
 
+def run_clustering_at_iteration(
+    gaussians,
+    scene,
+    deform,
+    pipe,
+    background,
+    dataset,
+    iteration: int,
+    temperature: float = 1.0,
+    mult: float = 1.0,
+    tb_writer=None,
+):
+    """Run dynamic Gaussian clustering at specified iteration (decoupled from training loop).
+
+    Args:
+        gaussians: GaussianModel instance.
+        scene: Scene instance.
+        deform: Deformation model.
+        pipe: Pipeline params.
+        background: Background color tensor.
+        dataset: Dataset with clustering parameters.
+        iteration: Current iteration number for naming outputs.
+        temperature: Temperature for sigmoid scaling.
+        mult: Scaling multiplier for rendering.
+        tb_writer: TensorBoard writer (optional).
+    """
+    if not getattr(dataset, 'use_dynamic_sep', False):
+        return None
+
+    _cluster_save = os.path.join(
+        dataset.model_path, "cluster",
+        f"cluster_iter{iteration}.npz")
+    os.makedirs(os.path.dirname(_cluster_save), exist_ok=True)
+
+    cluster_result = cluster_dynamic_gaussians(
+        gaussians,
+        dynamic_thresh=getattr(dataset, 'cluster_dynamic_thresh', 0.5),
+        n_clusters=getattr(dataset, 'cluster_n_clusters', 8),
+        w_xyz=getattr(dataset, 'cluster_w_xyz', 1.0),
+        w_color=getattr(dataset, 'cluster_w_color', 0.5),
+        w_motion=getattr(dataset, 'cluster_w_motion', 1.0),
+        temperature=temperature,
+        tb_writer=tb_writer,
+        iteration=iteration,
+        save_path=_cluster_save,
+    )
+    gaussians._cluster_labels = cluster_result["labels"]
+
+    # Pseudo-color visualization
+    _test_cams = scene.getTestCameras()
+    _debug_cam = None
+    for _c in _test_cams:
+        if 'cam00' in _c.image_name and float(_c.fid.item()) < 1e-4:
+            _debug_cam = _c
+            break
+    if _debug_cam is None:
+        _sorted = sorted(_test_cams, key=lambda c: c.fid.item())
+        _debug_cam = _sorted[0]
+    scene.ensure_cameras_loaded([_debug_cam])
+    _vis_path = os.path.join(
+        dataset.model_path, "cluster",
+        f"cluster_vis_iter{iteration}.png")
+    render_cluster_pseudocolor(
+        gaussians,
+        labels=cluster_result["labels"],
+        viewpoint_cam=_debug_cam,
+        deform=deform,
+        pipe=pipe,
+        bg_color=background,
+        mult=mult,
+        is_6dof=dataset.is_6dof,
+        save_path=_vis_path,
+        tb_writer=tb_writer,
+        iteration=iteration,
+    )
+    scene.release_cameras([_debug_cam])
+    print(f"[INFO] Clustering at iter {iteration} saved to {_cluster_save}")
+    return cluster_result
+
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: bool = False,
              profile: bool = False, profile_start: int = 500, profile_steps: int = 50,
              logger: logging.Logger = None):
@@ -180,7 +260,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
         print(f"[PROFILE] Will capture {profile_steps} iterations starting at iter {profile_start}")
         print(f"[PROFILE] Trace output: {trace_dir}")
         print(f"[PROFILE] Phase timer enabled — prints breakdown every {_PHASE_REPORT_INTERVAL} iters")
-    _clustering_done = False  # ensures dynamic clustering runs only once
 
     for iteration in range(1, opt.iterations + 1):
         # Start profiler at the designated iteration
@@ -531,60 +610,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
 
                 gaussians.final_prune_fastgs(min_opacity = 0.1, pruning_score = pruning_score)
 
-                # ── Dynamic Gaussian clustering (once, after first final_prune) ──
-                if (dataset.use_dynamic_sep
-                        and not _clustering_done
-                        and iteration > opt.final_prune_from_iter):
-                    _clustering_done = True
-                    _cluster_save = os.path.join(
-                        dataset.model_path, "cluster",
-                        f"cluster_iter{iteration}.npz")
-                    cluster_result = cluster_dynamic_gaussians(
-                        gaussians,
-                        dynamic_thresh=dataset.cluster_dynamic_thresh,
-                        n_clusters=dataset.cluster_n_clusters,
-                        w_xyz=dataset.cluster_w_xyz,
-                        w_color=dataset.cluster_w_color,
-                        w_motion=dataset.cluster_w_motion,
-                        temperature=_dyn_temp if '_dyn_temp' in dir() else 1.0,
-                        tb_writer=tb_writer,
-                        iteration=iteration,
-                        save_path=_cluster_save,
-                    )
-                    # Store labels on gaussians for downstream use
-                    gaussians._cluster_labels = cluster_result["labels"]
-
-                    # ── Debug: pseudo-color render of cluster labels ──
-                    # cam00 defaults to test set; use test cameras for viewpoint
-                    _test_cams = scene.getTestCameras()
-                    _debug_cam = None
-                    for _c in _test_cams:
-                        if 'cam00' in _c.image_name and float(_c.fid.item()) < 1e-4:
-                            _debug_cam = _c
-                            break
-                    if _debug_cam is None:  # fallback: first camera with fid ~= 0
-                        _sorted = sorted(_test_cams, key=lambda c: c.fid.item())
-                        _debug_cam = _sorted[0]
-                    scene.ensure_cameras_loaded([_debug_cam])
-                    _vis_path = os.path.join(
-                        dataset.model_path, "cluster",
-                        f"cluster_vis_iter{iteration}.png")
-                    render_cluster_pseudocolor(
-                        gaussians,
-                        labels=cluster_result["labels"],
-                        viewpoint_cam=_debug_cam,
-                        deform=deform,
-                        pipe=pipe,
-                        bg_color=background,
-                        mult=opt.mult,
-                        is_6dof=dataset.is_6dof,
-                        save_path=_vis_path,
-                        tb_writer=tb_writer,
-                        iteration=iteration,
-                    )
-                    scene.release_cameras([_debug_cam])
-            
-            
             if iteration < opt.iterations:
                 deform.optimizer.step()
                 deform.optimizer.zero_grad(set_to_none=True)
@@ -619,6 +644,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                     _profiler_ctx = None
                     logger.info("[PROFILE] Profiler stopped at iteration %d. Trace saved to %s", iteration, trace_dir)
                     print(f"[PROFILE] Profiler stopped at iteration {iteration}. Trace saved to {trace_dir}")
+
+            # ── Run clustering at configurable iterations (decoupled from training loop) ──
+            if dataset.use_dynamic_sep and iteration in dataset.clustering_iterations:
+                run_clustering_at_iteration(
+                    gaussians=gaussians,
+                    scene=scene,
+                    deform=deform,
+                    pipe=pipe,
+                    background=background,
+                    dataset=dataset,
+                    iteration=iteration,
+                    temperature=opt.dynamic_sep_temp_final,
+                    mult=opt.mult,
+                    tb_writer=tb_writer,
+                )
 
     # Final sync — only once at the very end
     torch.cuda.synchronize()
