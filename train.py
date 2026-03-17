@@ -157,6 +157,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
         deform = DeformModel(dataset.is_blender, dataset.is_6dof)
     deform.train_setting(opt)
 
+    if dataset.clustering_iterations.strip():
+        dataset.clustering_iterations = tuple(int(x.strip()) for x in dataset.clustering_iterations.split(','))
+    else:
+        dataset.clustering_iterations = [15000]
+
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt, args)
 
