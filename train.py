@@ -344,10 +344,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 _dyn_temp = opt.dynamic_sep_temp_init * (opt.dynamic_sep_temp_final / max(opt.dynamic_sep_temp_init, 1e-8)) ** _temp_progress
                 _dynamic_prob = gaussians.get_dynamic_prob_t(_dyn_temp)
                 # Detach dynamic_prob for deformation gating (no gradient flow to deform network)
-                _dynamic_prob_gated = _dynamic_prob.detach()
-                d_xyz = _dynamic_prob_gated * d_xyz
-                d_rotation = _dynamic_prob_gated * d_rotation
-                d_scaling = _dynamic_prob_gated * d_scaling
+                # _dynamic_prob_gated = _dynamic_prob.detach()
+                # d_xyz = _dynamic_prob_gated * d_xyz
+                # d_rotation = _dynamic_prob_gated * d_rotation
+                # d_scaling = _dynamic_prob_gated * d_scaling
 
             # ── Deformation distribution histogram (optional) ──
             if (dataset.log_deform_hist
