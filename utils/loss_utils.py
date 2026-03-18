@@ -173,7 +173,7 @@ def spatial_kl_regularization_loss(
     p_expanded = p.unsqueeze(1).expand(-1, p_neighbors.shape[1])  # (N, k)
 
     # Bernoulli KL(p_i || p_j) for each neighbor j
-    # KL = p * log(p/p_j) + (1-p) * log((1-p)/(1-p_j))
+    # KL = p * log(p/p_j)
     kl = p_expanded * (p_expanded.log() - p_neighbors.log())
     
     return kl.mean()
