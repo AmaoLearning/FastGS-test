@@ -166,7 +166,7 @@ def spatial_kl_regularization_loss(
     p = p.clamp(eps, 1.0 - eps)
 
     # Gather neighbor probabilities
-    p_neighbors = p[knn_indices]              # (N, k)
+    p_neighbors = p[knn_indices].detach()              # (N, k)
     p_neighbors = p_neighbors.clamp(eps, 1.0 - eps)
 
     # Expand p to (N, k) for broadcasting
