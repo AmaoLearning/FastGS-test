@@ -134,7 +134,7 @@ def compute_knn_indices(xyz: torch.Tensor, k: int = 16) -> torch.Tensor:
     return torch.from_numpy(indices).long().to(xyz.device)
 
 
-def spatial_kl_regularization_loss(
+def spatial_regularization_loss(
     dynamic_logit: torch.Tensor,
     knn_indices: torch.Tensor,
     temperature: float = 1.0,
@@ -172,11 +172,10 @@ def spatial_kl_regularization_loss(
     # Expand p to (N, k) for broadcasting
     p_expanded = p.unsqueeze(1).expand(-1, p_neighbors.shape[1])  # (N, k)
 
-    # Bernoulli KL(p_i || p_j) for each neighbor j
-    # KL = p * log(p/p_j)
-    kl = p_expanded * (p_expanded.log() - p_neighbors.log())
-    
-    return kl.mean()
+    # Asymmetric spatial regularization: penalize p_i > p_j
+    # Loss = (F.relu(p_i - p_j.detach()) ** 2).mean()
+    loss = F.relu(p_expanded - p_neighbors) ** 2
+    return loss.mean()
 
 
 def dynamic_sparsity_loss(prob: torch.Tensor) -> torch.Tensor:

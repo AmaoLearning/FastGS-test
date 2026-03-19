@@ -19,7 +19,7 @@ from utils.loss_utils import (l1_loss, ssim, kl_divergence, l2_loss,
                               dynamic_sparsity_loss, gate_deform_consistency_loss,
                               flow_classify_bce_loss,
                               binary_entropy_polarization_loss,
-                              spatial_kl_regularization_loss, compute_knn_indices,
+                              spatial_regularization_loss, compute_knn_indices,
                               deform_var_margin_ranking_loss)
 from utils.dynamic_classifier import DynamicClassifier2D
 from gaussian_renderer import render_fastgs, render_dynamic_prob_map, network_gui
@@ -491,7 +491,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                     _knn_indices = compute_knn_indices(
                         gaussians.get_xyz.detach(), k=opt.spatial_kl_k)
                     _knn_N = _N_cur
-                _spatial_kl_loss = spatial_kl_regularization_loss(
+                _spatial_kl_loss = spatial_regularization_loss(
                     gaussians._dynamic_logit, _knn_indices,
                     temperature=_dyn_temp,
                 )
