@@ -177,9 +177,11 @@ class OptimizationParams(ParamGroup):
         self.lambda_gate_deform = 0.1      # gate-deform consistency: large raw deform → high dynamic_prob
         self.lambda_dynamic_polarize = 0.01  # binary-entropy polarization: push dynamic_prob away from 0.5 toward 0/1
         self.lambda_flow_dynamic = 0.1     # flow-supervised dynamic prob via 2D CNN classifier (SA4D-inspired)
+        self.lambda_deform_var_rank = 0.05 # rank dynamic logits using accumulated deformation variance
         self.detach_flow_dynamic_geometry = True  # detach d_xyz/d_rotation/d_scaling in flow_dynamic branch to cut backward cost
         self.dynamic_sep_temp_init = 1.0   # sigmoid temperature at start (soft)
         self.dynamic_sep_temp_final = 0.05 # sigmoid temperature at end (near-binary)
+        self.deform_var_rank_margin = 0.2  # margin in variance-based dynamic logit ranking loss
 
         # 2D CNN classifier for flow-supervised dynamic logits (SA4D-inspired)
         self.classifier_hidden_channels = 32   # hidden channels in Conv2d layers

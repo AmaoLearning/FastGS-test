@@ -187,6 +187,57 @@ def dynamic_sparsity_loss(prob: torch.Tensor) -> torch.Tensor:
     return prob.mean()
 
 
+def deform_var_margin_ranking_loss(
+    dynamic_logit: torch.Tensor,
+    deform_var: torch.Tensor,
+    deform_count: torch.Tensor,
+    margin: float = 0.2,
+    min_count: int = 8,
+    pair_ratio: float = 0.25,
+    max_pairs: int = 4096,
+) -> torch.Tensor:
+    """Rank dynamic logits using accumulated deformation variance.
+
+    High-variance Gaussians should receive larger dynamic logits than
+    low-variance Gaussians. Variance is expected to be computed from the
+    memory-efficient accumulators ``sum(d)``, ``sum(d^2)``, and ``count``.
+
+    Args:
+        dynamic_logit: ``(N, 1)`` raw dynamic logits.
+        deform_var: ``(N, 3)`` per-axis deformation variance.
+        deform_count: ``(N, 1)`` number of accumulated observations.
+        margin: Margin used by :func:`torch.nn.functional.margin_ranking_loss`.
+        min_count: Minimum history count before a Gaussian participates.
+        pair_ratio: Fraction of valid Gaussians used for high/low variance pairing.
+        max_pairs: Upper bound on pair count to cap runtime.
+    """
+    if dynamic_logit.numel() == 0:
+        return dynamic_logit.new_zeros(())
+
+    counts = deform_count.squeeze(-1)
+    valid_mask = counts >= max(int(min_count), 1)
+    if valid_mask.sum() < 2:
+        return dynamic_logit.new_zeros(())
+
+    variance_score = deform_var.sum(dim=-1)
+    valid_scores = variance_score[valid_mask]
+    valid_logits = dynamic_logit.squeeze(-1)[valid_mask]
+    valid_count = valid_scores.shape[0]
+
+    pair_count = int(valid_count * pair_ratio)
+    pair_count = max(1, min(pair_count, valid_count // 2, int(max_pairs)))
+    if pair_count < 1:
+        return dynamic_logit.new_zeros(())
+
+    high_idx = torch.topk(valid_scores, k=pair_count, largest=True, sorted=False).indices
+    low_idx = torch.topk(valid_scores, k=pair_count, largest=False, sorted=False).indices
+
+    high_logits = valid_logits[high_idx]
+    low_logits = valid_logits[low_idx]
+    target = torch.ones_like(high_logits)
+    return F.margin_ranking_loss(high_logits, low_logits, target, margin=float(margin))
+
+
 def gate_deform_consistency_loss(
     prob: torch.Tensor,
     d_xyz_raw: torch.Tensor,

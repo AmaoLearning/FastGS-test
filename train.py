@@ -19,7 +19,8 @@ from utils.loss_utils import (l1_loss, ssim, kl_divergence, l2_loss,
                               dynamic_sparsity_loss, gate_deform_consistency_loss,
                               flow_classify_bce_loss,
                               binary_entropy_polarization_loss,
-                              spatial_kl_regularization_loss, compute_knn_indices)
+                              spatial_kl_regularization_loss, compute_knn_indices,
+                              deform_var_margin_ranking_loss)
 from utils.dynamic_classifier import DynamicClassifier2D
 from gaussian_renderer import render_fastgs, render_dynamic_prob_map, network_gui
 import sys
@@ -497,6 +498,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 loss = loss + opt.lambda_spatial_kl * _spatial_kl_loss
                 if tb_writer and iteration % 100 == 0:
                     tb_writer.add_scalar('train_loss_patches/spatial_kl', _spatial_kl_loss.item(), iteration)
+
+            # (3.75) Deformation-variance ranking: high-variance Gaussians
+            #        should rank above low-variance ones in dynamic_logit.
+            if opt.lambda_deform_var_rank > 0:
+                _deform_var_rank_loss = deform_var_margin_ranking_loss(
+                    gaussians._dynamic_logit,
+                    gaussians.get_deform_var(),
+                    gaussians._deform_denom,
+                    margin=opt.deform_var_rank_margin,
+                )
+                loss = loss + opt.lambda_deform_var_rank * _deform_var_rank_loss
+                if tb_writer and iteration % 100 == 0:
+                    tb_writer.add_scalar('train_loss_patches/deform_var_rank', _deform_var_rank_loss.item(), iteration)
 
             # (4) Flow-supervised dynamic probability via 2D CNN classifier (SA4D-inspired)
             #     Pipeline: prob_map → CNN → logits → BCE(sigmoid(logits), binarised_flow)
