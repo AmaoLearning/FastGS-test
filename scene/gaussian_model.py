@@ -138,8 +138,6 @@ class GaussianModel:
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
-        dynamic_logits = torch.zeros((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda")
-        self._dynamic_logit = nn.Parameter(dynamic_logits.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self._deform_accum = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
         self._deform_sq_accum = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
@@ -213,14 +211,13 @@ class GaussianModel:
         f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
-        dynamic_logits = self._dynamic_logit.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, dynamic_logits, scale, rotation), axis=1)
+        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -238,10 +235,6 @@ class GaussianModel:
                         np.asarray(plydata.elements[0]["y"]),
                         np.asarray(plydata.elements[0]["z"])), axis=1)
         opacities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
-        if "dynamic_logit" in plydata.elements[0].data.dtype.names:
-            dynamic_logits = np.asarray(plydata.elements[0]["dynamic_logit"])[..., np.newaxis]
-        else:
-            dynamic_logits = np.zeros((xyz.shape[0], 1), dtype=np.float32)
 
         features_dc = np.zeros((xyz.shape[0], 3, 1))
         features_dc[:, 0, 0] = np.asarray(plydata.elements[0]["f_dc_0"])
@@ -274,9 +267,6 @@ class GaussianModel:
             torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(
                 True))
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._dynamic_logit = nn.Parameter(
-            torch.tensor(dynamic_logits, dtype=torch.float, device="cuda").requires_grad_(True)
-        )
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
 
