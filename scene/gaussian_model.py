@@ -39,7 +39,6 @@ class GaussianModel:
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
-        self._dynamic_logit = torch.empty(0)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.xyz_gradient_accum_abs = torch.empty(0)
@@ -95,18 +94,6 @@ class GaussianModel:
     @property
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
-
-    @property
-    def get_dynamic_prob(self):
-        return torch.sigmoid(self._dynamic_logit)
-
-    def get_dynamic_prob_t(self, temperature: float = 1.0) -> torch.Tensor:
-        """Dynamic probability with temperature-scaled sigmoid.
-
-        As *temperature* → 0 the sigmoid approaches a step function,
-        producing near-binary outputs (0 or 1).
-        """
-        return torch.sigmoid(self._dynamic_logit / max(temperature, 1e-8))
 
     def get_covariance(self, scaling_modifier=1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
@@ -196,7 +183,6 @@ class GaussianModel:
         for i in range(self._features_rest.shape[1] * self._features_rest.shape[2]):
             l.append('f_rest_{}'.format(i))
         l.append('opacity')
-        l.append('dynamic_logit')
         for i in range(self._scaling.shape[1]):
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
@@ -340,7 +326,6 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
-        self._dynamic_logit = optimizable_tensors["dynamic_logit"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
         self.xyz_gradient_accum_abs = self.xyz_gradient_accum_abs[valid_points_mask]
@@ -380,14 +365,13 @@ class GaussianModel:
         return optimizable_tensors
 
     def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
-                              new_rotation, new_dynamic_logit):
+                              new_rotation):
         d = {"xyz": new_xyz,
              "f_dc": new_features_dc,
              "f_rest": new_features_rest,
              "opacity": new_opacities,
              "scaling": new_scaling,
-             "rotation": new_rotation,
-             "dynamic_logit": new_dynamic_logit}
+             "rotation": new_rotation}
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -396,7 +380,6 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
-        self._dynamic_logit = optimizable_tensors["dynamic_logit"]
 
         # Extend global deform accumulators for newly added Gaussians
         _n_new = new_xyz.shape[0]
@@ -549,9 +532,8 @@ class GaussianModel:
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N, 1, 1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N, 1, 1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N, 1)
-        new_dynamic_logit = self._dynamic_logit[selected_pts_mask].repeat(N, 1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_dynamic_logit)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
 
         prune_filter = torch.cat(
             (selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
@@ -570,10 +552,9 @@ class GaussianModel:
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
-        new_dynamic_logit = self._dynamic_logit[selected_pts_mask]
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
-                       new_rotation, new_dynamic_logit)
+                       new_rotation)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom
@@ -608,9 +589,8 @@ class GaussianModel:
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
-        new_dynamic_logit = self._dynamic_logit[selected_pts_mask].repeat(N,1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_dynamic_logit)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -625,9 +605,8 @@ class GaussianModel:
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
-        new_dynamic_logit = self._dynamic_logit[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_dynamic_logit)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
 
     def densify_and_prune_fastgs(self, max_screen_size, min_opacity, extent, radii, args, importance_score = None, pruning_score = None, flow_mask = None):
         
