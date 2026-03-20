@@ -81,11 +81,14 @@ class ModelParams(ParamGroup):
         # Dynamic Gaussian clustering (decoupled from training loop)
         self.clustering_iterations = "15000" # Comma-separated iteration numbers, e.g. "15000,30000" → [15000, 30000]
         self.cluster_n_clusters = 8        # KMeans 聚类数
-        self.cluster_dynamic_thresh = 0.5  # 动态概率阈值，仅 prob > thresh 的高斯参与聚类
+        self.cluster_dynamic_thresh = 0.5  # 动态概率阈值，仅 prob > thresh 的高斯参与聚类（用于旧版本兼容）
         self.cluster_w_xyz = 1.0           # 聚类特征权重：3D 位置
         self.cluster_w_color = 0.5         # 聚类特征权重：SH 0阶 (RGB)
         self.cluster_w_motion = 0.5        # 聚类特征权重：历史平均形变
 
+        # mapo
+        self.dynamic_score_percentile = 80  # 动态分数百分位阈值：选取动态分数位于前 (100-percentile)% 的高斯参与聚类，默认为80表示前20%
+        
         # optical flow loss（使用形变场有限差分 + diff-flow-rasterization）
         self.use_flow_loss = False  # 是否启用投影光流损失
         self.use_flow_mask = False  # 是否启用光流掩码引导致密化（可独立于 flow loss 使用）
@@ -170,30 +173,6 @@ class OptimizationParams(ParamGroup):
         # flow-based densification mask（用光流拟合质量控制致密化）
         self.flow_loss_thresh = 0.001  # 光流损失阈值（固定阈值模式）
         self.flow_loss_percentile = 70  # 自适应阈值百分比，-1 表示使用固定阈值，0-100 表示使用自适应阈值（如 70 表示约 70% 低损失高斯通过筛选）
-        
-        # dynamic logits
-        self.dynamic_prob_lr = 0.001
-        self.lambda_dynamic_sparse = 0.01  # sparsity prior: push dynamic_prob toward 0 (most are static)
-        self.lambda_gate_deform = 0.1      # gate-deform consistency: large raw deform → high dynamic_prob
-        self.lambda_dynamic_polarize = 0.01  # binary-entropy polarization: push dynamic_prob away from 0.5 toward 0/1
-        self.lambda_flow_dynamic = 0.1     # flow-supervised dynamic prob via 2D CNN classifier (SA4D-inspired)
-        self.lambda_deform_var_rank = 0.05 # rank dynamic logits using accumulated deformation variance
-        self.detach_flow_dynamic_geometry = True  # detach d_xyz/d_rotation/d_scaling in flow_dynamic branch to cut backward cost
-        self.dynamic_sep_temp_init = 1.0   # sigmoid temperature at start (soft)
-        self.dynamic_sep_temp_final = 0.05 # sigmoid temperature at end (near-binary)
-        self.deform_var_rank_margin = 0.2  # margin in variance-based dynamic logit ranking loss
-
-        # 2D CNN classifier for flow-supervised dynamic logits (SA4D-inspired)
-        self.classifier_hidden_channels = 32   # hidden channels in Conv2d layers
-        self.classifier_num_layers = 3         # number of conv layers (>= 2)
-        self.classifier_lr = 0.001             # learning rate for classifier optimizer
-        self.flow_dual_thresh_low = 30.0       # percentile (0-100): below this → reliable static
-        self.flow_dual_thresh_high = 70.0      # percentile (0-100): above this → reliable dynamic
-
-        # 3D spatial KL regularization (SA4D-inspired)
-        self.lambda_spatial_kl = 0.05          # weight for 3D spatial KL regularization loss
-        self.spatial_kl_k = 8                 # number of nearest neighbors for KL
-        self.spatial_kl_interval = 100         # recompute KNN indices every N iterations
         super().__init__(parser, "Optimization Parameters", sentinel)
 
 

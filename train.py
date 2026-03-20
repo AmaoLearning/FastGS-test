@@ -15,14 +15,8 @@ import logging
 import traceback
 import torch
 from random import randint
-from utils.loss_utils import (l1_loss, ssim, kl_divergence, l2_loss,
-                              dynamic_sparsity_loss, gate_deform_consistency_loss,
-                              flow_classify_bce_loss,
-                              binary_entropy_polarization_loss,
-                              spatial_regularization_loss, compute_knn_indices,
-                              deform_var_margin_ranking_loss)
-from utils.dynamic_classifier import DynamicClassifier2D
-from gaussian_renderer import render_fastgs, render_dynamic_prob_map, network_gui
+from utils.loss_utils import (l1_loss, ssim, kl_divergence, l2_loss)
+from gaussian_renderer import render_fastgs, network_gui
 import sys
 from scene import Scene, GaussianModel, DeformModel, DeformModel_4DGS
 from utils.general_utils import safe_state, get_linear_noise_func
@@ -90,6 +84,7 @@ def run_clustering_at_iteration(
         tb_writer=tb_writer,
         iteration=iteration,
         save_path=_cluster_save,
+        dynamic_score_percentile=getattr(dataset, 'dynamic_score_percentile', 80.0),
     )
     gaussians._cluster_labels = cluster_result["labels"]
 
@@ -175,60 +170,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
     # Initialize async image prefetch pipeline (lazy mode only)
     if scene._lazy_mode:
         scene.setup_lazy_dataloader()
-
-    # ── Optical Flow Setup (dynamic logits supervision only) ──
-    _need_flow_dyn = dataset.use_dynamic_sep and opt.lambda_flow_dynamic > 0
-    if _need_flow_dyn:
-        any_has_flow = any(c.has_flow for c in scene.getTrainCameras())
-        if any_has_flow:
-            n_with_flow = sum(1 for c in scene.getTrainCameras() if c.has_flow)
-            _flow_msg = f"Optical flow available for {n_with_flow}/{len(scene.getTrainCameras())} training cameras (lazy loading)"
-            logger.info(_flow_msg)
-            print(f"[INFO] {_flow_msg}")
-        else:
-            _flow_warn = "Dynamic flow supervision requested but no flow files found, disabling flow_dynamic path."
-            logger.warning(_flow_warn)
-            print(f"[WARNING] {_flow_warn}")
-            _need_flow_dyn = False
-
-    # ── 2D CNN Classifier for flow-supervised dynamic logits (SA4D-inspired) ──
-    _dynamic_classifier = None
-    _classifier_optimizer = None
-    if _need_flow_dyn:
-        _dynamic_classifier = DynamicClassifier2D(
-            hidden_channels=opt.classifier_hidden_channels,
-            num_layers=opt.classifier_num_layers,
-        ).cuda()
-        # torch.compile: fuse Conv→BN→ReLU kernels, reduce launch overhead
-        _dynamic_classifier = torch.compile(_dynamic_classifier, mode="reduce-overhead")
-        _classifier_optimizer = torch.optim.Adam(
-            _dynamic_classifier.parameters(),
-            lr=opt.classifier_lr,
-        )
-        _cls_msg = (f"DynamicClassifier2D created (compiled): hidden={opt.classifier_hidden_channels}, "
-                    f"layers={opt.classifier_num_layers}, lr={opt.classifier_lr}")
-        logger.info(_cls_msg)
-        print(f"[INFO] {_cls_msg}")
-
-    # ── Pre-warm flow cache before training loop ──
-    # Load up to flow_preload_cache_size flow pairs into cache during startup
-    # so the first warm_up→post-warmup transition doesn't stall on disk IO.
-    if _need_flow_dyn and dataset.enable_flow_preload_cache and dataset.flow_preload_cache_size > 0:
-        _prewarm_cams = [c for c in scene.getTrainCameras() if c.has_flow]
-        _prewarm_count = min(len(_prewarm_cams), dataset.flow_preload_cache_size)
-        if _prewarm_count > 0:
-            print(f"[INFO] Pre-warming flow cache with {_prewarm_count} cameras ...")
-            for _pw_cam in _prewarm_cams[:_prewarm_count]:
-                _pw_cam.load_flow(
-                    device='cpu',   # load to CPU first, will transfer on demand
-                    flow_magnitude_thresh=0.0,
-                    use_consistency_mask=False,
-                    enable_preload_cache=True,
-                    preload_cache_size=dataset.flow_preload_cache_size,
-                    preload_cache_device=dataset.flow_preload_cache_device,
-                )
-                _pw_cam.unload_flow()  # free per-camera tensors, cache retains them
-            print(f"[INFO] Flow cache pre-warmed: {_prewarm_count} entries")
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -334,22 +275,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
 
             d_xyz, d_rotation, d_scaling = deform.step(gaussians.get_xyz.detach(), time_input + ast_noise)
 
-            # ── Soft dynamic-static separation ──
-            # Gate each Gaussian's deformation with a learnable dynamic probability.
-            # Temperature annealing: sigmoid(logit / tau) with tau decaying over
-            # training, gradually sharpening the soft gate toward a hard 0/1 mask.
-            # Keep raw deformation for gate-deform consistency loss & accumulation.
+            # ── Accumulate deformation for dynamic score computation ──
+            # Record deformation from iteration 10000-15000 for dynamic score at iteration 15000
             _d_xyz_raw = d_xyz  # (N, 3), unmodified output from deform network
-            if dataset.use_dynamic_sep:
-                _temp_progress = max(0.0, min(1.0, (iteration - opt.warm_up) / max(1, opt.iterations - opt.warm_up)))
-                _dyn_temp = opt.dynamic_sep_temp_init * (opt.dynamic_sep_temp_final / max(opt.dynamic_sep_temp_init, 1e-8)) ** _temp_progress
-                _dynamic_prob = gaussians.get_dynamic_prob_t(_dyn_temp)
-                # Detach dynamic_prob for deformation gating (no gradient flow to deform network)
-                # _dynamic_prob_gated = _dynamic_prob.detach()
-                # d_xyz = _dynamic_prob_gated * d_xyz
-                # d_rotation = _dynamic_prob_gated * d_rotation
-                # d_scaling = _dynamic_prob_gated * d_scaling
-
+            
             # ── Deformation distribution histogram (optional) ──
             if (dataset.log_deform_hist
                     and tb_writer
@@ -360,12 +289,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                     tb_writer.add_scalar('deform/mag_max', _hist_mag.max().item(), iteration)
                     tb_writer.add_scalar('deform/mag_mean', _hist_mag.mean().item(), iteration)
                     tb_writer.add_scalar('deform/mag_median', _hist_mag.median().item(), iteration)
-                    # Also log dynamic_prob stats when dynamic sep is active
-                    if dataset.use_dynamic_sep:
-                        tb_writer.add_histogram('deform/dynamic_prob', _dynamic_prob.squeeze(-1), iteration)
-                        _static_ratio = (_dynamic_prob < 0.5).float().mean().item()
-                        tb_writer.add_scalar('deform/static_ratio', _static_ratio, iteration)
-                        tb_writer.add_scalar('deform/dynamic_sep_temp', _dyn_temp, iteration)
                     try:
                         import matplotlib
                         matplotlib.use('Agg')
@@ -382,10 +305,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                     except ImportError:
                         pass  # matplotlib not available, skip figure
 
-            # Accumulate RAW (pre-gate) deformation for clustering & pseudo-labels.
+            # Accumulate RAW deformation for dynamic score computation.
             # Using gated d_xyz would undercount motion for prob≈0.5 Gaussians.
             if torch.is_tensor(d_xyz) and dataset.use_dynamic_sep:
                 gaussians.add_deform_stats(_d_xyz_raw)
+            
+            # ── Start deformation tracking from iteration 10000 ──
+            if dataset.use_dynamic_sep and iteration == 10000:
+                gaussians.start_deform_tracking()
+                print(f"[INFO] Starting deformation tracking at iteration {iteration}")
 
         if _enable_phase_timer:
             torch.cuda.synchronize()
@@ -418,25 +346,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
             tb_writer.add_scalar('train_stats/num_gaussians', gaussians._xyz.shape[0], iteration)
 
-        # ── Flow data loading for dynamic logits supervision ──
-        flow_gt = None
-        _flow_need_for_dyn = (
-            _need_flow_dyn
-            and iteration >= opt.warm_up
-            and torch.is_tensor(d_xyz)
-            and viewpoint_cam.has_flow
-        )
-        if _flow_need_for_dyn:
-            viewpoint_cam.load_flow(
-                device='cuda',
-                flow_magnitude_thresh=0.0,       # dual threshold handles reliability
-                use_consistency_mask=False,       # dual threshold replaces consistency mask
-                enable_preload_cache=dataset.enable_flow_preload_cache,
-                preload_cache_size=dataset.flow_preload_cache_size,
-                preload_cache_device=dataset.flow_preload_cache_device,
-            )
-            flow_gt = viewpoint_cam.flow_fwd  # [2, H, W]
-
         # Log final total loss (after all auxiliary losses are added)
         if tb_writer and iteration % 100 == 0:
             tb_writer.add_scalar('train_loss_patches/total_loss_final', loss.item(), iteration)
@@ -450,92 +359,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 tb_writer.add_scalar('train_loss_patches/hexplane_tv', _tv_loss.item(), iteration)
                 tb_writer.add_scalar('train_loss_patches/hexplane_l1', _l1_loss.item(), iteration)
 
-        # ── Dynamic-static separation losses ──
-        # All dynamic_logit supervision is grouped here for clarity.
-        #   1) Sparsity prior: mean(p)         → push all prob toward 0
-        #   2) Gate-deform:   (1-p)*||d_raw||  → push large-deform prob toward 1
-        #   3) Polarization:  H(p)            → push prob away from 0.5 toward 0/1
-        #   4) Flow classifier (SA4D): prob_map → CNN → BCE(logits, binarised_flow)
-        if dataset.use_dynamic_sep and iteration >= opt.warm_up:
-            # (1) Sparsity prior
-            if opt.lambda_dynamic_sparse > 0:
-                _sparse_loss = dynamic_sparsity_loss(_dynamic_prob)
-                loss = loss + opt.lambda_dynamic_sparse * _sparse_loss
-                if tb_writer and iteration % 100 == 0:
-                    tb_writer.add_scalar('train_loss_patches/dynamic_sparse', _sparse_loss.item(), iteration)
-
-            # (2) Gate-deform consistency
-            if opt.lambda_gate_deform > 0 and torch.is_tensor(_d_xyz_raw):
-                _gate_loss = gate_deform_consistency_loss(_dynamic_prob, _d_xyz_raw)
-                loss = loss + opt.lambda_gate_deform * _gate_loss
-                if tb_writer and iteration % 100 == 0:
-                    tb_writer.add_scalar('train_loss_patches/gate_deform', _gate_loss.item(), iteration)
-
-            # (3) Binary-entropy polarization
-            if opt.lambda_dynamic_polarize > 0:
-                _polar_loss = binary_entropy_polarization_loss(_dynamic_prob)
-                loss = loss + opt.lambda_dynamic_polarize * _polar_loss
-                if tb_writer and iteration % 100 == 0:
-                    tb_writer.add_scalar('train_loss_patches/dynamic_polarize', _polar_loss.item(), iteration)
-
-            # (3.5) 3D spatial KL regularization (SA4D-inspired)
-            #   Each Gaussian's dynamic_prob should be consistent with its k
-            #   nearest neighbors.  KNN indices are recomputed periodically
-            #   (expensive CPU call) and cached between updates.
-            if opt.lambda_spatial_kl > 0:
-                # Recompute KNN when stale or after densification/pruning
-                _N_cur = gaussians.get_xyz.shape[0]
-                if ('_knn_indices' not in dir() or _knn_indices is None
-                        or _knn_N != _N_cur
-                        or iteration % opt.spatial_kl_interval == 0):
-                    _knn_indices = compute_knn_indices(
-                        gaussians.get_xyz.detach(), k=opt.spatial_kl_k)
-                    _knn_N = _N_cur
-                _spatial_kl_loss = spatial_regularization_loss(
-                    gaussians._dynamic_logit, _knn_indices,
-                    temperature=_dyn_temp,
-                )
-                loss = loss + opt.lambda_spatial_kl * _spatial_kl_loss
-                if tb_writer and iteration % 100 == 0:
-                    tb_writer.add_scalar('train_loss_patches/spatial_kl', _spatial_kl_loss.item(), iteration)
-
-            # (3.75) Deformation-variance ranking: high-variance Gaussians
-            #        should rank above low-variance ones in dynamic_logit.
-            if opt.lambda_deform_var_rank > 0:
-                _deform_var_rank_loss = deform_var_margin_ranking_loss(
-                    gaussians._dynamic_logit,
-                    gaussians.get_deform_var(),
-                    gaussians._deform_denom,
-                    margin=opt.deform_var_rank_margin,
-                )
-                loss = loss + opt.lambda_deform_var_rank * _deform_var_rank_loss
-                if tb_writer and iteration % 100 == 0:
-                    tb_writer.add_scalar('train_loss_patches/deform_var_rank', _deform_var_rank_loss.item(), iteration)
-
-            # (4) Flow-supervised dynamic probability via 2D CNN classifier (SA4D-inspired)
-            #     Pipeline: prob_map → CNN → logits → BCE(sigmoid(logits), binarised_flow)
-            if _need_flow_dyn and flow_gt is not None and _dynamic_classifier is not None:
-                _d_xyz_fd = d_xyz.detach() if (opt.detach_flow_dynamic_geometry and torch.is_tensor(d_xyz)) else d_xyz
-                _d_rotation_fd = d_rotation.detach() if (opt.detach_flow_dynamic_geometry and torch.is_tensor(d_rotation)) else d_rotation
-                _d_scaling_fd = d_scaling.detach() if (opt.detach_flow_dynamic_geometry and torch.is_tensor(d_scaling)) else d_scaling
-                # Step 1: Render 1D probability map (unchanged)
-                _prob_map = render_dynamic_prob_map(
-                    viewpoint_cam, gaussians, _dynamic_prob,
-                    pipe, opt.mult, _d_xyz_fd, _d_rotation_fd, _d_scaling_fd,
-                    dataset.is_6dof,
-                )
-                # Step 2: Pass through 2D CNN classifier
-                _classify_logits = _dynamic_classifier(_prob_map)
-                # Steps 3 & 4: Dual-threshold reliability + BCE
-                _flow_cls_loss = flow_classify_bce_loss(
-                    _classify_logits,
-                    flow_gt,
-                    dual_thresh_low=opt.flow_dual_thresh_low,
-                    dual_thresh_high=opt.flow_dual_thresh_high,
-                )
-                loss = loss + opt.lambda_flow_dynamic * _flow_cls_loss
-                if tb_writer and iteration % 100 == 0:
-                    tb_writer.add_scalar('train_loss_patches/flow_classify', _flow_cls_loss.item(), iteration)
+        # ── Dynamic score-based separation (replaces dynamic probability losses) ──
+        # Dynamic score is computed at iteration 15000 using displacement statistics
+        # from iterations 10000-15000. No online loss supervision needed.
 
         if _enable_phase_timer:
             torch.cuda.synchronize()
@@ -592,8 +418,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
                 deform.save_weights(args.model_path, iteration)
-                if _dynamic_classifier is not None:
-                    _dynamic_classifier.save_weights(args.model_path, iteration)
 
             # Densification
             if iteration < opt.densify_until_iter:
@@ -635,9 +459,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 deform.optimizer.step()
                 deform.optimizer.zero_grad(set_to_none=True)
                 gaussians.optimizer_step(iteration)
-                if _classifier_optimizer is not None:
-                    _classifier_optimizer.step()
-                    _classifier_optimizer.zero_grad(set_to_none=True)
 
             if _enable_phase_timer:
                 torch.cuda.synchronize()
@@ -676,7 +497,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                     background=background,
                     dataset=dataset,
                     iteration=iteration,
-                    temperature=opt.dynamic_sep_temp_final,
+                    temperature=1.0,  # temperature for dynamic score thresholding
                     mult=opt.mult,
                     tb_writer=tb_writer,
                 )

@@ -48,6 +48,10 @@ class GaussianModel:
         self._deform_accum = torch.empty(0)   # (N, 3) accumulated d_xyz
         self._deform_sq_accum = torch.empty(0)   # (N, 3) accumulated d_xyz^2
         self._deform_denom = torch.empty(0)   # (N, 1) count
+        # Maximum displacement difference tracking (for dynamic score)
+        self._deform_max = torch.empty(0)    # (N, 3) max d_xyz per Gaussian
+        self._deform_min = torch.empty(0)    # (N, 3) min d_xyz per Gaussian
+        self._deform_tracking_started = False  # flag to start tracking from iter 10000
 
         self.optimizer = None
         self.shoptimizer = None
@@ -140,6 +144,10 @@ class GaussianModel:
         self._deform_accum = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
         self._deform_sq_accum = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
         self._deform_denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        # Initialize max/min deformation tracking
+        self._deform_max = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
+        self._deform_min = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
+        self._deform_tracking_started = False
 
     def training_setup(self, training_args, args):
         self.percent_dense = training_args.percent_dense
@@ -151,6 +159,10 @@ class GaussianModel:
         self._deform_accum = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
         self._deform_sq_accum = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
         self._deform_denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        # Initialize max/min deformation tracking
+        self._deform_max = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
+        self._deform_min = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
+        self._deform_tracking_started = False
 
         self.spatial_lr_scale = 5
 
@@ -160,7 +172,6 @@ class GaussianModel:
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
-            {'params': [self._dynamic_logit], 'lr': training_args.dynamic_prob_lr, "name": "dynamic_logit"}
         ]
         sh_l = [{'params': [self._features_rest], 'lr': args.highfeature_lr / 20.0, "name": "f_rest"}]
 
@@ -348,6 +359,8 @@ class GaussianModel:
         self._deform_accum = self._deform_accum[valid_points_mask]
         self._deform_sq_accum = self._deform_sq_accum[valid_points_mask]
         self._deform_denom = self._deform_denom[valid_points_mask]
+        self._deform_max = self._deform_max[valid_points_mask] if self._deform_max.numel() > 0 else self._deform_max
+        self._deform_min = self._deform_min[valid_points_mask] if self._deform_min.numel() > 0 else self._deform_min
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
@@ -403,6 +416,10 @@ class GaussianModel:
                             torch.zeros(_n_new, 3, device="cuda")], dim=0)
         self._deform_denom = torch.cat([self._deform_denom,
                                          torch.zeros(_n_new, 1, device="cuda")], dim=0)
+        self._deform_max = torch.cat([self._deform_max,
+                                       torch.zeros(_n_new, 3, device="cuda")], dim=0) if self._deform_max.numel() > 0 else self._deform_max
+        self._deform_min = torch.cat([self._deform_min,
+                                       torch.zeros(_n_new, 3, device="cuda")], dim=0) if self._deform_min.numel() > 0 else self._deform_min
 
         self.zero_accums()
 
@@ -420,13 +437,32 @@ class GaussianModel:
         self._deform_accum = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
         self._deform_sq_accum = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
         self._deform_denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self._deform_max = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
+        self._deform_min = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
+        self._deform_tracking_started = False
+
+    def start_deform_tracking(self):
+        """Start tracking max/min deformation from iteration 10000."""
+        self._deform_tracking_started = True
 
     def add_deform_stats(self, d_xyz: torch.Tensor) -> None:
-        """Accumulate per-Gaussian deformation for motion history."""
+        """Accumulate per-Gaussian deformation for motion history.
+        
+        When tracking is started (from iter 10000), also tracks max/min displacement.
+        """
         d_xyz_detached = d_xyz.detach()
         self._deform_accum += d_xyz_detached
         self._deform_sq_accum += d_xyz_detached.square()
         self._deform_denom += 1
+        
+        # Track max/min displacement when tracking is enabled
+        if self._deform_tracking_started:
+            if self._deform_max.numel() == 0 or self._deform_max.shape[0] != d_xyz_detached.shape[0]:
+                self._deform_max = d_xyz_detached.clone()
+                self._deform_min = d_xyz_detached.clone()
+            else:
+                self._deform_max = torch.maximum(self._deform_max, d_xyz_detached)
+                self._deform_min = torch.minimum(self._deform_min, d_xyz_detached)
 
     def get_mean_deform(self) -> torch.Tensor:
         """Return per-Gaussian mean deformation (N, 3). Zero if no history."""
@@ -439,6 +475,69 @@ class GaussianModel:
         mean = self._deform_accum / denom
         second_moment = self._deform_sq_accum / denom
         return (second_moment - mean.square()).clamp_min(0.0)
+
+    def get_max_deform_diff(self) -> torch.Tensor:
+        """Return per-Gaussian maximum displacement difference (N,) - magnitude of max - min displacement."""
+        if self._deform_max.numel() == 0 or self._deform_min.numel() == 0:
+            return torch.zeros(self.get_xyz.shape[0], device="cuda")
+        # Compute L2 norm of (max - min) for each Gaussian
+        diff = self._deform_max - self._deform_min  # (N, 3)
+        return torch.norm(diff, dim=-1)  # (N,)
+
+    def compute_dynamic_score(self) -> torch.Tensor:
+        """Compute dynamic score as harmonic mean of percentile ranks.
+        
+        Dynamic score is the harmonic mean of:
+        1. Max displacement difference percentile: rank of each gaussian's max displacement diff in percent
+        2. Deformation variance percentile: rank of each gaussian's deformation variance in percent
+        
+        Returns:
+            dynamic_score: (N,) tensor with scores in range [0, 1]
+        """
+        if not self._deform_tracking_started or self._deform_denom.sum().item() == 0:
+            return torch.zeros(self.get_xyz.shape[0], device="cuda")
+        
+        # 1. Compute max displacement difference magnitude for each Gaussian
+        max_diff = self.get_max_deform_diff()  # (N,)
+        
+        # 2. Compute total deformation variance for each Gaussian (sum across xyz)
+        deform_var = self.get_deform_var()  # (N, 3)
+        deform_var_sum = deform_var.sum(dim=-1)  # (N,)
+        
+        # 3. Compute percentile ranks (0-100, floor)
+        # For max displacement difference percentile
+        max_diff_sorted, _ = torch.sort(max_diff)
+        # Use searchsorted to find percentile rank
+        max_diff_percentile = torch.searchsorted(max_diff_sorted, max_diff).float()  # (N,)
+        max_diff_percentile = torch.clamp(max_diff_percentile, max=99)  # Avoid 100 for valid harmonic mean
+        
+        # For deformation variance percentile
+        var_sorted, _ = torch.sort(deform_var_sum)
+        var_percentile = torch.searchsorted(var_sorted, deform_var_sum).float()  # (N,)
+        var_percentile = torch.clamp(var_percentile, max=99)
+        
+        # 4. Convert to 0-1 range for harmonic mean
+        max_diff_pct_normalized = (max_diff_percentile + 1) / 100.0  # +1 to avoid 0
+        var_pct_normalized = (var_percentile + 1) / 100.0
+        
+        # 5. Harmonic mean: 2 * a * b / (a + b)
+        # Add small epsilon to avoid division by zero
+        epsilon = 1e-8
+        harmonic_mean = 2.0 * max_diff_pct_normalized * var_pct_normalized / (max_diff_pct_normalized + var_pct_normalized + epsilon)
+        
+        return harmonic_mean  # (N,), range [0, 1]
+
+    def get_dynamic_gaussian_mask(self, threshold: float = 0.8) -> torch.Tensor:
+        """Get boolean mask for dynamic Gaussians based on dynamic score threshold.
+        
+        Args:
+            threshold: Dynamic score threshold (default 0.8 = 80%)
+            
+        Returns:
+            mask: (N,) boolean tensor, True for dynamic Gaussians
+        """
+        dynamic_score = self.compute_dynamic_score()
+        return dynamic_score > threshold
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]

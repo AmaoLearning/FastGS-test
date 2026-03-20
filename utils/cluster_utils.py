@@ -157,18 +157,21 @@ def cluster_dynamic_gaussians(
     tb_writer=None,
     iteration: int = 0,
     save_path: Optional[str] = None,
+    dynamic_score_percentile: float = 80.0,
 ) -> Dict[str, object]:
     """Cluster dynamic Gaussians and return results.
 
     Args:
         gaussians: GaussianModel instance.
-        dynamic_thresh: Probability threshold for selecting dynamic Gaussians.
+        dynamic_thresh: Probability threshold for selecting dynamic Gaussians (legacy).
         n_clusters: Number of KMeans clusters.
         w_xyz / w_color / w_motion: Feature weights.
         temperature: Sigmoid temperature for dynamic prob.
         tb_writer: Optional TensorBoard writer.
         iteration: Current training iteration (for logging).
         save_path: If provided, save cluster labels as .npz.
+        dynamic_score_percentile: Percentile threshold for dynamic score (0-100).
+            Default 80 means select Gaussians with dynamic score in top 20%.
 
     Returns:
         Dict with keys:
@@ -181,15 +184,36 @@ def cluster_dynamic_gaussians(
     N = gaussians.get_xyz.shape[0]
 
     # ── 1. Select dynamic Gaussians ──
+    # Use dynamic score (from iter 15000) if available, otherwise fall back to dynamic probability
     with torch.no_grad():
-        if hasattr(gaussians, 'get_dynamic_prob_t'):
-            dyn_prob = gaussians.get_dynamic_prob_t(temperature).squeeze(-1)  # (N,)
-        else:
-            dyn_prob = gaussians.get_dynamic_prob.squeeze(-1)
-        dynamic_mask = dyn_prob > dynamic_thresh  # boolean (N,)
+        # Use dynamic score mechanism: compute score and compute percentile-based threshold
+        dyn_score = gaussians.compute_dynamic_score()  # (N,), range [0, 1]
+            
+        # Compute threshold based on percentile: get the value at (100 - percentile) position
+        # e.g., percentile=80 means select top 20%, so we need to find the value at 80th percentile
+        sorted_scores, _ = torch.sort(dyn_score)
+        # Convert percentile to index (clamp to valid range)
+        percentile_idx = int((100 - dynamic_score_percentile) / 100.0 * N)
+        percentile_idx = max(0, min(percentile_idx, N - 1))
+        score_thresh = sorted_scores[percentile_idx].item()
+            
+        dynamic_mask = dyn_score > score_thresh  # boolean (N,)
         n_dynamic = int(dynamic_mask.sum().item())
+            
+        _msg = (f"[CLUSTER] Using dynamic score mechanism: "
+                f"percentile={dynamic_score_percentile}, "
+                f"score_threshold={score_thresh:.4f}, "
+                f"selected={n_dynamic}/{N}")
+        logger.info(_msg)
+        print(_msg)
+            
+        # Log score distribution for debugging
+        if tb_writer is not None:
+            tb_writer.add_scalar('cluster/dynamic_score_thresh', score_thresh, iteration)
+            tb_writer.add_scalar('cluster/n_dynamic_gaussians', n_dynamic, iteration)
+            tb_writer.add_histogram('cluster/dynamic_scores', dyn_score, iteration)
 
-    _msg = f"[CLUSTER] Selecting dynamic Gaussians: {n_dynamic}/{N} (thresh={dynamic_thresh:.2f})"
+    _msg = f"[CLUSTER] Selecting dynamic Gaussians: {n_dynamic}/{N}"
     logger.info(_msg)
     print(_msg)
 
