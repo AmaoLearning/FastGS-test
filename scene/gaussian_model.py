@@ -467,8 +467,20 @@ class GaussianModel:
         Returns:
             dynamic_score: (N,) tensor with scores in range [0, 1]
         """
-        if not self._deform_tracking_started or self._deform_denom.sum().item() == 0:
+        # Check if we have any deformation data at all
+        if self._deform_denom.sum().item() == 0:
+            print(f"[DEBUG] compute_dynamic_score: no deform data, returning zeros")
             return torch.zeros(self.get_xyz.shape[0], device="cuda")
+        
+        if not self._deform_tracking_started:
+            # Even if tracking not started, we can still use variance-based scoring
+            # But warn that max/min tracking is not active
+            print(f"[DEBUG] compute_dynamic_score: tracking not started, using variance only")
+        
+        # Check if max/min tracking has actual data (not all zeros)
+        max_diff = self.get_max_deform_diff()  # (N,)
+        if max_diff.max().item() < 1e-10 and self._deform_tracking_started:
+            print(f"[DEBUG] compute_dynamic_score: max_diff is all zeros despite tracking started")
         
         # 1. Compute max displacement difference magnitude for each Gaussian
         max_diff = self.get_max_deform_diff()  # (N,)

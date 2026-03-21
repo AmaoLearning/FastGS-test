@@ -188,17 +188,28 @@ def cluster_dynamic_gaussians(
     with torch.no_grad():
         # Use dynamic score mechanism: compute score and compute percentile-based threshold
         dyn_score = gaussians.compute_dynamic_score()  # (N,), range [0, 1]
+        
+        # Debug logging
+        print(f"[DEBUG] dyn_score: min={dyn_score.min().item():.6f}, max={dyn_score.max().item():.6f}, mean={dyn_score.mean().item():.6f}")
+        print(f"[DEBUG] N_gaussians={N}, percentile={dynamic_score_percentile}")
             
-        # Compute threshold based on percentile: get the value at (100 - percentile) position
-        # e.g., percentile=80 means select top 20%, so we need to find the value at 80th percentile
+        # Compute threshold based on percentile: get the value at (percentile) position
+        # e.g., percentile=80 means select Gaussians with score >= 80th percentile (top 20%)
         sorted_scores, _ = torch.sort(dyn_score)
-        # Convert percentile to index (clamp to valid range)
-        percentile_idx = int((100 - dynamic_score_percentile) / 100.0 * N)
+        
+        # For percentile=80, we want to select scores >= 80th percentile value
+        # So we find the index at percentile position and use that value as threshold
+        percentile_idx = int(dynamic_score_percentile / 100.0 * N)
         percentile_idx = max(0, min(percentile_idx, N - 1))
         score_thresh = sorted_scores[percentile_idx].item()
-            
-        dynamic_mask = dyn_score > score_thresh  # boolean (N,)
+        
+        print(f"[DEBUG] percentile_idx={percentile_idx}, score_thresh={score_thresh:.6f}")
+        
+        # Select Gaussians with score >= threshold (top (100-percentile)%)
+        dynamic_mask = dyn_score >= score_thresh  # boolean (N,)
         n_dynamic = int(dynamic_mask.sum().item())
+        
+        print(f"[DEBUG] Selected {n_dynamic} dynamic Gaussians out of {N}")
             
         _msg = (f"[CLUSTER] Using dynamic score mechanism: "
                 f"percentile={dynamic_score_percentile}, "
