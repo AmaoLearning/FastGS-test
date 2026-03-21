@@ -479,36 +479,28 @@ class GaussianModel:
         
         # Check if max/min tracking has actual data (not all zeros)
         max_diff = self.get_max_deform_diff()  # (N,)
-        if max_diff.max().item() < 1e-10 and self._deform_tracking_started:
-            print(f"[DEBUG] compute_dynamic_score: max_diff is all zeros despite tracking started")
         
-        # 1. Compute max displacement difference magnitude for each Gaussian
-        max_diff = self.get_max_deform_diff()  # (N,)
-        
-        # 2. Compute total deformation variance for each Gaussian (sum across xyz)
         deform_var = self.get_deform_var()  # (N, 3)
         deform_var_sum = deform_var.sum(dim=-1)  # (N,)
         
-        # 3. Compute percentile ranks (0-100, floor)
+        # 3. Compute percentile ranks (0-100)
+        # searchsorted returns indices (0 to N-1), convert to percentile (0 to 100)
+        N_gaussians = max(1, self.get_xyz.shape[0])
+        
         # For max displacement difference percentile
         max_diff_sorted, _ = torch.sort(max_diff)
-        # Use searchsorted to find percentile rank
-        max_diff_percentile = torch.searchsorted(max_diff_sorted, max_diff).float()  # (N,)
-        max_diff_percentile = torch.clamp(max_diff_percentile, max=99)  # Avoid 100 for valid harmonic mean
+        max_diff_indices = torch.searchsorted(max_diff_sorted, max_diff)  # (N,), returns 0 to N
+        max_diff_percentile = (max_diff_indices.float() / max(N_gaussians - 1, 1))  # (N,), 0-100
         
         # For deformation variance percentile
         var_sorted, _ = torch.sort(deform_var_sum)
-        var_percentile = torch.searchsorted(var_sorted, deform_var_sum).float()  # (N,)
-        var_percentile = torch.clamp(var_percentile, max=99)
-        
-        # 4. Convert to 0-1 range for harmonic mean
-        max_diff_pct_normalized = (max_diff_percentile + 1) / 100.0  # +1 to avoid 0
-        var_pct_normalized = (var_percentile + 1) / 100.0
+        var_indices = torch.searchsorted(var_sorted, deform_var_sum)  # (N,), returns 0 to N
+        var_percentile = (var_indices.float() / max(N_gaussians - 1, 1))  # (N,), 0-100
         
         # 5. Harmonic mean: 2 * a * b / (a + b)
         # Add small epsilon to avoid division by zero
         epsilon = 1e-8
-        harmonic_mean = 2.0 * max_diff_pct_normalized * var_pct_normalized / (max_diff_pct_normalized + var_pct_normalized + epsilon)
+        harmonic_mean = 2.0 * max_diff_percentile * var_percentile / (max_diff_percentile + var_percentile + epsilon)
         
         return harmonic_mean  # (N,), range [0, 1]
 
