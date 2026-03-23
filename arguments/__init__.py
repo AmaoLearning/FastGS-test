@@ -87,8 +87,12 @@ class ModelParams(ParamGroup):
         self.cluster_w_motion = 0.5        # 聚类特征权重：历史平均形变
 
         # mapo
-        self.dynamic_score_percentile = 80  # 动态分数百分位阈值：选取动态分数位于前 (100-percentile)% 的高斯参与聚类，默认为80表示前20%
+        self.dynamic_score_percentile = 80  # 动态分数百分位阈值：选取动态分数位于前 (100-percentile)% 的高斯参与聚类，默认为 80 表示前 20%
         
+        # Dynamic-static separation ablation test (force static Gaussians to have zero deformation)
+        self.use_dynamic_ablation = False  # 启用动静分离预测试实验：15000 轮后只让动态高斯 (20%) 有形变，其余强制为 0
+        self.dynamic_ablation_start_iter = 15000  # 动静分离实验起始轮次
+
         # optical flow loss（使用形变场有限差分 + diff-flow-rasterization）
         self.use_flow_loss = False  # 是否启用投影光流损失
         self.use_flow_mask = False  # 是否启用光流掩码引导致密化（可独立于 flow loss 使用）

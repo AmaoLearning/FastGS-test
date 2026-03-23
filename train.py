@@ -314,6 +314,31 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             if dataset.use_dynamic_sep and iteration == 10000:
                 gaussians.start_deform_tracking()
                 print(f"[INFO] Starting deformation tracking at iteration {iteration}")
+            
+            # ── Dynamic-static separation ablation test: mask static Gaussians after 15000 iterations ──
+            if getattr(dataset, 'use_dynamic_ablation', False) and iteration >= dataset.dynamic_ablation_start_iter:
+                with torch.no_grad():
+                    # Get dynamic mask from clustering results
+                    dynamic_mask = gaussians.get_dynamic_mask_from_cluster()  # (N,) bool
+                    
+                    # Check if clustering has been performed
+                    if dynamic_mask.sum() == 0:
+                        # No clustering performed yet, warn user
+                        if iteration == dataset.dynamic_ablation_start_iter:
+                            print(f"[WARNING] use_dynamic_ablation=True but no cluster labels found. "
+                                  f"Please ensure clustering_iterations includes {dataset.dynamic_ablation_start_iter}")
+                    else:
+                        # Mask out static Gaussians (set their deformation to zero)
+                        if iteration == dataset.dynamic_ablation_start_iter:
+                            _msg = (f"[ABLATION] Starting dynamic-static separation at iter {iteration}: "
+                                    f"{dynamic_mask.sum().item()} dynamic / {gaussians.get_xyz.shape[0]} total Gaussians")
+                            print(_msg)
+                            logger.info(_msg)
+                        
+                        # Apply mask: only dynamic Gaussians get deformation
+                        d_xyz = d_xyz * dynamic_mask.unsqueeze(-1)
+                        d_rotation = d_rotation * dynamic_mask.unsqueeze(-1) if torch.is_tensor(d_rotation) else d_rotation
+                        d_scaling = d_scaling * dynamic_mask.unsqueeze(-1) if torch.is_tensor(d_scaling) else d_scaling
 
         if _enable_phase_timer:
             torch.cuda.synchronize()

@@ -51,6 +51,7 @@ class GaussianModel:
         self._deform_max = torch.empty(0)    # (N, 3) max d_xyz per Gaussian
         self._deform_min = torch.empty(0)    # (N, 3) min d_xyz per Gaussian
         self._deform_tracking_started = False  # flag to start tracking from iter 10000
+        self._cluster_labels = None  # (N,) int32 tensor: -1 for static, >=0 for cluster id
 
         self.optimizer = None
         self.shoptimizer = None
@@ -515,6 +516,19 @@ class GaussianModel:
         """
         dynamic_score = self.compute_dynamic_score()
         return dynamic_score > threshold
+
+    def get_dynamic_mask_from_cluster(self) -> torch.Tensor:
+        """Get boolean mask for dynamic Gaussians based on clustering results.
+        
+        Returns:
+            mask: (N,) boolean tensor, True for dynamic Gaussians (cluster label >= 0)
+        """
+        if self._cluster_labels is None:
+            # No clustering performed yet, return all False
+            return torch.zeros(self.get_xyz.shape[0], dtype=torch.bool, device="cuda")
+        
+        # Dynamic Gaussians are those with cluster label >= 0
+        return self._cluster_labels >= 0
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
