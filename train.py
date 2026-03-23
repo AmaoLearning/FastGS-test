@@ -316,17 +316,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 print(f"[INFO] Starting deformation tracking at iteration {iteration}")
             
             # ── Dynamic-static separation ablation test: mask static Gaussians after 15000 iterations ──
-            if getattr(dataset, 'use_dynamic_ablation', False) and iteration >= dataset.dynamic_ablation_start_iter:
+            if getattr(dataset, 'use_dynamic_ablation', False) and iteration > dataset.dynamic_ablation_start_iter:
                 with torch.no_grad():
                     # Get dynamic mask from clustering results
                     dynamic_mask = gaussians.get_dynamic_mask_from_cluster()  # (N,) bool
                     
-                    # Check if clustering has been performed
-                    if dynamic_mask.sum() == 0:
-                        # No clustering performed yet, warn user
+                    # Check if clustering has been performed and mask dimension matches
+                    if dynamic_mask.sum() == 0 or dynamic_mask.shape[0] != gaussians.get_xyz.shape[0]:
+                        # No clustering performed yet or dimension mismatch due to densify/prune
                         if iteration == dataset.dynamic_ablation_start_iter:
                             print(f"[WARNING] use_dynamic_ablation=True but no cluster labels found. "
                                   f"Please ensure clustering_iterations includes {dataset.dynamic_ablation_start_iter}")
+                        # Skip masking if mask is not available or dimension mismatch
+                        # The mask will be valid after next clustering
                     else:
                         # Mask out static Gaussians (set their deformation to zero)
                         if iteration == dataset.dynamic_ablation_start_iter:

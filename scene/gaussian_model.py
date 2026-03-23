@@ -337,6 +337,10 @@ class GaussianModel:
         self._deform_denom = self._deform_denom[valid_points_mask]
         self._deform_max = self._deform_max[valid_points_mask] if self._deform_max.numel() > 0 else self._deform_max
         self._deform_min = self._deform_min[valid_points_mask] if self._deform_min.numel() > 0 else self._deform_min
+        
+        # Prune cluster labels if they exist
+        if self._cluster_labels is not None:
+            self._cluster_labels = self._cluster_labels[valid_points_mask]
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
@@ -394,6 +398,11 @@ class GaussianModel:
                                        torch.zeros(_n_new, 3, device="cuda")], dim=0) if self._deform_max.numel() > 0 else self._deform_max
         self._deform_min = torch.cat([self._deform_min,
                                        torch.zeros(_n_new, 3, device="cuda")], dim=0) if self._deform_min.numel() > 0 else self._deform_min
+        
+        # Extend cluster labels for newly added Gaussians (default to -1: static)
+        if self._cluster_labels is not None:
+            self._cluster_labels = torch.cat([self._cluster_labels,
+                                               torch.full((_n_new,), -1, dtype=torch.int32, device="cuda")], dim=0)
 
         self.zero_accums()
 
