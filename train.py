@@ -442,15 +442,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
         if tb_writer and iteration % 100 == 0:
             tb_writer.add_scalar('train_loss_patches/total_loss_final', loss.item(), iteration)
 
-        # ── HexPlane regularisation (4DGS only) ──
+        # ── HexPlane regularisation (4DGS / ClusteredDeform) ──
         if _deform_type == "4dgs" and iteration >= opt.warm_up:
-            _tv_loss = deform.get_tv_loss()
-            _l1_loss = deform.get_l1_loss()
-            loss = loss + 1e-3 * _tv_loss + 1e-4 * _l1_loss
+            _reg_loss = deform.get_regularization_loss()
+            loss = loss + _reg_loss
             if tb_writer and iteration % 100 == 0:
-                tb_writer.add_scalar('train_loss_patches/hexplane_tv', _tv_loss.item(), iteration)
-                tb_writer.add_scalar('train_loss_patches/hexplane_l1', _l1_loss.item(), iteration)
-
+                tb_writer.add_scalar('train_loss_patches/hexplane_reg', _reg_loss.item(), iteration)
+        
         # ── Knowledge distillation loss for clustered deform model ──
         if isinstance(deform, ClusteredDeformModel) and iteration > getattr(dataset, 'clustered_deform_start_iter', 15000):
             # Compute distillation loss: student predictions match teacher

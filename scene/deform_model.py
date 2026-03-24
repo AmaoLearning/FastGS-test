@@ -198,13 +198,9 @@ class DeformModel_4DGS:
 
     # ── Regularisation losses ─────────────────────────────────────────
 
-    def get_tv_loss(self) -> torch.Tensor:
-        """Total Variation loss on HexPlane grids."""
-        return self.deform.get_plane_tv_loss()
-
-    def get_l1_loss(self) -> torch.Tensor:
-        """L1 sparsity loss on HexPlane grid parameters."""
-        return self.deform.get_plane_l1_loss()
+    def get_regularization_loss(self) -> torch.Tensor:
+        """Get TV and L1 regularization"""
+        return 1e-3 * self.deform.get_plane_tv_loss() + 1e-4 * self.deform.get_plane_l1_loss()
 
 
 class ClusteredDeformModel:
