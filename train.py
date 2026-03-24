@@ -398,15 +398,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                                       f"(1.0=no suppression, 0.0=full suppression)")
                         
                         # Apply suppression: deformation = deformation * weight for static Gaussians
-                        # This is equivalent to: d_xyz = d_xyz * (1 - (1-weight) * static_mask)
-                        _static_suppress_factor = 1.0 - (1.0 - _suppress_weight) * static_mask.to(dtype=d_xyz.dtype)
-                        d_xyz = d_xyz * _static_suppress_factor.unsqueeze(-1)
+                        # Combine dynamic mask (1.0) with scaled static mask (weight)
+                        # Dynamic: factor = 1.0, Static: factor = suppress_weight
+                        _suppress_factor = (
+                            dynamic_mask.to(dtype=d_xyz.dtype) + 
+                            static_mask.to(dtype=d_xyz.dtype) * _suppress_weight
+                        )
+                        d_xyz = d_xyz * _suppress_factor.unsqueeze(-1)
                         
                         # Also suppress rotation and scaling
                         if torch.is_tensor(d_rotation):
-                            d_rotation = d_rotation * _static_suppress_factor.unsqueeze(-1)
+                            d_rotation = d_rotation * _suppress_factor.unsqueeze(-1)
                         if torch.is_tensor(d_scaling):
-                            d_scaling = d_scaling * _static_suppress_factor.unsqueeze(-1)
+                            d_scaling = d_scaling * _suppress_factor.unsqueeze(-1)
 
         if _enable_phase_timer:
             torch.cuda.synchronize()
