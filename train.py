@@ -14,6 +14,7 @@ import time
 import logging
 import traceback
 import torch
+import math
 from random import randint
 from utils.loss_utils import (l1_loss, ssim, kl_divergence, l2_loss)
 from gaussian_renderer import render_fastgs, network_gui
@@ -118,6 +119,30 @@ def run_clustering_at_iteration(
     scene.release_cameras([_debug_cam])
     print(f"[INFO] Clustering at iter {iteration} saved to {_cluster_save}")
     return cluster_result
+
+
+# ── Helper function: gradual weight scheduling ──
+def _get_static_suppress_weight(current_iter: int, start_iter: int, end_iter: int) -> float:
+    """Get suppression weight for static Gaussians using cosine annealing.
+    
+    Weight starts at 1.0 (no suppression) and decreases to 0.0 (full suppression)
+    using cosine annealing to avoid abrupt changes.
+    
+    Args:
+        current_iter: Current training iteration
+        start_iter: Iteration to start suppression (default: 15000)
+        end_iter: Iteration to reach full suppression (default: 25000)
+    
+    Returns:
+        Weight in range [0, 1]: 1.0 = no suppression, 0.0 = full suppression
+    """
+    if current_iter <= start_iter:
+        return 1.0
+    if current_iter >= end_iter:
+        return 0.0
+    
+    progress = (current_iter - start_iter) / (end_iter - start_iter)
+    return 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: bool = False,
@@ -315,8 +340,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 gaussians.start_deform_tracking()
                 print(f"[INFO] Starting deformation tracking at iteration {iteration}")
             
-            # ── Dynamic-static separation ablation test: mask static Gaussians after 15000 iterations ──
-            # Clustering runs at the END of iteration 15000, so masking starts from iteration 15001
+            # ── Dynamic-static separation ablation test: gradually suppress static Gaussians ──
+            # Clustering runs at the END of iteration 15000, so suppression starts from iteration 15001
+            # Use gradual cosine annealing from 15000 to 25000 to avoid abrupt changes
             if getattr(dataset, 'use_dynamic_ablation', False) and iteration > dataset.dynamic_ablation_start_iter:
                 with torch.no_grad():
                     # Get dynamic mask from clustering results
@@ -331,36 +357,56 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                                   f"Please ensure clustering_iterations includes {dataset.dynamic_ablation_start_iter}")
                         # Skip masking if mask is not available or dimension mismatch
                     else:
-                        # Mask out static Gaussians (set their deformation to zero)
-                        # Only log on the first iteration after clustering (15001)
+                        # Get suppression weight (1.0 at 15000 → 0.0 at 25000)
+                        _use_gradual = getattr(dataset, 'ablation_use_gradual', True)
+                        _end_iter = getattr(dataset, 'dynamic_ablation_end_iter', 25000)
+                        
+                        if _use_gradual:
+                            _suppress_weight = _get_static_suppress_weight(
+                                iteration, 
+                                dataset.dynamic_ablation_start_iter, 
+                                _end_iter
+                            )
+                        else:
+                            _suppress_weight = 0.0  # Immediate suppression
+                        
+                        # Get static mask (inverse of dynamic mask)
+                        static_mask = ~dynamic_mask  # (N,) bool
+                        
+                        # Apply gradual suppression to static Gaussians only
+                        # Log on the first iteration after clustering (15001)
                         if iteration == dataset.dynamic_ablation_start_iter + 1:
                             _n_dynamic = dynamic_mask.sum().item()
+                            _n_static = static_mask.sum().item()
                             _n_total = gaussians.get_xyz.shape[0]
                             _pct_dynamic = _n_dynamic / _n_total * 100
-                            _msg = (f"[ABLATION] Starting dynamic-static separation at iter {iteration}: "
-                                    f"{_n_dynamic} dynamic / {_n_total} total Gaussians "
-                                    f"({_pct_dynamic:.1f}%)")
+                            _msg = (f"[ABLATION] Starting gradual static suppression at iter {iteration}: "
+                                    f"{_n_dynamic} dynamic / {_n_static} static / {_n_total} total, "
+                                    f"weight={_suppress_weight:.4f}")
                             print(_msg)
                             logger.info(_msg)
-                            # Log deformation magnitude before and after masking for debugging
+                            # Log deformation magnitude for debugging
                             if torch.is_tensor(d_xyz):
                                 _mag_before = d_xyz.norm(dim=-1).mean().item()
-                                _mag_after = (d_xyz * dynamic_mask.to(dtype=d_xyz.dtype).unsqueeze(-1)).norm(dim=-1).mean().item()
-                                _mag_dynamic_only = d_xyz[dynamic_mask].norm(dim=-1).mean().item() if _n_dynamic > 0 else 0.0
-                                _mag_static_only = d_xyz[~dynamic_mask].norm(dim=-1).mean().item() if _n_total - _n_dynamic > 0 else 0.0
-                                print(f"[ABLATION DEBUG] Deformation magnitude:")
-                                print(f"  - Before masking (all): {_mag_before:.6f}")
-                                print(f"  - After masking: {_mag_after:.6f}")
-                                print(f"  - Dynamic Gaussians only: {_mag_dynamic_only:.6f}")
-                                print(f"  - Static Gaussians only: {_mag_static_only:.6f}")
+                                _mag_static = d_xyz[static_mask].norm(dim=-1).mean().item() if _n_static > 0 else 0.0
+                                _mag_dynamic = d_xyz[dynamic_mask].norm(dim=-1).mean().item() if _n_dynamic > 0 else 0.0
+                                print(f"[ABLATION DEBUG] Deformation magnitude (before suppression):")
+                                print(f"  - All Gaussians: {_mag_before:.6f}")
+                                print(f"  - Static only: {_mag_static:.6f}")
+                                print(f"  - Dynamic only: {_mag_dynamic:.6f}")
+                                print(f"[ABLATION DEBUG] Suppression weight: {_suppress_weight:.4f} "
+                                      f"(1.0=no suppression, 0.0=full suppression)")
                         
-                        # Convert bool mask to float for proper multiplication
-                        _dynamic_mask_float = dynamic_mask.to(dtype=d_xyz.dtype)  # (N,) float32
+                        # Apply suppression: deformation = deformation * weight for static Gaussians
+                        # This is equivalent to: d_xyz = d_xyz * (1 - (1-weight) * static_mask)
+                        _static_suppress_factor = 1.0 - (1.0 - _suppress_weight) * static_mask.to(dtype=d_xyz.dtype)
+                        d_xyz = d_xyz * _static_suppress_factor.unsqueeze(-1)
                         
-                        # Apply mask: only dynamic Gaussians get deformation
-                        d_xyz = d_xyz * _dynamic_mask_float.unsqueeze(-1)
-                        d_rotation = d_rotation * _dynamic_mask_float.unsqueeze(-1) if torch.is_tensor(d_rotation) else d_rotation
-                        d_scaling = d_scaling * _dynamic_mask_float.unsqueeze(-1) if torch.is_tensor(d_scaling) else d_scaling
+                        # Also suppress rotation and scaling
+                        if torch.is_tensor(d_rotation):
+                            d_rotation = d_rotation * _static_suppress_factor.unsqueeze(-1)
+                        if torch.is_tensor(d_scaling):
+                            d_scaling = d_scaling * _static_suppress_factor.unsqueeze(-1)
 
         if _enable_phase_timer:
             torch.cuda.synchronize()

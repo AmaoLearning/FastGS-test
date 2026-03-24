@@ -92,6 +92,8 @@ class ModelParams(ParamGroup):
         # Dynamic-static separation ablation test (force static Gaussians to have zero deformation)
         self.use_dynamic_ablation = False  # 启用动静分离预测试实验：15000 轮后只让动态高斯 (20%) 有形变，其余强制为 0
         self.dynamic_ablation_start_iter = 15000  # 动静分离实验起始轮次
+        self.dynamic_ablation_end_iter = 25000  # 渐进式形变归零结束轮次（使用余弦退火）
+        self.ablation_use_gradual = True  # 使用渐进式形变归零（而非突变）
 
         # optical flow loss（使用形变场有限差分 + diff-flow-rasterization）
         self.use_flow_loss = False  # 是否启用投影光流损失
