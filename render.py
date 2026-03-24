@@ -37,11 +37,14 @@ def _apply_dynamic_gate(gaussians, d_xyz, d_rotation, d_scaling, use_dynamic_sep
     # Priority 1: Dynamic-static ablation test (hard masking based on clustering)
     if use_dynamic_ablation:
         dynamic_mask = gaussians.get_dynamic_mask_from_cluster()  # (N,) bool
-        if dynamic_mask.sum() > 0:
+        if dynamic_mask.sum() > 0 and dynamic_mask.shape[0] == d_xyz.shape[0]:
+            # Convert bool mask to float for proper multiplication
+            _dynamic_mask_float = dynamic_mask.to(dtype=d_xyz.dtype)
+            
             # Apply hard mask: static Gaussians get zero deformation
-            d_xyz = d_xyz * dynamic_mask.unsqueeze(-1) if torch.is_tensor(d_xyz) else d_xyz
-            d_rotation = d_rotation * dynamic_mask.unsqueeze(-1) if torch.is_tensor(d_rotation) else d_rotation
-            d_scaling = d_scaling * dynamic_mask.unsqueeze(-1) if torch.is_tensor(d_scaling) else d_scaling
+            d_xyz = d_xyz * _dynamic_mask_float.unsqueeze(-1)
+            d_rotation = d_rotation * _dynamic_mask_float.unsqueeze(-1) if torch.is_tensor(d_rotation) else d_rotation
+            d_scaling = d_scaling * _dynamic_mask_float.unsqueeze(-1) if torch.is_tensor(d_scaling) else d_scaling
             return d_xyz, d_rotation, d_scaling
     
     # Priority 2: Original soft dynamic separation (currently commented out)

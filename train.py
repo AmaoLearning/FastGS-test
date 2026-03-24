@@ -316,7 +316,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 print(f"[INFO] Starting deformation tracking at iteration {iteration}")
             
             # ── Dynamic-static separation ablation test: mask static Gaussians after 15000 iterations ──
-            if getattr(dataset, 'use_dynamic_ablation', False) and iteration > dataset.dynamic_ablation_start_iter:
+            if getattr(dataset, 'use_dynamic_ablation', False) and iteration >= dataset.dynamic_ablation_start_iter:
                 with torch.no_grad():
                     # Get dynamic mask from clustering results
                     dynamic_mask = gaussians.get_dynamic_mask_from_cluster()  # (N,) bool
@@ -332,15 +332,35 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                     else:
                         # Mask out static Gaussians (set their deformation to zero)
                         if iteration == dataset.dynamic_ablation_start_iter:
+                            _n_dynamic = dynamic_mask.sum().item()
+                            _n_total = gaussians.get_xyz.shape[0]
+                            _pct_dynamic = _n_dynamic / _n_total * 100
                             _msg = (f"[ABLATION] Starting dynamic-static separation at iter {iteration}: "
-                                    f"{dynamic_mask.sum().item()} dynamic / {gaussians.get_xyz.shape[0]} total Gaussians")
+                                    f"{_n_dynamic} dynamic / {_n_total} total Gaussians "
+                                    f"({_pct_dynamic:.1f}%)")
                             print(_msg)
                             logger.info(_msg)
+                            # Log deformation magnitude before and after masking for debugging
+                            if torch.is_tensor(d_xyz):
+                                _mag_before = d_xyz.norm(dim=-1).mean().item()
+                                _mag_after = (d_xyz * dynamic_mask.to(dtype=d_xyz.dtype).unsqueeze(-1)).norm(dim=-1).mean().item()
+                                _mag_dynamic_only = d_xyz[dynamic_mask].norm(dim=-1).mean().item() if _n_dynamic > 0 else 0.0
+                                _mag_static_only = d_xyz[~dynamic_mask].norm(dim=-1).mean().item() if _n_total - _n_dynamic > 0 else 0.0
+                                print(f"[ABLATION DEBUG] Deformation magnitude:")
+                                print(f"  - Before masking (all): {_mag_before:.6f}")
+                                print(f"  - After masking: {_mag_after:.6f}")
+                                print(f"  - Dynamic Gaussians only: {_mag_dynamic_only:.6f}")
+                                print(f"  - Static Gaussians only: {_mag_static_only:.6f}")
+                                print(f"[ABLATION DEBUG] Dynamic mask - Min: {dynamic_mask.min().item()}, Max: {dynamic_mask.max().item()}, Sum: {_n_dynamic}, Pct: {_pct_dynamic:.1f}%")
+                                print(f"[ABLATION DEBUG] Cluster labels - Unique values: {torch.unique(gaussians._cluster_labels).cpu().tolist() if gaussians._cluster_labels is not None else 'None'}")
+                        
+                        # Convert bool mask to float for proper multiplication
+                        _dynamic_mask_float = dynamic_mask.to(dtype=d_xyz.dtype)  # (N,) float32
                         
                         # Apply mask: only dynamic Gaussians get deformation
-                        d_xyz = d_xyz * dynamic_mask.unsqueeze(-1)
-                        d_rotation = d_rotation * dynamic_mask.unsqueeze(-1) if torch.is_tensor(d_rotation) else d_rotation
-                        d_scaling = d_scaling * dynamic_mask.unsqueeze(-1) if torch.is_tensor(d_scaling) else d_scaling
+                        d_xyz = d_xyz * _dynamic_mask_float.unsqueeze(-1)
+                        d_rotation = d_rotation * _dynamic_mask_float.unsqueeze(-1) if torch.is_tensor(d_rotation) else d_rotation
+                        d_scaling = d_scaling * _dynamic_mask_float.unsqueeze(-1) if torch.is_tensor(d_scaling) else d_scaling
 
         if _enable_phase_timer:
             torch.cuda.synchronize()
