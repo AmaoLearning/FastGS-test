@@ -462,14 +462,15 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
             deform = DeformModel(dataset.is_blender, dataset.is_6dof)
         deform.load_weights(dataset.model_path)
 
-        _use_dynamic_sep = getattr(dataset, "use_dynamic_sep", False)
-        _use_clustered_deform = getattr(dataset, "use_clustered_deform", False)
+        _use_dynamic_sep = getattr(dataset, "use_dynamic_sep", True)
+        # Automatically detect clustered deform from teacher_checkpoint_path
+        _use_clustered = bool(getattr(dataset, 'teacher_checkpoint_path', ''))
 
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
         # For clustered deform model, use dual-path rendering
-        if _use_clustered_deform and isinstance(deform, ClusteredDeformModel):
+        if _use_clustered:
             render_func = render_set_with_clustered_deform
             print("[INFO] Using dual-path rendering for clustered deform model")
         elif mode == "render":

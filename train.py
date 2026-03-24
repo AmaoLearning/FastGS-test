@@ -123,7 +123,11 @@ def run_clustering_at_iteration(
     print(f"[INFO] Clustering at iter {iteration} saved to {_cluster_save}")
     
     # ── Switch to clustered deform model if enabled ──
-    if getattr(dataset, 'use_clustered_deform', False) and iteration >= getattr(dataset, 'clustered_deform_start_iter', 15000):
+    # Automatically enabled when teacher_checkpoint_path is provided
+    teacher_checkpoint = getattr(dataset, 'teacher_checkpoint_path', '')
+    use_clustered = teacher_checkpoint and iteration >= getattr(dataset, 'clustered_deform_start_iter', 15000)
+    
+    if use_clustered:
         from scene.deform_model import ClusteredDeformModel
         
         n_clusters = getattr(dataset, 'cluster_n_clusters', 8)
@@ -213,9 +217,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
     # ── Select deformation network ──
     _deform_type = getattr(dataset, "deform_type", "mlp")
     
-    # Check if we will use clustered deform model
-    _use_clustered = getattr(dataset, "use_clustered_deform", False)
-    _cluster_start_iter = getattr(dataset, "clustered_deform_start_iter", 15000)
+    # Check if we will use clustered deform model (auto-detected from teacher_checkpoint_path)
+    _use_clustered = bool(getattr(dataset, 'teacher_checkpoint_path', ''))
+    _cluster_start_iter = getattr(dataset, 'clustered_deform_start_iter', 15000)
     
     if _deform_type == "4dgs":
         _s_res = tuple(int(x) for x in dataset.hex_spatial_res.split(","))
@@ -481,10 +485,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             _t0 = time.perf_counter()
 
         # Release VRAM.
-        # Flow: unload_flow() frees per-camera flow tensors (no-op if none loaded).
         # Image: release_camera_image() drops the reference; in lazy mode the
         #   GPU buffer persists on Scene for zero-alloc reuse.
-        viewpoint_cam.unload_flow()
         scene.release_camera_image(viewpoint_cam)
 
         with torch.no_grad():

@@ -74,9 +74,8 @@ class ModelParams(ParamGroup):
         self.hex_fusion = "concat"
 
         # soft dynamic-static separation
-        self.use_dynamic_sep = False   # 启用软动静分离：使用可学习动态概率混合形变与零向量
+        self.use_dynamic_sep = True   # 启用动静分离：积累形变统计、执行聚类（默认启用）
         self.log_deform_hist = False   # 每隔3000轮记录全局形变分布柱状图
-
 
         # Dynamic Gaussian clustering (decoupled from training loop)
         self.clustering_iterations = "15000" # Comma-separated iteration numbers, e.g. "15000,30000" → [15000, 30000]
@@ -89,12 +88,7 @@ class ModelParams(ParamGroup):
         # mapo
         self.dynamic_score_percentile = 80  # 动态分数百分位阈值：选取动态分数位于前 (100-percentile)% 的高斯参与聚类，默认为 80 表示前 20%
         
-        # Dynamic-static separation ablation test (force static Gaussians to have zero deformation)
-        self.use_dynamic_ablation = False  # 启用动静分离预测试实验：15000 轮后只让动态高斯 (20%) 有形变，其余强制为 0
-        self.dynamic_ablation_start_iter = 15000  # 动静分离实验起始轮次
-        
         # Clustered multi-deform model (teacher-student distillation)
-        self.use_clustered_deform = False  # 启用多形变场训练：15000 轮后为每个聚类分配独立形变场
         self.clustered_deform_start_iter = 15000  # 多形变场训练起始轮次
         self.kl_distill_weight = 1.0  # 知识蒸馏损失权重（教师 - 学生约束）
         self.teacher_checkpoint_path = ""  # 预训练教师模型权重路径（必须手动设置）
@@ -106,20 +100,15 @@ class ModelParams(ParamGroup):
         self.student_mlp_hidden = 64  # Student MLP hidden dimension
         self.student_mlp_layers = 2  # Student MLP layers
 
-        # optical flow loss（使用形变场有限差分 + diff-flow-rasterization）
-        self.use_flow_loss = False  # 是否启用投影光流损失
-        self.use_flow_mask = False  # 是否启用光流掩码引导致密化（可独立于 flow loss 使用）
-        self.use_flow_tv_loss = False  # 是否对光流预测加 TV 正则
-
         # lazy loading — N3V large-scale dataset (zero OOM)
         self.lazy_load = False
         self.num_images = 300  # number of frames per camera for N3V dataset
         self.lazy_num_workers = 8
         self.lazy_prefetch_factor = 6
         self.lazy_image_buffer_count = 4  # number of persistent GPU image buffers (>=2)
-        self.lazy_prefetch_flow_to_cache = True  # use lazy DataLoader order to prewarm flow cache
+        self.lazy_prefetch_flow_to_cache = False  # use lazy DataLoader order to prewarm flow cache
 
-        self.enable_flow_preload_cache = True   # cache flow tensors on CPU to reduce repeated npy IO
+        self.enable_flow_preload_cache = False  # cache flow tensors on CPU to reduce repeated npy IO
         self.flow_preload_cache_size = 64       # max number of cameras cached for flow preload (0 disables)
         self.flow_preload_cache_device = "cuda"  # preload cache device: "cpu" or "cuda"/"cuda:0"
         super().__init__(parser, "Loading Parameters", sentinel)
@@ -176,20 +165,6 @@ class OptimizationParams(ParamGroup):
         self.hex_plane_lr_final = 0.002
         self.hex_mlp_lr_init = 0.001
         self.hex_mlp_lr_final = 0.00001
-
-        # optical flow loss（投影光流监督损失，使用形变场有限差分）
-        self.lambda_flow = 0.1  # 光流损失权重
-        self.flow_loss_from_iter = 6000  # 从第几个 iteration 开始使用光流损失
-        self.flow_loss_interval = 5  # 每隔几个 iteration 计算一次光流损失
-        self.flow_tv_weight = 0.01  # TV 正则权重
-        self.detach_flow_geometry = False  # 是否阻断光流损失对几何（scaling/rotation/opacity）的梯度传播（velocity3D 始终不 detach）
-
-        # flow mask preprocessing（光流掩码预处理）
-        self.flow_magnitude_thresh = 0.2  # 光流模长阈值（像素），低于此值视为静态噪声，不参与损失/致密化
-
-        # flow-based densification mask（用光流拟合质量控制致密化）
-        self.flow_loss_thresh = 0.001  # 光流损失阈值（固定阈值模式）
-        self.flow_loss_percentile = 70  # 自适应阈值百分比，-1 表示使用固定阈值，0-100 表示使用自适应阈值（如 70 表示约 70% 低损失高斯通过筛选）
         super().__init__(parser, "Optimization Parameters", sentinel)
 
 
