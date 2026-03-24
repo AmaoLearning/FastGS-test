@@ -205,3 +205,244 @@ class DeformModel_4DGS:
     def get_l1_loss(self) -> torch.Tensor:
         """L1 sparsity loss on HexPlane grid parameters."""
         return self.deform.get_plane_l1_loss()
+
+
+class ClusteredDeformModel:
+    """Multi-deform model for clustered dynamic Gaussians.
+    
+    This class manages multiple deformation fields, each responsible for a cluster
+    of dynamic Gaussians. Implements teacher-student distillation from a single
+    teacher model to multiple student models.
+    
+    Architecture:
+    - 1 teacher deform field (original 4DGS model, frozen after clustering)
+    - K student deform fields (one per cluster, configurable capacity)
+    - Student model architecture is manually configurable
+    
+    Training objectives:
+    1. Visual quality loss (L1 + SSIM) - same as original
+    2. Knowledge distillation loss - student predictions match teacher
+    """
+    
+    def __init__(
+        self,
+        n_clusters: int,
+        is_blender: bool = False,
+        is_6dof: bool = False,
+        # Teacher config (original 4DGS)
+        teacher_spatial_resolutions: Sequence[int] = (64, 128, 256),
+        teacher_time_resolutions: Sequence[int] = (64, 128, 256),
+        teacher_feat_dim: int = 16,
+        teacher_mlp_hidden_dim: int = 128,
+        teacher_mlp_num_hidden: int = 2,
+        # Student config (manually configured)
+        student_feat_dim: int = 8,
+        student_spatial_resolutions: Sequence[int] = (64, 128),
+        student_time_resolutions: Sequence[int] = (64, 128),
+        student_mlp_hidden_dim: int = 64,
+        student_mlp_num_hidden: int = 2,
+        fusion: str = "concat",
+    ) -> None:
+        self.n_clusters = n_clusters
+        self.is_blender = is_blender
+        self.is_6dof = is_6dof
+        self.fusion = fusion
+        
+        # Teacher model (original capacity)
+        self.teacher = HexPlaneDeformNetwork(
+            spatial_resolutions=teacher_spatial_resolutions,
+            time_resolutions=teacher_time_resolutions,
+            feat_dim=teacher_feat_dim,
+            mlp_hidden_dim=teacher_mlp_hidden_dim,
+            mlp_num_hidden=teacher_mlp_num_hidden,
+            fusion=fusion,
+            is_blender=is_blender,
+            is_6dof=is_6dof,
+        ).cuda()
+        self.teacher.eval()  # Teacher is frozen after clustering
+        
+        # Student models (configurable architecture)
+        self.students = nn.ModuleList()
+        for _ in range(n_clusters):
+            student = HexPlaneDeformNetwork(
+                spatial_resolutions=student_spatial_resolutions,
+                time_resolutions=student_time_resolutions,
+                feat_dim=student_feat_dim,
+                mlp_hidden_dim=student_mlp_hidden_dim,
+                mlp_num_hidden=student_mlp_num_hidden,
+                fusion=fusion,
+                is_blender=is_blender,
+                is_6dof=is_6dof,
+            ).cuda()
+            self.students.append(student)
+        
+        self.optimizer: Optional[torch.optim.Optimizer] = None
+        self.spatial_lr_scale = 5
+        
+        # Cluster assignments (updated during training)
+        self._cluster_labels: Optional[torch.Tensor] = None  # (N,) int32
+        
+    def set_aabb(self, points: torch.Tensor, padding: float = 0.1) -> None:
+        """Set AABB for all deform models."""
+        self.teacher.set_aabb(points, padding=padding)
+        for student in self.students:
+            student.set_aabb(points, padding=padding)
+    
+    def set_cluster_labels(self, cluster_labels: torch.Tensor) -> None:
+        """Set cluster labels for Gaussian assignment."""
+        self._cluster_labels = cluster_labels  # (N,) int32, -1 for static
+    
+    def step(
+        self,
+        xyz: torch.Tensor,
+        time_emb: torch.Tensor,
+        cluster_ids: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Forward pass for clustered deformation.
+        
+        Args:
+            xyz: Gaussian positions (N, 3)
+            time_emb: Time embeddings (N, 1) or (1, 1)
+            cluster_ids: Cluster assignments for each Gaussian (N,) or None to use self._cluster_labels
+        
+        Returns:
+            d_xyz, d_rotation, d_scaling: Deformation outputs (N, 3), (N, 4), (N, 3)
+        """
+        if cluster_ids is None:
+            cluster_ids = self._cluster_labels
+        
+        if cluster_ids is None:
+            raise ValueError("No cluster labels provided. Set cluster_labels first.")
+        
+        N = xyz.shape[0]
+        d_xyz = torch.zeros(N, 3, device=xyz.device, dtype=xyz.dtype)
+        d_rotation = torch.zeros(N, 4, device=xyz.device, dtype=xyz.dtype)
+        d_scaling = torch.zeros(N, 3, device=xyz.device, dtype=xyz.dtype)
+        
+        # Process each cluster with its corresponding student model
+        for cluster_id in range(self.n_clusters):
+            mask = (cluster_ids == cluster_id)
+            if mask.sum() == 0:
+                continue
+            
+            xyz_cluster = xyz[mask]
+            time_cluster = time_emb[mask] if time_emb.shape[0] == N else time_emb
+            
+            d_xyz_c, d_rotation_c, d_scaling_c = self.students[cluster_id](xyz_cluster, time_cluster)
+            
+            d_xyz[mask] = d_xyz_c
+            d_rotation[mask] = d_rotation_c
+            d_scaling[mask] = d_scaling_c
+        
+        # Static Gaussians get no deformation
+        static_mask = (cluster_ids < 0)
+        if static_mask.any():
+            pass  # Already initialized to zeros
+        
+        return d_xyz, d_rotation, d_scaling
+    
+    def step_teacher(
+        self,
+        xyz: torch.Tensor,
+        time_emb: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Forward pass through teacher model (for distillation target)."""
+        return self.teacher(xyz, time_emb)
+    
+    def train_setting(self, training_args) -> None:
+        """Initialize optimizers for all student models."""
+        param_groups = []
+        
+        for cluster_id, student in enumerate(self.students):
+            plane_params = list(student.hexplane.parameters())
+            mlp_params = list(student.decoder.parameters())
+            pe_params = (
+                list(student.pe_xyz.parameters())
+                + list(student.pe_t.parameters())
+            )
+            
+            _plane_lr_init = getattr(training_args, "hex_plane_lr_init", 0.02)
+            _plane_lr_final = getattr(training_args, "hex_plane_lr_final", 0.002)
+            _mlp_lr_init = getattr(training_args, "hex_mlp_lr_init", 0.001)
+            _mlp_lr_final = getattr(training_args, "hex_mlp_lr_final", 0.00001)
+            
+            param_groups.extend([
+                {"params": plane_params, "lr": _plane_lr_init, "name": f"student_{cluster_id}_planes"},
+                {"params": mlp_params + pe_params, "lr": _mlp_lr_init, "name": f"student_{cluster_id}_mlp"},
+            ])
+        
+        self.optimizer = torch.optim.Adam(param_groups, lr=0.0, eps=1e-15)
+        
+        # LR schedulers
+        _max_steps = training_args.deform_lr_max_steps
+        self._plane_lr_func = get_expon_lr_func(
+            lr_init=getattr(training_args, "hex_plane_lr_init", 0.02),
+            lr_final=getattr(training_args, "hex_plane_lr_final", 0.002),
+            lr_delay_mult=0.01,
+            max_steps=_max_steps,
+        )
+        self._mlp_lr_func = get_expon_lr_func(
+            lr_init=getattr(training_args, "hex_mlp_lr_init", 0.001),
+            lr_final=getattr(training_args, "hex_mlp_lr_final", 0.00001),
+            lr_delay_mult=0.01,
+            max_steps=_max_steps,
+        )
+    
+    def update_learning_rate(self, iteration: int) -> Optional[float]:
+        """Update learning rates for all student models."""
+        plane_lr = self._plane_lr_func(iteration)
+        mlp_lr = self._mlp_lr_func(iteration)
+        
+        for param_group in self.optimizer.param_groups:
+            if "planes" in param_group["name"]:
+                param_group["lr"] = plane_lr
+            elif "mlp" in param_group["name"]:
+                param_group["lr"] = mlp_lr
+        
+        return plane_lr
+    
+    def get_distillation_loss(
+        self,
+        xyz: torch.Tensor,
+        time_emb: torch.Tensor,
+        cluster_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute knowledge distillation loss: student vs teacher predictions."""
+        with torch.no_grad():
+            teacher_d_xyz, teacher_d_rot, teacher_d_scale = self.step_teacher(xyz, time_emb)
+        
+        student_d_xyz, student_d_rot, student_d_scale = self.step(xyz, time_emb, cluster_ids)
+        
+        # L2 loss between teacher and student predictions
+        loss_xyz = F.mse_loss(student_d_xyz, teacher_d_xyz)
+        loss_rot = F.mse_loss(student_d_rot, teacher_d_rot)
+        loss_scale = F.mse_loss(student_d_scale, teacher_d_scale)
+        
+        return loss_xyz + loss_rot + loss_scale
+    
+    def save_weights(self, model_path: str, iteration: int) -> None:
+        """Save all student model weights."""
+        for cluster_id, student in enumerate(self.students):
+            out_weights_path = os.path.join(model_path, f"deform_cluster_{cluster_id}/iteration_{iteration}")
+            os.makedirs(out_weights_path, exist_ok=True)
+            torch.save(student.state_dict(), os.path.join(out_weights_path, "deform.pth"))
+    
+    def load_weights(self, model_path: str, iteration: int = -1) -> None:
+        """Load all student model weights."""
+        for cluster_id in range(self.n_clusters):
+            if iteration == -1:
+                loaded_iter = searchForMaxIteration(os.path.join(model_path, f"deform_cluster_{cluster_id}"))
+            else:
+                loaded_iter = iteration
+            
+            weights_path = os.path.join(
+                model_path, f"deform_cluster_{cluster_id}/iteration_{loaded_iter}/deform.pth"
+            )
+            if os.path.exists(weights_path):
+                self.students[cluster_id].load_state_dict(torch.load(weights_path))
+    
+    def get_regularization_loss(self) -> torch.Tensor:
+        """Get TV and L1 regularization from all student models."""
+        tv_loss = sum(student.get_plane_tv_loss() for student in self.students)
+        l1_loss = sum(student.get_plane_l1_loss() for student in self.students)
+        return 1e-3 * tv_loss + 1e-4 * l1_loss

@@ -527,17 +527,29 @@ class GaussianModel:
         return dynamic_score > threshold
 
     def get_dynamic_mask_from_cluster(self) -> torch.Tensor:
-        """Get boolean mask for dynamic Gaussians based on clustering results.
+        """Get dynamic mask from cluster labels.
         
         Returns:
-            mask: (N,) boolean tensor, True for dynamic Gaussians (cluster label >= 0)
+            dynamic_mask: (N,) bool tensor, True for dynamic Gaussians (cluster >= 0)
         """
         if self._cluster_labels is None:
-            # No clustering performed yet, return all False
             return torch.zeros(self.get_xyz.shape[0], dtype=torch.bool, device="cuda")
         
-        # Dynamic Gaussians are those with cluster label >= 0
         return self._cluster_labels >= 0
+    
+    def get_cluster_mask(self, cluster_id: int) -> torch.Tensor:
+        """Get mask for a specific cluster.
+        
+        Args:
+            cluster_id: Cluster ID (0 to n_clusters-1)
+        
+        Returns:
+            mask: (N,) bool tensor, True for Gaussians in the specified cluster
+        """
+        if self._cluster_labels is None:
+            return torch.zeros(self.get_xyz.shape[0], dtype=torch.bool, device="cuda")
+        
+        return self._cluster_labels == cluster_id
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]

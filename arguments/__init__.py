@@ -92,6 +92,19 @@ class ModelParams(ParamGroup):
         # Dynamic-static separation ablation test (force static Gaussians to have zero deformation)
         self.use_dynamic_ablation = False  # 启用动静分离预测试实验：15000 轮后只让动态高斯 (20%) 有形变，其余强制为 0
         self.dynamic_ablation_start_iter = 15000  # 动静分离实验起始轮次
+        
+        # Clustered multi-deform model (teacher-student distillation)
+        self.use_clustered_deform = False  # 启用多形变场训练：15000 轮后为每个聚类分配独立形变场
+        self.clustered_deform_start_iter = 15000  # 多形变场训练起始轮次
+        self.kl_distill_weight = 1.0  # 知识蒸馏损失权重（教师 - 学生约束）
+        self.teacher_checkpoint_path = ""  # 预训练教师模型权重路径（必须手动设置）
+        
+        # Student model architecture parameters (for clustered deform model)
+        self.student_feat_dim = 8  # Student HexPlane feature dimension (default: 8)
+        self.student_spatial_res = "64,128"  # Student spatial resolutions, comma-separated (default: 2 levels)
+        self.student_time_res = "64,128"  # Student temporal resolutions, comma-separated
+        self.student_mlp_hidden = 64  # Student MLP hidden dimension
+        self.student_mlp_layers = 2  # Student MLP layers
 
         # optical flow loss（使用形变场有限差分 + diff-flow-rasterization）
         self.use_flow_loss = False  # 是否启用投影光流损失

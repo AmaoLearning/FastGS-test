@@ -18,7 +18,7 @@ from random import randint
 from utils.loss_utils import (l1_loss, ssim, kl_divergence, l2_loss)
 from gaussian_renderer import render_fastgs, network_gui
 import sys
-from scene import Scene, GaussianModel, DeformModel, DeformModel_4DGS
+from scene import Scene, GaussianModel, DeformModel, DeformModel_4DGS, ClusteredDeformModel
 from utils.general_utils import safe_state, get_linear_noise_func
 import uuid
 from tqdm import tqdm
@@ -46,10 +46,12 @@ def run_clustering_at_iteration(
     pipe,
     background,
     dataset,
+    opt,
     iteration: int,
     temperature: float = 1.0,
     mult: float = 1.0,
     tb_writer=None,
+    logger=None,
 ):
     """Run dynamic Gaussian clustering at specified iteration (decoupled from training loop).
 
@@ -60,10 +62,12 @@ def run_clustering_at_iteration(
         pipe: Pipeline params.
         background: Background color tensor.
         dataset: Dataset with clustering parameters.
+        opt: Optimization params.
         iteration: Current iteration number for naming outputs.
         temperature: Temperature for sigmoid scaling.
         mult: Scaling multiplier for rendering.
         tb_writer: TensorBoard writer (optional).
+        logger: Logger instance (optional).
     """
     if not getattr(dataset, 'use_dynamic_sep', False):
         return None
@@ -117,7 +121,82 @@ def run_clustering_at_iteration(
     )
     scene.release_cameras([_debug_cam])
     print(f"[INFO] Clustering at iter {iteration} saved to {_cluster_save}")
-    return cluster_result
+    
+    # ── Switch to clustered deform model if enabled ──
+    if getattr(dataset, 'use_clustered_deform', False) and iteration >= getattr(dataset, 'clustered_deform_start_iter', 15000):
+        from scene.deform_model import ClusteredDeformModel
+        
+        n_clusters = getattr(dataset, 'cluster_n_clusters', 8)
+        _deform_type = getattr(dataset, "deform_type", "mlp")
+        
+        if _deform_type == "4dgs":
+            _s_res = tuple(int(x) for x in dataset.hex_spatial_res.split(","))
+            _t_res = tuple(int(x) for x in dataset.hex_time_res.split(","))
+            
+            # Student model architecture parameters
+            _student_s_res = tuple(int(x) for x in dataset.student_spatial_res.split(","))
+            _student_t_res = tuple(int(x) for x in dataset.student_time_res.split(","))
+            _student_feat_dim = getattr(dataset, 'student_feat_dim', 8)
+            _student_mlp_hidden = getattr(dataset, 'student_mlp_hidden', 64)
+            _student_mlp_layers = getattr(dataset, 'student_mlp_layers', 2)
+            
+            # Create clustered deform model
+            clustered_deform = ClusteredDeformModel(
+                n_clusters=n_clusters,
+                is_blender=dataset.is_blender,
+                is_6dof=dataset.is_6dof,
+                teacher_spatial_resolutions=_s_res,
+                teacher_time_resolutions=_t_res,
+                teacher_feat_dim=dataset.hex_feat_dim,
+                teacher_mlp_hidden_dim=dataset.hex_mlp_hidden,
+                teacher_mlp_num_hidden=dataset.hex_mlp_layers,
+                student_feat_dim=_student_feat_dim,
+                student_spatial_resolutions=_student_s_res,
+                student_time_resolutions=_student_t_res,
+                student_mlp_hidden_dim=_student_mlp_hidden,
+                student_mlp_num_hidden=_student_mlp_layers,
+                fusion=dataset.hex_fusion,
+            )
+            
+            # Load pre-trained teacher weights (REQUIRED - must be manually set)
+            teacher_checkpoint = getattr(dataset, 'teacher_checkpoint_path', '')
+            if not teacher_checkpoint:
+                raise ValueError(
+                    "[ERROR] teacher_checkpoint_path is required for clustered deform model. "
+                    "Please set --teacher_checkpoint_path /path/to/deform.pth"
+                )
+            
+            if not os.path.exists(teacher_checkpoint):
+                raise FileNotFoundError(
+                    f"[ERROR] Teacher checkpoint not found: {teacher_checkpoint}\n"
+                    "Please check the path and ensure the pre-trained weights exist."
+                )
+            
+            # Load teacher weights
+            clustered_deform.teacher.load_state_dict(torch.load(teacher_checkpoint))
+            clustered_deform.teacher.eval()  # Ensure teacher is in eval mode (frozen)
+            
+            logger.info("[ITER %d] Loaded teacher weights from %s", iteration, teacher_checkpoint)
+            print(f"[INFO] Loaded teacher weights from: {teacher_checkpoint}")
+            
+            # Set AABB
+            clustered_deform.set_aabb(gaussians.get_xyz.detach(), padding=0.1)
+            
+            # Set cluster labels
+            clustered_deform.set_cluster_labels(gaussians._cluster_labels)
+            
+            # Initialize optimizer
+            clustered_deform.train_setting(opt)
+            
+            logger.info("[ITER %d] Switched to clustered deform model with %d students", iteration, n_clusters)
+            print(f"[INFO] Switched to clustered deform model with {n_clusters} student models")
+            
+            # Replace deform object
+            deform = clustered_deform
+            
+            return cluster_result, deform
+
+    return cluster_result, deform
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: bool = False,
@@ -133,6 +212,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
 
     # ── Select deformation network ──
     _deform_type = getattr(dataset, "deform_type", "mlp")
+    
+    # Check if we will use clustered deform model
+    _use_clustered = getattr(dataset, "use_clustered_deform", False)
+    _cluster_start_iter = getattr(dataset, "clustered_deform_start_iter", 15000)
+    
     if _deform_type == "4dgs":
         _s_res = tuple(int(x) for x in dataset.hex_spatial_res.split(","))
         _t_res = tuple(int(x) for x in dataset.hex_time_res.split(","))
@@ -146,9 +230,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             mlp_num_hidden=dataset.hex_mlp_layers,
             fusion=dataset.hex_fusion,
         )
-        logger.info("Using 4DGS HexPlane deformation network  spatial_res=%s  time_res=%s  feat_dim=%d  mlp=%dx%d  fusion=%s",
-                    _s_res, _t_res, dataset.hex_feat_dim, dataset.hex_mlp_hidden, dataset.hex_mlp_layers, dataset.hex_fusion)
-        print(f"[INFO] Using 4DGS HexPlane  spatial_res={_s_res}  time_res={_t_res}  feat_dim={dataset.hex_feat_dim}  mlp={dataset.hex_mlp_hidden}x{dataset.hex_mlp_layers}  fusion={dataset.hex_fusion}")
+        if _use_clustered:
+            logger.info("Using 4DGS HexPlane deformation network (will switch to clustered at iter %d)", _cluster_start_iter)
+            print(f"[INFO] Using 4DGS HexPlane (will switch to clustered at iter {_cluster_start_iter})")
+        else:
+            logger.info("Using 4DGS HexPlane deformation network  spatial_res=%s  time_res=%s  feat_dim=%d  mlp=%dx%d  fusion=%s",
+                        _s_res, _t_res, dataset.hex_feat_dim, dataset.hex_mlp_hidden, dataset.hex_mlp_layers, dataset.hex_fusion)
+            print(f"[INFO] Using 4DGS HexPlane  spatial_res={_s_res}  time_res={_t_res}  feat_dim={dataset.hex_feat_dim}  mlp={dataset.hex_mlp_hidden}x{dataset.hex_mlp_layers}  fusion={dataset.hex_fusion}")
     else:
         deform = DeformModel(dataset.is_blender, dataset.is_6dof)
     deform.train_setting(opt)
@@ -314,33 +402,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             if dataset.use_dynamic_sep and iteration == 10000:
                 gaussians.start_deform_tracking()
                 print(f"[INFO] Starting deformation tracking at iteration {iteration}")
-            
-            # ── Dynamic-static separation ablation test: mask static Gaussians after 15000 iterations ──
-            if getattr(dataset, 'use_dynamic_ablation', False) and iteration > dataset.dynamic_ablation_start_iter:
-                with torch.no_grad():
-                    # Get dynamic mask from clustering results
-                    dynamic_mask = gaussians.get_dynamic_mask_from_cluster()  # (N,) bool
-                    
-                    # Check if clustering has been performed and mask dimension matches
-                    if dynamic_mask.sum() == 0 or dynamic_mask.shape[0] != gaussians.get_xyz.shape[0]:
-                        # No clustering performed yet or dimension mismatch due to densify/prune
-                        if iteration == dataset.dynamic_ablation_start_iter:
-                            print(f"[WARNING] use_dynamic_ablation=True but no cluster labels found. "
-                                  f"Please ensure clustering_iterations includes {dataset.dynamic_ablation_start_iter}")
-                        # Skip masking if mask is not available or dimension mismatch
-                        # The mask will be valid after next clustering
-                    else:
-                        # Mask out static Gaussians (set their deformation to zero)
-                        if iteration == dataset.dynamic_ablation_start_iter:
-                            _msg = (f"[ABLATION] Starting dynamic-static separation at iter {iteration}: "
-                                    f"{dynamic_mask.sum().item()} dynamic / {gaussians.get_xyz.shape[0]} total Gaussians")
-                            print(_msg)
-                            logger.info(_msg)
-                        
-                        # Apply mask: only dynamic Gaussians get deformation
-                        d_xyz = d_xyz * dynamic_mask.unsqueeze(-1)
-                        d_rotation = d_rotation * dynamic_mask.unsqueeze(-1) if torch.is_tensor(d_rotation) else d_rotation
-                        d_scaling = d_scaling * dynamic_mask.unsqueeze(-1) if torch.is_tensor(d_scaling) else d_scaling
 
         if _enable_phase_timer:
             torch.cuda.synchronize()
@@ -385,6 +446,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             if tb_writer and iteration % 100 == 0:
                 tb_writer.add_scalar('train_loss_patches/hexplane_tv', _tv_loss.item(), iteration)
                 tb_writer.add_scalar('train_loss_patches/hexplane_l1', _l1_loss.item(), iteration)
+
+        # ── Knowledge distillation loss for clustered deform model ──
+        if isinstance(deform, ClusteredDeformModel) and iteration > getattr(dataset, 'clustered_deform_start_iter', 15000):
+            # Compute distillation loss: student predictions match teacher
+            N = gaussians.get_xyz.shape[0]
+            time_input = fid.unsqueeze(0).expand(N, -1)
+            
+            kl_weight = getattr(dataset, 'kl_distill_weight', 1.0)
+            distill_loss = deform.get_distillation_loss(
+                gaussians.get_xyz.detach(),
+                time_input + ast_noise if iteration >= opt.warm_up else time_input,
+                gaussians._cluster_labels
+            )
+            loss = loss + kl_weight * distill_loss
+            
+            if tb_writer and iteration % 100 == 0:
+                tb_writer.add_scalar('train_loss_patches/distillation_loss', distill_loss.item(), iteration)
 
         # ── Dynamic score-based separation (replaces dynamic probability losses) ──
         # Dynamic score is computed at iteration 15000 using displacement statistics
@@ -516,17 +594,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
 
             # ── Run clustering at configurable iterations (decoupled from training loop) ──
             if dataset.use_dynamic_sep and iteration in dataset.clustering_iterations:
-                run_clustering_at_iteration(
+                cluster_result, deform = run_clustering_at_iteration(
                     gaussians=gaussians,
                     scene=scene,
                     deform=deform,
                     pipe=pipe,
                     background=background,
                     dataset=dataset,
+                    opt=opt,
                     iteration=iteration,
                     temperature=1.0,  # temperature for dynamic score thresholding
                     mult=opt.mult,
                     tb_writer=tb_writer,
+                    logger=logger,
                 )
 
     # Final sync — only once at the very end

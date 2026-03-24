@@ -10,7 +10,7 @@
 #
 
 import torch
-from scene import Scene, DeformModel, DeformModel_4DGS
+from scene import Scene, DeformModel, DeformModel_4DGS, ClusteredDeformModel
 import os
 from tqdm import tqdm
 from os import makedirs
@@ -32,19 +32,13 @@ def _apply_dynamic_gate(gaussians, d_xyz, d_rotation, d_scaling, use_dynamic_sep
     At inference time we use the final (low) temperature to produce near-binary
     gating, effectively hard-separating static and dynamic Gaussians.
     
-    For dynamic-static ablation test, use clustering results to mask static Gaussians.
+    Note: For clustered deform model, no masking is needed as ClusteredDeformModel
+    naturally handles static Gaussians (they receive zero deformation by design).
     """
-    # Priority 1: Dynamic-static ablation test (hard masking based on clustering)
-    if use_dynamic_ablation:
-        dynamic_mask = gaussians.get_dynamic_mask_from_cluster()  # (N,) bool
-        if dynamic_mask.sum() > 0:
-            # Apply hard mask: static Gaussians get zero deformation
-            d_xyz = d_xyz * dynamic_mask.unsqueeze(-1) if torch.is_tensor(d_xyz) else d_xyz
-            d_rotation = d_rotation * dynamic_mask.unsqueeze(-1) if torch.is_tensor(d_rotation) else d_rotation
-            d_scaling = d_scaling * dynamic_mask.unsqueeze(-1) if torch.is_tensor(d_scaling) else d_scaling
-            return d_xyz, d_rotation, d_scaling
+    # ClusteredDeformModel naturally handles static Gaussians - no masking needed
+    # Static Gaussians receive zero deformation in the forward pass
     
-    # Priority 2: Original soft dynamic separation (currently commented out)
+    # Original soft dynamic separation (currently commented out)
     # if use_dynamic_sep:
     #     prob = gaussians.get_dynamic_prob_t(temperature=0.05).detach()  # near-binary at inference
     #     return prob * d_xyz, prob * d_rotation, prob * d_scaling
@@ -52,7 +46,7 @@ def _apply_dynamic_gate(gaussians, d_xyz, d_rotation, d_scaling, use_dynamic_sep
     return d_xyz, d_rotation, d_scaling
 
 
-def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration, views, gaussians, pipeline, background, args, deform, use_dynamic_sep=False, use_dynamic_ablation=False):
+def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration, views, gaussians, pipeline, background, args, deform, use_dynamic_sep=False):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
     depth_path = os.path.join(model_path, name, "ours_{}".format(iteration), "depth")
@@ -80,7 +74,7 @@ def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration, views,
         t_start = time.time()
 
         d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input)
-        d_xyz, d_rotation, d_scaling = _apply_dynamic_gate(gaussians, d_xyz, d_rotation, d_scaling, use_dynamic_sep, use_dynamic_ablation)
+        d_xyz, d_rotation, d_scaling = _apply_dynamic_gate(gaussians, d_xyz, d_rotation, d_scaling, use_dynamic_sep)
 
         results = render_fastgs(view, gaussians, pipeline, background, args.mult, d_xyz, d_rotation, d_scaling, is_6dof)
 
@@ -107,7 +101,120 @@ def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration, views,
     print(f"[{name}] Rendered {num_frames} frames in {total_time:.2f} seconds. Average FPS: {fps:.2f}")
 
 
-def interpolate_time(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, views, gaussians, pipeline, background, args, deform, use_dynamic_sep=False, use_dynamic_ablation=False):
+def render_set_with_clustered_deform(
+    model_path,
+    load2gpu_on_the_fly,
+    is_6dof,
+    name,
+    iteration,
+    views,
+    gaussians,
+    pipeline,
+    background,
+    args,
+    deform,
+    use_dynamic_sep=False,
+):
+    """Render with clustered deform model: dual-path evaluation.
+    
+    Renders twice:
+    1. Using original teacher deform model (single path)
+    2. Using all student deform models (clustered path)
+    
+    This allows comparing visual quality and metrics between the two.
+    """
+    if not isinstance(deform, ClusteredDeformModel):
+        # Fall back to standard rendering if not clustered
+        render_set(
+            model_path, load2gpu_on_the_fly, is_6dof, name, iteration,
+            views, gaussians, pipeline, background, args, deform,
+            use_dynamic_sep
+        )
+        return
+    
+    # Path 1: Teacher model rendering
+    render_path_teacher = os.path.join(model_path, name, f"ours_{iteration}_teacher", "renders")
+    gts_path_teacher = os.path.join(model_path, name, f"ours_{iteration}_teacher", "gt")
+    makedirs(render_path_teacher, exist_ok=True)
+    makedirs(gts_path_teacher, exist_ok=True)
+    
+    print(f"[RENDER] Starting teacher deform path rendering at iteration {iteration}")
+    
+    total_time_teacher = 0.0
+    for idx, view in enumerate(tqdm(views, desc="Teacher rendering progress")):
+        if load2gpu_on_the_fly:
+            view.load2device()
+        
+        if view.original_image is None and hasattr(view, 'load_image_to_gpu'):
+            view.load_image_to_gpu('cuda')
+        
+        fid = view.fid
+        xyz = gaussians.get_xyz
+        time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
+        
+        torch.cuda.synchronize()
+        t_start = time.time()
+        
+        # Teacher model forward
+        d_xyz, d_rotation, d_scaling = deform.step_teacher(xyz.detach(), time_input)
+        
+        torch.cuda.synchronize()
+        total_time_teacher += time.time() - t_start
+        
+        rendering = render_fastgs(view, gaussians, pipeline, background, args.mult, d_xyz, d_rotation, d_scaling, is_6dof)["render"]
+        gt = view.original_image[0:3, :, :]
+        torchvision.utils.save_image(rendering, os.path.join(render_path_teacher, '{0:05d}'.format(idx) + ".png"))
+        torchvision.utils.save_image(gt, os.path.join(gts_path_teacher, '{0:05d}'.format(idx) + ".png"))
+        
+        if hasattr(view, 'unload_image'):
+            view.unload_image()
+    
+    # Path 2: Student models rendering (clustered)
+    render_path_students = os.path.join(model_path, name, f"ours_{iteration}_clustered", "renders")
+    gts_path_students = os.path.join(model_path, name, f"ours_{iteration}_clustered", "gt")
+    makedirs(render_path_students, exist_ok=True)
+    makedirs(gts_path_students, exist_ok=True)
+    
+    print(f"[RENDER] Starting student (clustered) deform path rendering at iteration {iteration}")
+    
+    total_time_students = 0.0
+    for idx, view in enumerate(tqdm(views, desc="Student rendering progress")):
+        if load2gpu_on_the_fly:
+            view.load2device()
+        
+        if view.original_image is None and hasattr(view, 'load_image_to_gpu'):
+            view.load_image_to_gpu('cuda')
+        
+        fid = view.fid
+        xyz = gaussians.get_xyz
+        time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
+        
+        torch.cuda.synchronize()
+        t_start = time.time()
+        
+        # Student models forward (clustered)
+        d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input, gaussians._cluster_labels)
+        
+        torch.cuda.synchronize()
+        total_time_students += time.time() - t_start
+        
+        rendering = render_fastgs(view, gaussians, pipeline, background, args.mult, d_xyz, d_rotation, d_scaling, is_6dof)["render"]
+        gt = view.original_image[0:3, :, :]
+        torchvision.utils.save_image(rendering, os.path.join(render_path_students, '{0:05d}'.format(idx) + ".png"))
+        torchvision.utils.save_image(gt, os.path.join(gts_path_students, '{0:05d}'.format(idx) + ".png"))
+        
+        if hasattr(view, 'unload_image'):
+            view.unload_image()
+    
+    # Report statistics
+    num_frames = len(views)
+    print(f"[TEACHER] Rendered {num_frames} frames in {total_time_teacher:.2f}s. Avg FPS: {num_frames / total_time_teacher:.2f}")
+    print(f"[STUDENTS] Rendered {num_frames} frames in {total_time_students:.2f}s. Avg FPS: {num_frames / total_time_students:.2f}")
+    print(f"[COMPARISON] Teacher path: {render_path_teacher}")
+    print(f"[COMPARISON] Student path: {render_path_students}")
+
+
+def interpolate_time(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, views, gaussians, pipeline, background, args, deform, use_dynamic_sep=False):
     render_path = os.path.join(model_path, name, "interpolate_{}".format(iteration), "renders")
     depth_path = os.path.join(model_path, name, "interpolate_{}".format(iteration), "depth")
 
@@ -125,7 +232,7 @@ def interpolate_time(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, 
         xyz = gaussians.get_xyz
         time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
         d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input)
-        d_xyz, d_rotation, d_scaling = _apply_dynamic_gate(gaussians, d_xyz, d_rotation, d_scaling, use_dynamic_sep, use_dynamic_ablation)
+        d_xyz, d_rotation, d_scaling = _apply_dynamic_gate(gaussians, d_xyz, d_rotation, d_scaling, use_dynamic_sep)
         results = render_fastgs(view, gaussians, pipeline, background, args.mult, d_xyz, d_rotation, d_scaling, is_6dof)
         rendering = results["render"]
         renderings.append(to8b(rendering.cpu().numpy()))
@@ -139,7 +246,7 @@ def interpolate_time(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, 
     imageio.mimwrite(os.path.join(render_path, 'video.mp4'), renderings, fps=30, quality=8)
 
 
-def interpolate_view(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, views, gaussians, pipeline, background, args, timer, use_dynamic_sep=False, use_dynamic_ablation=False):
+def interpolate_view(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, views, gaussians, pipeline, background, args, timer, use_dynamic_sep=False):
     render_path = os.path.join(model_path, name, "interpolate_view_{}".format(iteration), "renders")
     depth_path = os.path.join(model_path, name, "interpolate_view_{}".format(iteration), "depth")
     # acc_path = os.path.join(model_path, name, "interpolate_view_{}".format(iteration), "acc")
@@ -172,7 +279,7 @@ def interpolate_view(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, 
         xyz = gaussians.get_xyz
         time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
         d_xyz, d_rotation, d_scaling = timer.step(xyz.detach(), time_input)
-        d_xyz, d_rotation, d_scaling = _apply_dynamic_gate(gaussians, d_xyz, d_rotation, d_scaling, use_dynamic_sep, use_dynamic_ablation)
+        d_xyz, d_rotation, d_scaling = _apply_dynamic_gate(gaussians, d_xyz, d_rotation, d_scaling, use_dynamic_sep)
         results = render_fastgs(view, gaussians, pipeline, background, args.mult, d_xyz, d_rotation, d_scaling, is_6dof)
         rendering = results["render"]
         renderings.append(to8b(rendering.cpu().numpy()))
@@ -186,7 +293,7 @@ def interpolate_view(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, 
     imageio.mimwrite(os.path.join(render_path, 'video.mp4'), renderings, fps=30, quality=8)
 
 
-def interpolate_all(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, views, gaussians, pipeline, background, args, deform, use_dynamic_sep=False, use_dynamic_ablation=False):
+def interpolate_all(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, views, gaussians, pipeline, background, args, deform, use_dynamic_sep=False):
     render_path = os.path.join(model_path, name, "interpolate_all_{}".format(iteration), "renders")
     depth_path = os.path.join(model_path, name, "interpolate_all_{}".format(iteration), "depth")
 
@@ -215,7 +322,7 @@ def interpolate_all(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, v
         xyz = gaussians.get_xyz
         time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
         d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input)
-        d_xyz, d_rotation, d_scaling = _apply_dynamic_gate(gaussians, d_xyz, d_rotation, d_scaling, use_dynamic_sep, use_dynamic_ablation)
+        d_xyz, d_rotation, d_scaling = _apply_dynamic_gate(gaussians, d_xyz, d_rotation, d_scaling, use_dynamic_sep)
         results = render_fastgs(view, gaussians, pipeline, background, args.mult, d_xyz, d_rotation, d_scaling, is_6dof)
         rendering = results["render"]
         renderings.append(to8b(rendering.cpu().numpy()))
@@ -229,7 +336,7 @@ def interpolate_all(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, v
     imageio.mimwrite(os.path.join(render_path, 'video.mp4'), renderings, fps=30, quality=8)
 
 
-def interpolate_poses(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, views, gaussians, pipeline, background, args, timer, use_dynamic_sep=False, use_dynamic_ablation=False):
+def interpolate_poses(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, views, gaussians, pipeline, background, args, timer, use_dynamic_sep=False):
     render_path = os.path.join(model_path, name, "interpolate_pose_{}".format(iteration), "renders")
     depth_path = os.path.join(model_path, name, "interpolate_pose_{}".format(iteration), "depth")
 
@@ -263,7 +370,7 @@ def interpolate_poses(model_path, load2gpt_on_the_fly, is_6dof, name, iteration,
         xyz = gaussians.get_xyz
         time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
         d_xyz, d_rotation, d_scaling = timer.step(xyz.detach(), time_input)
-        d_xyz, d_rotation, d_scaling = _apply_dynamic_gate(gaussians, d_xyz, d_rotation, d_scaling, use_dynamic_sep, use_dynamic_ablation)
+        d_xyz, d_rotation, d_scaling = _apply_dynamic_gate(gaussians, d_xyz, d_rotation, d_scaling, use_dynamic_sep)
 
         results = render_fastgs(view, gaussians, pipeline, background, args.mult, d_xyz, d_rotation, d_scaling, is_6dof)
         rendering = results["render"]
@@ -276,7 +383,7 @@ def interpolate_poses(model_path, load2gpt_on_the_fly, is_6dof, name, iteration,
 
 
 def interpolate_view_original(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, views, gaussians, pipeline, background, args,
-                              timer, use_dynamic_sep=False, use_dynamic_ablation=False):
+                              timer, use_dynamic_sep=False):
     render_path = os.path.join(model_path, name, "interpolate_hyper_view_{}".format(iteration), "renders")
     depth_path = os.path.join(model_path, name, "interpolate_hyper_view_{}".format(iteration), "depth")
     # acc_path = os.path.join(model_path, name, "interpolate_all_{}".format(iteration), "acc")
@@ -320,7 +427,7 @@ def interpolate_view_original(model_path, load2gpt_on_the_fly, is_6dof, name, it
         xyz = gaussians.get_xyz
         time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
         d_xyz, d_rotation, d_scaling = timer.step(xyz.detach(), time_input)
-        d_xyz, d_rotation, d_scaling = _apply_dynamic_gate(gaussians, d_xyz, d_rotation, d_scaling, use_dynamic_sep, use_dynamic_ablation)
+        d_xyz, d_rotation, d_scaling = _apply_dynamic_gate(gaussians, d_xyz, d_rotation, d_scaling, use_dynamic_sep)
 
         results = render_fastgs(view, gaussians, pipeline, background, args.mult, d_xyz, d_rotation, d_scaling, is_6dof)
         rendering = results["render"]
@@ -356,12 +463,16 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
         deform.load_weights(dataset.model_path)
 
         _use_dynamic_sep = getattr(dataset, "use_dynamic_sep", False)
-        _use_dynamic_ablation = getattr(dataset, "use_dynamic_ablation", False)
+        _use_clustered_deform = getattr(dataset, "use_clustered_deform", False)
 
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-        if mode == "render":
+        # For clustered deform model, use dual-path rendering
+        if _use_clustered_deform and isinstance(deform, ClusteredDeformModel):
+            render_func = render_set_with_clustered_deform
+            print("[INFO] Using dual-path rendering for clustered deform model")
+        elif mode == "render":
             render_func = render_set
         elif mode == "time":
             render_func = interpolate_time
@@ -377,12 +488,12 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
         if not skip_train:
             render_func(dataset.model_path, dataset.load2gpu_on_the_fly, dataset.is_6dof, "train", scene.loaded_iter,
                         scene.getTrainCameras(), gaussians, pipeline,
-                        background, args, deform, use_dynamic_sep=_use_dynamic_sep, use_dynamic_ablation=_use_dynamic_ablation)
+                        background, args, deform, use_dynamic_sep=_use_dynamic_sep)
 
         if not skip_test:
             render_func(dataset.model_path, dataset.load2gpu_on_the_fly, dataset.is_6dof, "test", scene.loaded_iter,
                         scene.getTestCameras(), gaussians, pipeline,
-                        background, args, deform, use_dynamic_sep=_use_dynamic_sep, use_dynamic_ablation=_use_dynamic_ablation)
+                        background, args, deform, use_dynamic_sep=_use_dynamic_sep)
 
 
 if __name__ == "__main__":
