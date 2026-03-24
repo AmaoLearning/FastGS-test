@@ -316,7 +316,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 print(f"[INFO] Starting deformation tracking at iteration {iteration}")
             
             # ── Dynamic-static separation ablation test: mask static Gaussians after 15000 iterations ──
-            if getattr(dataset, 'use_dynamic_ablation', False) and iteration >= dataset.dynamic_ablation_start_iter:
+            # Clustering runs at the END of iteration 15000, so masking starts from iteration 15001
+            if getattr(dataset, 'use_dynamic_ablation', False) and iteration > dataset.dynamic_ablation_start_iter:
                 with torch.no_grad():
                     # Get dynamic mask from clustering results
                     dynamic_mask = gaussians.get_dynamic_mask_from_cluster()  # (N,) bool
@@ -324,14 +325,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                     # Check if clustering has been performed and mask dimension matches
                     if dynamic_mask.sum() == 0 or dynamic_mask.shape[0] != gaussians.get_xyz.shape[0]:
                         # No clustering performed yet or dimension mismatch due to densify/prune
-                        if iteration == dataset.dynamic_ablation_start_iter:
+                        # Only warn on the first iteration after clustering (15001)
+                        if iteration == dataset.dynamic_ablation_start_iter + 1:
                             print(f"[WARNING] use_dynamic_ablation=True but no cluster labels found. "
                                   f"Please ensure clustering_iterations includes {dataset.dynamic_ablation_start_iter}")
                         # Skip masking if mask is not available or dimension mismatch
-                        # The mask will be valid after next clustering
                     else:
                         # Mask out static Gaussians (set their deformation to zero)
-                        if iteration == dataset.dynamic_ablation_start_iter:
+                        # Only log on the first iteration after clustering (15001)
+                        if iteration == dataset.dynamic_ablation_start_iter + 1:
                             _n_dynamic = dynamic_mask.sum().item()
                             _n_total = gaussians.get_xyz.shape[0]
                             _pct_dynamic = _n_dynamic / _n_total * 100
@@ -351,8 +353,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                                 print(f"  - After masking: {_mag_after:.6f}")
                                 print(f"  - Dynamic Gaussians only: {_mag_dynamic_only:.6f}")
                                 print(f"  - Static Gaussians only: {_mag_static_only:.6f}")
-                                print(f"[ABLATION DEBUG] Dynamic mask - Min: {dynamic_mask.min().item()}, Max: {dynamic_mask.max().item()}, Sum: {_n_dynamic}, Pct: {_pct_dynamic:.1f}%")
-                                print(f"[ABLATION DEBUG] Cluster labels - Unique values: {torch.unique(gaussians._cluster_labels).cpu().tolist() if gaussians._cluster_labels is not None else 'None'}")
                         
                         # Convert bool mask to float for proper multiplication
                         _dynamic_mask_float = dynamic_mask.to(dtype=d_xyz.dtype)  # (N,) float32
