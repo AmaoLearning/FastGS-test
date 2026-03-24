@@ -543,6 +543,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                                                 importance_score = importance_score,
                                                 pruning_score = pruning_score)
 
+                    # Sync cluster labels to clustered deform model after pruning
+                    if isinstance(deform, ClusteredDeformModel) and gaussians._cluster_labels is not None:
+                        deform.set_cluster_labels(gaussians._cluster_labels)
+
                 if iteration % opt.opacity_reset_interval == 0 or (
                         dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
@@ -559,6 +563,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 scene.release_cameras(camlist)
 
                 gaussians.final_prune_fastgs(min_opacity = 0.1, pruning_score = pruning_score)
+
+                # Sync cluster labels to clustered deform model after pruning
+                if isinstance(deform, ClusteredDeformModel) and gaussians._cluster_labels is not None:
+                    deform.set_cluster_labels(gaussians._cluster_labels)
 
             if iteration < opt.iterations:
                 deform.optimizer.step()
