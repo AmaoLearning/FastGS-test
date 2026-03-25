@@ -265,12 +265,13 @@ class GaussianModel:
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
-
+        
         # Load cluster labels if they exist (for clustered deform model)
-        if 'cluster_label' in plydata.elements[0].properties:
-            cluster_labels = np.asarray(plydata.elements[0]['cluster_label'])
-            self._cluster_labels = torch.tensor(cluster_labels, dtype=torch.int32, device="cuda")
-        else:
+        try:
+            self._cluster_labels = torch.tensor(np.asarray(plydata.elements[0]['cluster_label']), dtype=torch.int32, device="cuda")
+            print("[INFO] Load cluster label successfully!")
+        except ValueError:
+            print("[WARNNING] Failed to load cluster label! Set to None")
             self._cluster_labels = None
 
         self.active_sh_degree = self.max_sh_degree
@@ -386,7 +387,7 @@ class GaussianModel:
         return optimizable_tensors
 
     def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
-                              new_rotation):
+                              new_rotation, new_cluster_labels=None):
         d = {"xyz": new_xyz,
              "f_dc": new_features_dc,
              "f_rest": new_features_rest,
@@ -415,8 +416,12 @@ class GaussianModel:
         self._deform_min = torch.cat([self._deform_min,
                                        torch.zeros(_n_new, 3, device="cuda")], dim=0) if self._deform_min.numel() > 0 else self._deform_min
         
-        # Extend cluster labels for newly added Gaussians (default to -1: static)
-        if self._cluster_labels is not None:
+        # Extend or initialize cluster labels for newly added Gaussians
+        if new_cluster_labels is not None:
+            # Inherit cluster labels from parent Gaussians
+            self._cluster_labels = torch.cat([self._cluster_labels, new_cluster_labels], dim=0)
+        elif self._cluster_labels is not None:
+            # Default to -1 (static) for new Gaussians if no parent labels provided
             self._cluster_labels = torch.cat([self._cluster_labels,
                                                torch.full((_n_new,), -1, dtype=torch.int32, device="cuda")], dim=0)
 
@@ -644,8 +649,13 @@ class GaussianModel:
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
+        
+        # Inherit cluster labels from parent Gaussians
+        new_cluster_labels = None
+        if self._cluster_labels is not None:
+            new_cluster_labels = self._cluster_labels[selected_pts_mask].repeat(N)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_cluster_labels)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -660,8 +670,13 @@ class GaussianModel:
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
+        
+        # Inherit cluster labels from parent Gaussians
+        new_cluster_labels = None
+        if self._cluster_labels is not None:
+            new_cluster_labels = self._cluster_labels[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_cluster_labels)
 
     def densify_and_prune_fastgs(self, max_screen_size, min_opacity, extent, radii, args, importance_score = None, pruning_score = None, flow_mask = None):
         

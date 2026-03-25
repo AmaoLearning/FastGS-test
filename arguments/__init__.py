@@ -77,7 +77,7 @@ class ModelParams(ParamGroup):
         self.use_dynamic_sep = True   # 启用动静分离：积累形变统计、执行聚类（默认启用）
         self.log_deform_hist = False   # 每隔3000轮记录全局形变分布柱状图
 
-        # Dynamic Gaussian clustering (decoupled from training loop)
+        # Dynamic Gaussian clustering (run at 15000 to assign deform fields, labels persist with Gaussians)
         self.clustering_iterations = "15000" # Comma-separated iteration numbers, e.g. "15000,30000" → [15000, 30000]
         self.cluster_n_clusters = 8        # KMeans 聚类数
         self.cluster_dynamic_thresh = 0.5  # 动态概率阈值，仅 prob > thresh 的高斯参与聚类（用于旧版本兼容）
