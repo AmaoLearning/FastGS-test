@@ -429,12 +429,30 @@ class ClusteredDeformModel:
         xyz: torch.Tensor,
         time_emb: torch.Tensor,
         cluster_ids: torch.Tensor,
+        student_d_xyz: Optional[torch.Tensor] = None,
+        student_d_rot: Optional[torch.Tensor] = None,
+        student_d_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Compute knowledge distillation loss: student vs teacher predictions."""
+        """Compute knowledge distillation loss: student vs teacher predictions.
+        
+        Args:
+            xyz: Gaussian positions (N, 3)
+            time_emb: Time embeddings (N, 1)
+            cluster_ids: Cluster assignments (N,)
+            student_d_xyz: Pre-computed student deformation (N, 3). If None, recomputes.
+            student_d_rot: Pre-computed student rotation (N, 4). If None, recomputes.
+            student_d_scale: Pre-computed student scaling (N, 3). If None, recomputes.
+        
+        Returns:
+            Distillation loss (scalar)
+        """
+        # Teacher prediction (no_grad, frozen)
         with torch.no_grad():
             teacher_d_xyz, teacher_d_rot, teacher_d_scale = self.step_teacher(xyz, time_emb)
         
-        student_d_xyz, student_d_rot, student_d_scale = self.step(xyz, time_emb, cluster_ids)
+        # Reuse pre-computed student predictions if provided, otherwise compute fresh
+        if student_d_xyz is None or student_d_rot is None or student_d_scale is None:
+            student_d_xyz, student_d_rot, student_d_scale = self.step(xyz, time_emb, cluster_ids)
         
         # L2 loss between teacher and student predictions
         loss_xyz = F.mse_loss(student_d_xyz, teacher_d_xyz)
