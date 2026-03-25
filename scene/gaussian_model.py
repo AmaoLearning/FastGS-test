@@ -206,7 +206,7 @@ class GaussianModel:
         
         # Include cluster labels if they exist
         if hasattr(self, '_cluster_labels') and self._cluster_labels is not None:
-            cluster_labels = self._cluster_labels.detach().cpu().numpy().astype(np.float32)
+            cluster_labels = self._cluster_labels.detach().cpu().unsqueeze(1).numpy().astype(np.float32)
             attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation, cluster_labels), axis=1)
         else:
             attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
