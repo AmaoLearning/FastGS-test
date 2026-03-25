@@ -188,6 +188,9 @@ class GaussianModel:
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
             l.append('rot_{}'.format(i))
+        # Add cluster labels if they exist (for clustered deform model)
+        if hasattr(self, '_cluster_labels') and self._cluster_labels is not None:
+            l.append('cluster_label')
         return l
 
     def save_ply(self, path):
@@ -200,11 +203,17 @@ class GaussianModel:
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
+        
+        # Include cluster labels if they exist
+        if hasattr(self, '_cluster_labels') and self._cluster_labels is not None:
+            cluster_labels = self._cluster_labels.detach().cpu().numpy().astype(np.float32)
+            attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation, cluster_labels), axis=1)
+        else:
+            attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -256,6 +265,13 @@ class GaussianModel:
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+
+        # Load cluster labels if they exist (for clustered deform model)
+        if 'cluster_label' in plydata.elements[0].properties:
+            cluster_labels = np.asarray(plydata.elements[0]['cluster_label'])
+            self._cluster_labels = torch.tensor(cluster_labels, dtype=torch.int32, device="cuda")
+        else:
+            self._cluster_labels = None
 
         self.active_sh_degree = self.max_sh_degree
 

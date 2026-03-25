@@ -72,10 +72,8 @@ def run_clustering_at_iteration(
     if not getattr(dataset, 'use_dynamic_sep', False):
         return None
 
-    _cluster_save = os.path.join(
-        dataset.model_path, "cluster",
-        f"cluster_iter{iteration}.npz")
-    os.makedirs(os.path.dirname(_cluster_save), exist_ok=True)
+    _cluster_save = os.path.join(dataset.model_path, "cluster")
+    os.makedirs(_cluster_save, exist_ok=True)
 
     cluster_result = cluster_dynamic_gaussians(
         gaussians,
@@ -87,7 +85,6 @@ def run_clustering_at_iteration(
         temperature=temperature,
         tb_writer=tb_writer,
         iteration=iteration,
-        save_path=_cluster_save,
         dynamic_score_percentile=getattr(dataset, 'dynamic_score_percentile', 80.0),
     )
     gaussians._cluster_labels = cluster_result["labels"]

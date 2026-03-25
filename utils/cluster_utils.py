@@ -156,7 +156,6 @@ def cluster_dynamic_gaussians(
     temperature: float = 1.0,
     tb_writer=None,
     iteration: int = 0,
-    save_path: Optional[str] = None,
     dynamic_score_percentile: float = 80.0,
 ) -> Dict[str, object]:
     """Cluster dynamic Gaussians and return results.
@@ -341,24 +340,6 @@ def cluster_dynamic_gaussians(
         tb_writer.add_scalar('cluster/intra_inter_ratio', ratio, iteration)
         for c_id in range(n_clusters):
             tb_writer.add_scalar(f'cluster/count_{c_id}', int(cluster_counts[c_id]), iteration)
-
-    # ── 7. Save results ──
-    if save_path is not None:
-        import os
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        np.savez_compressed(
-            save_path,
-            labels=labels_full.cpu().numpy(),
-            dynamic_mask=dynamic_mask.cpu().numpy(),
-            metrics_silhouette=sil,
-            metrics_intra=intra,
-            metrics_inter=inter,
-            metrics_ratio=ratio,
-            cluster_counts=cluster_counts,
-        )
-        _msg = f"[CLUSTER] Results saved to {save_path}"
-        logger.info(_msg)
-        print(_msg)
 
     t_end = time.perf_counter()
     _msg = f"[CLUSTER] Total clustering time: {t_end - t_start:.2f}s"
