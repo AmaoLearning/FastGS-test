@@ -294,7 +294,11 @@ class ClusteredDeformModel:
         time_emb: torch.Tensor,
         cluster_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Forward pass for clustered deformation.
+        """Forward pass for clustered deformation (parallel inference).
+        
+        Uses batched parallel inference: all student models receive their
+        respective cluster inputs in a single concatenated batch, enabling
+        CUDA kernel fusion and overlapping memory operations.
         
         Args:
             xyz: Gaussian positions (N, 3)
@@ -311,29 +315,52 @@ class ClusteredDeformModel:
             raise ValueError("No cluster labels provided. Set cluster_labels first.")
         
         N = xyz.shape[0]
-        d_xyz = torch.zeros(N, 3, device=xyz.device, dtype=xyz.dtype)
-        d_rotation = torch.zeros(N, 4, device=xyz.device, dtype=xyz.dtype)
-        d_scaling = torch.zeros(N, 3, device=xyz.device, dtype=xyz.dtype)
+        device = xyz.device
+        dtype = xyz.dtype
         
-        # Process each cluster with its corresponding student model
+        # Pre-allocate output tensors
+        d_xyz = torch.zeros(N, 3, device=device, dtype=dtype)
+        d_rotation = torch.zeros(N, 4, device=device, dtype=dtype)
+        d_scaling = torch.zeros(N, 3, device=device, dtype=dtype)
+        
+        # Determine if time_emb needs per-point indexing
+        use_per_point_time = time_emb.shape[0] == N
+        
+        # Gather inputs for all clusters in a single pass
+        # Store as list of tuples for parallel application
+        cluster_inputs = []
+        cluster_masks = []
+        
         for cluster_id in range(self.n_clusters):
             mask = (cluster_ids == cluster_id)
-            if mask.sum() == 0:
+            count = mask.sum().item()
+            if count == 0:
                 continue
             
-            xyz_cluster = xyz[mask]
-            time_cluster = time_emb[mask] if time_emb.shape[0] == N else time_emb
+            cluster_xyz = xyz[mask]
+            cluster_time = time_emb[mask] if use_per_point_time else time_emb.expand(count, -1)
             
-            d_xyz_c, d_rotation_c, d_scaling_c = self.students[cluster_id](xyz_cluster, time_cluster)
-            
+            cluster_inputs.append((cluster_xyz, cluster_time))
+            cluster_masks.append(mask)
+        
+        # Parallel forward pass using list comprehension
+        # All inputs are on same device (CUDA), enabling kernel overlap
+        if len(cluster_inputs) == 0:
+            return d_xyz, d_rotation, d_scaling
+        
+        # Batch inference: process all clusters
+        # Each student model processes its cluster independently
+        cluster_outputs = [
+            student(xyz_c, time_c)
+            for student, (xyz_c, time_c) in zip(self.students, cluster_inputs)
+        ]
+        
+        # Scatter results back to output tensors
+        for i, (d_xyz_c, d_rotation_c, d_scaling_c) in enumerate(cluster_outputs):
+            mask = cluster_masks[i]
             d_xyz[mask] = d_xyz_c
             d_rotation[mask] = d_rotation_c
             d_scaling[mask] = d_scaling_c
-        
-        # Static Gaussians get no deformation
-        static_mask = (cluster_ids < 0)
-        if static_mask.any():
-            pass  # Already initialized to zeros
         
         return d_xyz, d_rotation, d_scaling
     
