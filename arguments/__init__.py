@@ -90,7 +90,6 @@ class ModelParams(ParamGroup):
         
         # Clustered multi-deform model (teacher-student distillation)
         self.clustered_deform_start_iter = 15000  # 多形变场训练起始轮次
-        self.kl_distill_weight = 1.0  # 知识蒸馏损失权重（教师 - 学生约束）
         self.teacher_checkpoint_path = ""  # 预训练教师模型权重路径（必须手动设置）
         
         # Student model architecture parameters (for clustered deform model)

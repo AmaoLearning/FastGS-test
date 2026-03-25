@@ -459,7 +459,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             N = gaussians.get_xyz.shape[0]
             time_input = fid.unsqueeze(0).expand(N, -1)
             
-            kl_weight = getattr(dataset, 'kl_distill_weight', 1.0)
+            kl_weight = getattr(opt, 'kl_distill_weight', 1.0)
             
             # Pass pre-computed student deformations (from rendering step) to avoid recomputation
             distill_loss = deform.get_distillation_loss(
