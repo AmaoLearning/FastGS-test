@@ -343,17 +343,33 @@ class ClusteredDeformModel:
             cluster_inputs.append((cluster_xyz, cluster_time))
             cluster_masks.append(mask)
         
-        # Parallel forward pass using list comprehension
-        # All inputs are on same device (CUDA), enabling kernel overlap
+        # Parallel forward pass using CUDA streams for true async execution
         if len(cluster_inputs) == 0:
             return d_xyz, d_rotation, d_scaling
         
-        # Batch inference: process all clusters
-        # Each student model processes its cluster independently
-        cluster_outputs = [
-            student(xyz_c, time_c)
-            for student, (xyz_c, time_c) in zip(self.students, cluster_inputs)
-        ]
+        # Use multiple CUDA streams to submit all student forward passes asynchronously
+        # This enables kernel overlap and better GPU utilization
+        n_streams = min(len(cluster_inputs), 4)  # Limit streams to avoid overhead
+        streams = [torch.cuda.Stream(device=device) for _ in range(n_streams)]
+        
+        # Record CUDA events for synchronization
+        events = []
+        cluster_outputs = []
+        
+        # Submit all student forward passes on different streams
+        for i, (student, (xyz_c, time_c)) in enumerate(zip(self.students, cluster_inputs)):
+            stream_id = i % n_streams
+            with torch.cuda.stream(streams[stream_id]):
+                d_xyz_c, d_rotation_c, d_scaling_c = student(xyz_c, time_c)
+                cluster_outputs.append((d_xyz_c, d_rotation_c, d_scaling_c))
+                # Record event for this stream
+                event = torch.cuda.Event()
+                event.record(streams[stream_id])
+                events.append(event)
+        
+        # Wait for all streams to complete
+        for event in events:
+            event.synchronize()
         
         # Scatter results back to output tensors
         for i, (d_xyz_c, d_rotation_c, d_scaling_c) in enumerate(cluster_outputs):

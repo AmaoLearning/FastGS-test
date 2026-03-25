@@ -165,6 +165,12 @@ class OptimizationParams(ParamGroup):
         self.hex_plane_lr_final = 0.002
         self.hex_mlp_lr_init = 0.001
         self.hex_mlp_lr_final = 0.00001
+        
+        # Clustered deform model
+        self.distill_loss_interval = 5  # Compute distillation loss every N iterations
+        
+        # Knowledge distillation
+        self.kl_distill_weight = 1.0  # Weight for distillation loss
         super().__init__(parser, "Optimization Parameters", sentinel)
 
 

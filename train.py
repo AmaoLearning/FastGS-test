@@ -450,14 +450,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 tb_writer.add_scalar('train_loss_patches/hexplane_reg', _reg_loss.item(), iteration)
         
         # ── Knowledge distillation loss for clustered deform model ──
-        # Reuse deformation computed during rendering to avoid redundant forward pass
-        if isinstance(deform, ClusteredDeformModel) and iteration > getattr(dataset, 'clustered_deform_start_iter', 15000):
+        # Compute distillation loss sparsely (every 5 iterations) to reduce overhead
+        # Student models are already supervised by rendering loss every iteration
+        _distill_interval = getattr(dataset, 'distill_loss_interval', 5)
+        if (isinstance(deform, ClusteredDeformModel) 
+                and iteration > getattr(dataset, 'clustered_deform_start_iter', 15000)
+                and iteration % _distill_interval == 0):
             N = gaussians.get_xyz.shape[0]
             time_input = fid.unsqueeze(0).expand(N, -1)
             
             kl_weight = getattr(dataset, 'kl_distill_weight', 1.0)
             
-            # Pass pre-computed student deformations to avoid recomputation
+            # Pass pre-computed student deformations (from rendering step) to avoid recomputation
             distill_loss = deform.get_distillation_loss(
                 gaussians.get_xyz.detach(),
                 time_input + ast_noise if iteration >= opt.warm_up else time_input,
