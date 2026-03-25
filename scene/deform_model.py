@@ -417,14 +417,54 @@ class ClusteredDeformModel:
         return loss_xyz + loss_rot + loss_scale
     
     def save_weights(self, model_path: str, iteration: int) -> None:
-        """Save all student model weights."""
+        """Save all student model weights.
+        
+        New format: deform/iteration_30000/deform_cluster_*.pth
+        """
+        deform_dir = os.path.join(model_path, "deform")
+        iter_dir = os.path.join(deform_dir, f"iteration_{iteration}")
+        os.makedirs(iter_dir, exist_ok=True)
+        
         for cluster_id, student in enumerate(self.students):
-            out_weights_path = os.path.join(model_path, f"deform_cluster_{cluster_id}/iteration_{iteration}")
-            os.makedirs(out_weights_path, exist_ok=True)
-            torch.save(student.state_dict(), os.path.join(out_weights_path, "deform.pth"))
+            weights_path = os.path.join(iter_dir, f"deform_cluster_{cluster_id}.pth")
+            torch.save(student.state_dict(), weights_path)
     
     def load_weights(self, model_path: str, iteration: int = -1) -> None:
-        """Load all student model weights."""
+        """Load all student model weights.
+        
+        Supports both new format (deform/iteration_*/deform_cluster_*.pth)
+        and legacy format (deform_cluster_*/iteration_*/deform.pth).
+        """
+        deform_dir = os.path.join(model_path, "deform")
+        
+        # Try new format first
+        if iteration == -1:
+            # Search for max iteration in new format
+            import re
+            iter_pattern = re.compile(r"iteration_(\d+)")
+            max_iter = -1
+            if os.path.isdir(deform_dir):
+                for dirname in os.listdir(deform_dir):
+                    match = iter_pattern.match(dirname)
+                    if match:
+                        iter_num = int(match.group(1))
+                        if iter_num > max_iter:
+                            max_iter = iter_num
+            loaded_iter = max_iter if max_iter >= 0 else 0
+        else:
+            loaded_iter = iteration
+        
+        # Check new format
+        iter_dir = os.path.join(deform_dir, f"iteration_{loaded_iter}")
+        if os.path.isdir(iter_dir):
+            # New format exists
+            for cluster_id in range(self.n_clusters):
+                weights_path = os.path.join(iter_dir, f"deform_cluster_{cluster_id}.pth")
+                if os.path.exists(weights_path):
+                    self.students[cluster_id].load_state_dict(torch.load(weights_path))
+            return
+        
+        # Fallback to legacy format
         for cluster_id in range(self.n_clusters):
             if iteration == -1:
                 loaded_iter = searchForMaxIteration(os.path.join(model_path, f"deform_cluster_{cluster_id}"))

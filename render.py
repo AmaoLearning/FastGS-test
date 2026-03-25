@@ -26,26 +26,6 @@ import numpy as np
 import time
 
 
-def _apply_dynamic_gate(gaussians, d_xyz, d_rotation, d_scaling, use_dynamic_sep, use_dynamic_ablation=False):
-    """Gate deformations by learnable per-Gaussian dynamic probability.
-
-    At inference time we use the final (low) temperature to produce near-binary
-    gating, effectively hard-separating static and dynamic Gaussians.
-    
-    Note: For clustered deform model, no masking is needed as ClusteredDeformModel
-    naturally handles static Gaussians (they receive zero deformation by design).
-    """
-    # ClusteredDeformModel naturally handles static Gaussians - no masking needed
-    # Static Gaussians receive zero deformation in the forward pass
-    
-    # Original soft dynamic separation (currently commented out)
-    # if use_dynamic_sep:
-    #     prob = gaussians.get_dynamic_prob_t(temperature=0.05).detach()  # near-binary at inference
-    #     return prob * d_xyz, prob * d_rotation, prob * d_scaling
-    
-    return d_xyz, d_rotation, d_scaling
-
-
 def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration, views, gaussians, pipeline, background, args, deform, use_dynamic_sep=False):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
@@ -74,8 +54,6 @@ def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration, views,
         t_start = time.time()
 
         d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input)
-        d_xyz, d_rotation, d_scaling = _apply_dynamic_gate(gaussians, d_xyz, d_rotation, d_scaling, use_dynamic_sep)
-
         results = render_fastgs(view, gaussians, pipeline, background, args.mult, d_xyz, d_rotation, d_scaling, is_6dof)
 
         torch.cuda.synchronize()
@@ -115,13 +93,9 @@ def render_set_with_clustered_deform(
     deform,
     use_dynamic_sep=False,
 ):
-    """Render with clustered deform model: dual-path evaluation.
+    """Render with clustered deform model (student models only).
     
-    Renders twice:
-    1. Using original teacher deform model (single path)
-    2. Using all student deform models (clustered path)
-    
-    This allows comparing visual quality and metrics between the two.
+    Output goes to standard test folder for compatibility with metrics.py.
     """
     if not isinstance(deform, ClusteredDeformModel):
         # Fall back to standard rendering if not clustered
@@ -132,86 +106,57 @@ def render_set_with_clustered_deform(
         )
         return
     
-    # Path 1: Teacher model rendering
-    render_path_teacher = os.path.join(model_path, name, f"ours_{iteration}_teacher", "renders")
-    gts_path_teacher = os.path.join(model_path, name, f"ours_{iteration}_teacher", "gt")
-    makedirs(render_path_teacher, exist_ok=True)
-    makedirs(gts_path_teacher, exist_ok=True)
-    
-    print(f"[RENDER] Starting teacher deform path rendering at iteration {iteration}")
-    
-    total_time_teacher = 0.0
-    for idx, view in enumerate(tqdm(views, desc="Teacher rendering progress")):
+    render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
+    gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
+    depth_path = os.path.join(model_path, name, "ours_{}".format(iteration), "depth")
+
+    makedirs(render_path, exist_ok=True)
+    makedirs(gts_path, exist_ok=True)
+    makedirs(depth_path, exist_ok=True)
+
+    total_time = 0.0
+
+    for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
         if load2gpu_on_the_fly:
             view.load2device()
-        
+
+        # LazyCamera: image starts as None; load from disk on demand
         if view.original_image is None and hasattr(view, 'load_image_to_gpu'):
             view.load_image_to_gpu('cuda')
-        
+
         fid = view.fid
         xyz = gaussians.get_xyz
         time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
-        
+
+        # ---- timing starts (deform + render only, excludes I/O) ----
         torch.cuda.synchronize()
         t_start = time.time()
-        
-        # Teacher model forward
-        d_xyz, d_rotation, d_scaling = deform.step_teacher(xyz.detach(), time_input)
-        
-        torch.cuda.synchronize()
-        total_time_teacher += time.time() - t_start
-        
-        rendering = render_fastgs(view, gaussians, pipeline, background, args.mult, d_xyz, d_rotation, d_scaling, is_6dof)["render"]
-        gt = view.original_image[0:3, :, :]
-        torchvision.utils.save_image(rendering, os.path.join(render_path_teacher, '{0:05d}'.format(idx) + ".png"))
-        torchvision.utils.save_image(gt, os.path.join(gts_path_teacher, '{0:05d}'.format(idx) + ".png"))
-        
-        if hasattr(view, 'unload_image'):
-            view.unload_image()
-    
-    # Path 2: Student models rendering (clustered)
-    render_path_students = os.path.join(model_path, name, f"ours_{iteration}_clustered", "renders")
-    gts_path_students = os.path.join(model_path, name, f"ours_{iteration}_clustered", "gt")
-    makedirs(render_path_students, exist_ok=True)
-    makedirs(gts_path_students, exist_ok=True)
-    
-    print(f"[RENDER] Starting student (clustered) deform path rendering at iteration {iteration}")
-    
-    total_time_students = 0.0
-    for idx, view in enumerate(tqdm(views, desc="Student rendering progress")):
-        if load2gpu_on_the_fly:
-            view.load2device()
-        
-        if view.original_image is None and hasattr(view, 'load_image_to_gpu'):
-            view.load_image_to_gpu('cuda')
-        
-        fid = view.fid
-        xyz = gaussians.get_xyz
-        time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
-        
-        torch.cuda.synchronize()
-        t_start = time.time()
-        
+
         # Student models forward (clustered)
         d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input, gaussians._cluster_labels)
-        
+        results = render_fastgs(view, gaussians, pipeline, background, args.mult, d_xyz, d_rotation, d_scaling, is_6dof)
+
         torch.cuda.synchronize()
-        total_time_students += time.time() - t_start
-        
-        rendering = render_fastgs(view, gaussians, pipeline, background, args.mult, d_xyz, d_rotation, d_scaling, is_6dof)["render"]
+        total_time += time.time() - t_start
+        # ---- timing ends ----
+
+        rendering = results["render"]
+        depth = results["depth"]
+        depth = depth / (depth.max() + 1e-5)
+
         gt = view.original_image[0:3, :, :]
-        torchvision.utils.save_image(rendering, os.path.join(render_path_students, '{0:05d}'.format(idx) + ".png"))
-        torchvision.utils.save_image(gt, os.path.join(gts_path_students, '{0:05d}'.format(idx) + ".png"))
-        
+        torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
+        torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
+        torchvision.utils.save_image(depth, os.path.join(depth_path, '{0:05d}'.format(idx) + ".png"))
+
+        # Free image VRAM — thousands of cameras cannot all stay resident
         if hasattr(view, 'unload_image'):
             view.unload_image()
-    
-    # Report statistics
+
     num_frames = len(views)
-    print(f"[TEACHER] Rendered {num_frames} frames in {total_time_teacher:.2f}s. Avg FPS: {num_frames / total_time_teacher:.2f}")
-    print(f"[STUDENTS] Rendered {num_frames} frames in {total_time_students:.2f}s. Avg FPS: {num_frames / total_time_students:.2f}")
-    print(f"[COMPARISON] Teacher path: {render_path_teacher}")
-    print(f"[COMPARISON] Student path: {render_path_students}")
+    avg_time = total_time / num_frames if num_frames > 0 else 0
+    fps = 1.0 / avg_time if avg_time > 0 else 0
+    print(f"[{name}] Rendered {num_frames} frames in {total_time:.2f} seconds. Average FPS: {fps:.2f}")
 
 
 def interpolate_time(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, views, gaussians, pipeline, background, args, deform, use_dynamic_sep=False):
@@ -232,7 +177,6 @@ def interpolate_time(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, 
         xyz = gaussians.get_xyz
         time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
         d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input)
-        d_xyz, d_rotation, d_scaling = _apply_dynamic_gate(gaussians, d_xyz, d_rotation, d_scaling, use_dynamic_sep)
         results = render_fastgs(view, gaussians, pipeline, background, args.mult, d_xyz, d_rotation, d_scaling, is_6dof)
         rendering = results["render"]
         renderings.append(to8b(rendering.cpu().numpy()))
@@ -279,7 +223,6 @@ def interpolate_view(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, 
         xyz = gaussians.get_xyz
         time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
         d_xyz, d_rotation, d_scaling = timer.step(xyz.detach(), time_input)
-        d_xyz, d_rotation, d_scaling = _apply_dynamic_gate(gaussians, d_xyz, d_rotation, d_scaling, use_dynamic_sep)
         results = render_fastgs(view, gaussians, pipeline, background, args.mult, d_xyz, d_rotation, d_scaling, is_6dof)
         rendering = results["render"]
         renderings.append(to8b(rendering.cpu().numpy()))
@@ -322,7 +265,6 @@ def interpolate_all(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, v
         xyz = gaussians.get_xyz
         time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
         d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input)
-        d_xyz, d_rotation, d_scaling = _apply_dynamic_gate(gaussians, d_xyz, d_rotation, d_scaling, use_dynamic_sep)
         results = render_fastgs(view, gaussians, pipeline, background, args.mult, d_xyz, d_rotation, d_scaling, is_6dof)
         rendering = results["render"]
         renderings.append(to8b(rendering.cpu().numpy()))
@@ -370,8 +312,6 @@ def interpolate_poses(model_path, load2gpt_on_the_fly, is_6dof, name, iteration,
         xyz = gaussians.get_xyz
         time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
         d_xyz, d_rotation, d_scaling = timer.step(xyz.detach(), time_input)
-        d_xyz, d_rotation, d_scaling = _apply_dynamic_gate(gaussians, d_xyz, d_rotation, d_scaling, use_dynamic_sep)
-
         results = render_fastgs(view, gaussians, pipeline, background, args.mult, d_xyz, d_rotation, d_scaling, is_6dof)
         rendering = results["render"]
         renderings.append(to8b(rendering.cpu().numpy()))
@@ -427,8 +367,6 @@ def interpolate_view_original(model_path, load2gpt_on_the_fly, is_6dof, name, it
         xyz = gaussians.get_xyz
         time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
         d_xyz, d_rotation, d_scaling = timer.step(xyz.detach(), time_input)
-        d_xyz, d_rotation, d_scaling = _apply_dynamic_gate(gaussians, d_xyz, d_rotation, d_scaling, use_dynamic_sep)
-
         results = render_fastgs(view, gaussians, pipeline, background, args.mult, d_xyz, d_rotation, d_scaling, is_6dof)
         rendering = results["render"]
         renderings.append(to8b(rendering.cpu().numpy()))
@@ -445,27 +383,44 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
         gaussians = GaussianModel(dataset.sh_degree)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         _deform_type = getattr(dataset, "deform_type", "mlp")
+        
+        # Detect if using clustered deform model
+        _use_clustered = bool(getattr(dataset, 'teacher_checkpoint_path', ''))
+        
         if _deform_type == "4dgs":
             _s_res = tuple(int(x) for x in dataset.hex_spatial_res.split(","))
             _t_res = tuple(int(x) for x in dataset.hex_time_res.split(","))
-            deform = DeformModel_4DGS(
-                is_blender=dataset.is_blender,
-                is_6dof=dataset.is_6dof,
-                spatial_resolutions=_s_res,
-                time_resolutions=_t_res,
-                feat_dim=dataset.hex_feat_dim,
-                mlp_hidden_dim=dataset.hex_mlp_hidden,
-                mlp_num_hidden=dataset.hex_mlp_layers,
-                fusion=dataset.hex_fusion,
-            )
+            
+            if _use_clustered:
+                # Load ClusteredDeformModel
+                from scene import ClusteredDeformModel
+                n_clusters = getattr(dataset, 'cluster_n_clusters', 8)
+                deform = ClusteredDeformModel(
+                    n_clusters=n_clusters,
+                    is_blender=dataset.is_blender,
+                    is_6dof=dataset.is_6dof,
+                )
+                deform.load_weights(dataset.model_path, iteration if iteration >= 0 else -1)
+                print(f"[INFO] Loaded clustered deform model with {n_clusters} student models")
+            else:
+                # Load standard DeformModel_4DGS
+                deform = DeformModel_4DGS(
+                    is_blender=dataset.is_blender,
+                    is_6dof=dataset.is_6dof,
+                    spatial_resolutions=_s_res,
+                    time_resolutions=_t_res,
+                    feat_dim=dataset.hex_feat_dim,
+                    mlp_hidden_dim=dataset.hex_mlp_hidden,
+                    mlp_num_hidden=dataset.hex_mlp_layers,
+                    fusion=dataset.hex_fusion,
+                )
+                deform.load_weights(dataset.model_path)
         else:
             deform = DeformModel(dataset.is_blender, dataset.is_6dof)
-        deform.load_weights(dataset.model_path)
+            deform.load_weights(dataset.model_path)
 
         _use_dynamic_sep = getattr(dataset, "use_dynamic_sep", True)
-        # Automatically detect clustered deform from teacher_checkpoint_path
-        _use_clustered = bool(getattr(dataset, 'teacher_checkpoint_path', ''))
-
+        
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
