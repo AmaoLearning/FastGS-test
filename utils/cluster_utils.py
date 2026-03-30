@@ -607,6 +607,7 @@ def _allocate_tiered(
             "spatial_resolutions": tiers["high"]["spatial_resolutions"],
             "time_resolutions": tiers["high"]["time_resolutions"],
             "mlp_hidden_dim": tiers["high"]["mlp_hidden_dim"],
+            "mlp_layer_num": tiers["high"].get("mlp_layer_num", 2),
             "feat_dim": tiers["high"]["feat_dim"],
         }
         medium_config = {
@@ -614,6 +615,7 @@ def _allocate_tiered(
             "spatial_resolutions": tiers["medium"]["spatial_resolutions"],
             "time_resolutions": tiers["medium"]["time_resolutions"],
             "mlp_hidden_dim": tiers["medium"]["mlp_hidden_dim"],
+            "mlp_layer_num": tiers["medium"].get("mlp_layer_num", 2),
             "feat_dim": tiers["medium"]["feat_dim"],
         }
         low_config = {
@@ -621,6 +623,7 @@ def _allocate_tiered(
             "spatial_resolutions": tiers["low"]["spatial_resolutions"],
             "time_resolutions": tiers["low"]["time_resolutions"],
             "mlp_hidden_dim": tiers["low"]["mlp_hidden_dim"],
+            "mlp_layer_num": tiers["low"].get("mlp_layer_num", 2),
             "feat_dim": tiers["low"]["feat_dim"],
         }
     else:
@@ -630,6 +633,7 @@ def _allocate_tiered(
             "spatial_resolutions": list(max_spatial_res),
             "time_resolutions": list(max_time_res),
             "mlp_hidden_dim": max_mlp_hidden,
+            "mlp_layer_num": 2,
             "feat_dim": max_feat_dim,
         }
         medium_config = {
@@ -637,6 +641,7 @@ def _allocate_tiered(
             "spatial_resolutions": list(min_spatial_res) + [(min_spatial_res[-1] + max_spatial_res[-1]) // 2],
             "time_resolutions": list(min_time_res) + [(min_time_res[-1] + max_time_res[-1]) // 2],
             "mlp_hidden_dim": (min_mlp_hidden + max_mlp_hidden) // 2,
+            "mlp_layer_num": 2,
             "feat_dim": (min_feat_dim + max_feat_dim) // 2,
         }
         low_config = {
@@ -644,6 +649,7 @@ def _allocate_tiered(
             "spatial_resolutions": list(min_spatial_res),
             "time_resolutions": list(min_time_res),
             "mlp_hidden_dim": min_mlp_hidden,
+            "mlp_layer_num": 2,
             "feat_dim": min_feat_dim,
         }
     
@@ -723,6 +729,7 @@ def _allocate_linear(
             "spatial_resolutions": spatial_res,
             "time_resolutions": time_res,
             "mlp_hidden_dim": mlp_hidden,
+            "mlp_layer_num": 2,  # Default to 2 layers
             "feat_dim": feat_dim,
         })
     

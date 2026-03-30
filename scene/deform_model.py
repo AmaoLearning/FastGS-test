@@ -279,7 +279,7 @@ class ClusteredDeformModel:
                     "time_resolutions": student_time_resolutions,
                     "feat_dim": student_feat_dim,
                     "mlp_hidden_dim": student_mlp_hidden_dim,
-                    "mlp_num_hidden": student_mlp_num_hidden,
+                    "mlp_layer_num": student_mlp_num_hidden,  # Unified naming
                 }
                 for _ in range(n_clusters)
             ]
@@ -292,7 +292,7 @@ class ClusteredDeformModel:
                 time_resolutions=config["time_resolutions"],
                 feat_dim=config["feat_dim"],
                 mlp_hidden_dim=config["mlp_hidden_dim"],
-                mlp_num_hidden=config["mlp_num_hidden"],
+                mlp_num_hidden=config["mlp_layer_num"],
                 fusion=fusion,
                 is_blender=is_blender,
                 is_6dof=is_6dof,

@@ -8,6 +8,7 @@
         "spatial_resolutions": [64, 128, 192],
         "time_resolutions": [64, 128, 192],
         "mlp_hidden_dim": 96,
+        "mlp_layer_num": 2,
         "feat_dim": 12
       },
       "medium": {
@@ -15,6 +16,7 @@
         "spatial_resolutions": [64, 128, 128],
         "time_resolutions": [64, 128, 128],
         "mlp_hidden_dim": 64,
+        "mlp_layer_num": 2,
         "feat_dim": 8
       },
       "low": {
@@ -22,6 +24,7 @@
         "spatial_resolutions": [64, 96],
         "time_resolutions": [64, 96],
         "mlp_hidden_dim": 48,
+        "mlp_layer_num": 2,
         "feat_dim": 8
       }
     }
