@@ -609,18 +609,21 @@ def _allocate_tiered(
     if capacity_tier_configs is not None and "tiers" in capacity_tier_configs:
         tiers = capacity_tier_configs["tiers"]
         high_config = {
+            "tier": "high",
             "spatial_resolutions": tiers["high"]["spatial_resolutions"],
             "time_resolutions": tiers["high"]["time_resolutions"],
             "mlp_hidden_dim": tiers["high"]["mlp_hidden_dim"],
             "feat_dim": tiers["high"]["feat_dim"],
         }
         medium_config = {
+            "tier": "medium",
             "spatial_resolutions": tiers["medium"]["spatial_resolutions"],
             "time_resolutions": tiers["medium"]["time_resolutions"],
             "mlp_hidden_dim": tiers["medium"]["mlp_hidden_dim"],
             "feat_dim": tiers["medium"]["feat_dim"],
         }
         low_config = {
+            "tier": "low",
             "spatial_resolutions": tiers["low"]["spatial_resolutions"],
             "time_resolutions": tiers["low"]["time_resolutions"],
             "mlp_hidden_dim": tiers["low"]["mlp_hidden_dim"],
@@ -629,18 +632,21 @@ def _allocate_tiered(
     else:
         # Fallback: construct configs from min/max parameters
         high_config = {
+            "tier": "high",
             "spatial_resolutions": list(max_spatial_res),
             "time_resolutions": list(max_time_res),
             "mlp_hidden_dim": max_mlp_hidden,
             "feat_dim": max_feat_dim,
         }
         medium_config = {
+            "tier": "medium",
             "spatial_resolutions": list(min_spatial_res) + [(min_spatial_res[-1] + max_spatial_res[-1]) // 2],
             "time_resolutions": list(min_time_res) + [(min_time_res[-1] + max_time_res[-1]) // 2],
             "mlp_hidden_dim": (min_mlp_hidden + max_mlp_hidden) // 2,
             "feat_dim": (min_feat_dim + max_feat_dim) // 2,
         }
         low_config = {
+            "tier": "low",
             "spatial_resolutions": list(min_spatial_res),
             "time_resolutions": list(min_time_res),
             "mlp_hidden_dim": min_mlp_hidden,
@@ -651,11 +657,11 @@ def _allocate_tiered(
     student_configs = [None] * n_clusters
     for rank, cluster_idx in enumerate(sorted_indices):
         if rank < n_high:
-            student_configs[cluster_idx] = high_config
+            student_configs[cluster_idx] = high_config.copy()
         elif rank < n_high + n_medium:
-            student_configs[cluster_idx] = medium_config
+            student_configs[cluster_idx] = medium_config.copy()
         else:
-            student_configs[cluster_idx] = low_config
+            student_configs[cluster_idx] = low_config.copy()
     
     return student_configs
 
@@ -672,7 +678,10 @@ def _allocate_linear(
     min_feat_dim: int,
     max_feat_dim: int,
 ) -> List[Dict]:
-    """Linear interpolation: capacity scales continuously with score."""
+    """Linear interpolation: capacity scales continuously with score.
+    
+    Each config includes a 'tier' field inferred from the capacity ranking.
+    """
     scores = np.array(cluster_mean_scores)
     min_score = scores.min()
     max_score = scores.max()
@@ -680,6 +689,20 @@ def _allocate_linear(
     
     # Normalize scores to [0, 1]
     norm_scores = (scores - min_score) / score_range
+    
+    # Compute capacity ranking for tier assignment
+    sorted_indices = sorted(range(n_clusters), key=lambda i: norm_scores[i], reverse=True)
+    n_tier = max(1, n_clusters // 3)
+    
+    # Assign tiers based on ranking
+    tier_labels = [""] * n_clusters
+    for rank, cluster_idx in enumerate(sorted_indices):
+        if rank < n_tier:
+            tier_labels[cluster_idx] = "high"
+        elif rank < 2 * n_tier:
+            tier_labels[cluster_idx] = "medium"
+        else:
+            tier_labels[cluster_idx] = "low"
     
     student_configs = []
     for i in range(n_clusters):
@@ -702,6 +725,7 @@ def _allocate_linear(
         feat_dim = int(min_feat_dim + alpha * (max_feat_dim - min_feat_dim))
         
         student_configs.append({
+            "tier": tier_labels[i],
             "spatial_resolutions": spatial_res,
             "time_resolutions": time_res,
             "mlp_hidden_dim": mlp_hidden,
@@ -739,3 +763,269 @@ def compute_cluster_mean_scores(
             cluster_mean_scores.append(mean_score)
     
     return cluster_mean_scores
+
+
+# ---------------------------------------------------------------------------
+# Capacity allocation visualization
+# ---------------------------------------------------------------------------
+
+# Capacity tier colors (red=high, yellow=medium, blue=low)
+_CAPACITY_TIER_COLORS = {
+    "high": torch.tensor([1.0, 0.2, 0.2], dtype=torch.float32),    # Red
+    "medium": torch.tensor([1.0, 1.0, 0.2], dtype=torch.float32),  # Yellow
+    "low": torch.tensor([0.2, 0.6, 1.0], dtype=torch.float32),     # Blue
+}
+_STATIC_COLOR = torch.tensor([0.15, 0.15, 0.15], dtype=torch.float32)  # Dark grey
+
+
+def visualize_capacity_allocation(
+    student_configs: List[Dict],
+    cluster_mean_scores: List[float],
+    tb_writer=None,
+    iteration: int = 0,
+    logger=None,
+) -> None:
+    """Visualize capacity allocation across clusters.
+    
+    This function:
+    1. Renders a pseudo-color image showing capacity tiers (high/medium/low)
+    2. Logs FLOPs and parameter estimates to TensorBoard
+    
+    Args:
+        student_configs: List of capacity configs for each cluster.
+        cluster_mean_scores: Mean dynamic score for each cluster.
+        tb_writer: Optional TensorBoard writer.
+        iteration: Current training iteration.
+        logger: Optional logger instance.
+    """
+    n_clusters = len(student_configs)
+    
+    # ── 1. Estimate FLOPs and parameters for each cluster ──
+    # Simplified estimation: HexPlane FLOPs ∝ (spatial_res^3 * time_res * feat_dim)
+    # MLP FLOPs ∝ (hidden_dim * feat_dim * 3)  (for output d_xyz, d_rot, d_scale)
+    cluster_flops = []
+    cluster_params = []
+    
+    for config in student_configs:
+        spatial_res = config.get("spatial_resolutions", [64, 128])
+        time_res = config.get("time_resolutions", [64, 128])
+        feat_dim = config.get("feat_dim", 8)
+        mlp_hidden = config.get("mlp_hidden_dim", 48)
+        
+        # HexPlane FLOPs (simplified: product of resolutions * feat_dim)
+        hex_flops = 1.0
+        for s_res in spatial_res:
+            hex_flops *= s_res
+        for t_res in time_res:
+            hex_flops *= t_res
+        hex_flops *= feat_dim * 3  # 3 levels, fusion
+        
+        # MLP FLOPs (2-layer: feat_dim -> hidden -> 10 output)
+        mlp_flops = feat_dim * mlp_hidden + mlp_hidden * 10
+        
+        total_flops = hex_flops + mlp_flops
+        cluster_flops.append(total_flops)
+        
+        # Parameter count
+        # HexPlane params: sum(resolution * feat_dim) for all planes
+        hex_params = sum(spatial_res + time_res) * feat_dim * 3
+        # MLP params
+        mlp_params = feat_dim * mlp_hidden + mlp_hidden * 10
+        total_params = hex_params + mlp_params
+        cluster_params.append(total_params)
+    
+    # Normalize for visualization (0-1 range)
+    max_flops = max(cluster_flops) + 1e-8
+    max_params = max(cluster_params) + 1e-8
+    
+    # ── 2. Log to TensorBoard ──
+    if tb_writer is not None:
+        # Log FLOPs per cluster
+        for k in range(n_clusters):
+            tb_writer.add_scalar(f'capacity/flops_cluster_{k}', cluster_flops[k], iteration)
+            tb_writer.add_scalar(f'capacity/params_cluster_{k}', cluster_params[k], iteration)
+        
+        # Log aggregated stats
+        total_flops = sum(cluster_flops)
+        total_params = sum(cluster_params)
+        avg_flops = total_flops / n_clusters
+        avg_params = total_params / n_clusters
+        
+        tb_writer.add_scalar('capacity/total_flops', total_flops, iteration)
+        tb_writer.add_scalar('capacity/total_params', total_params, iteration)
+        tb_writer.add_scalar('capacity/avg_flops_per_cluster', avg_flops, iteration)
+        tb_writer.add_scalar('capacity/avg_params_per_cluster', avg_params, iteration)
+        
+        # Log capacity distribution (normalized)
+        flops_distribution = [f / max_flops for f in cluster_flops]
+        params_distribution = [p / max_params for p in cluster_params]
+        tb_writer.add_histogram('capacity/flops_distribution', flops_distribution, iteration)
+        tb_writer.add_histogram('capacity/params_distribution', params_distribution, iteration)
+    
+    # Log summary
+    if logger is not None:
+        _msg = (f"[CAPACITY] Iteration {iteration}: "
+                f"Total FLOPs={total_flops/1e6:.2f}M, "
+                f"Total Params={total_params/1e6:.2f}M, "
+                f"Avg FLOPs/cluster={avg_flops/1e6:.2f}M")
+        logger.info(_msg)
+        print(_msg)
+        
+        # Per-cluster breakdown
+        for k in range(n_clusters):
+            _msg = (f"[CAPACITY]   Cluster {k}: "
+                    f"Score={cluster_mean_scores[k]:.4f}, "
+                    f"FLOPs={cluster_flops[k]/1e6:.2f}M, "
+                    f"Params={cluster_params[k]/1e6:.2f}M, "
+                    f"Spatial={student_configs[k]['spatial_resolutions']}, "
+                    f"Time={student_configs[k]['time_resolutions']}")
+            logger.info(_msg)
+            print(_msg)
+
+
+def render_capacity_pseudocolor(
+    gaussians,
+    student_configs: List[Dict],
+    cluster_labels: torch.Tensor,
+    viewpoint_cam,
+    deform,
+    pipe,
+    bg_color: torch.Tensor,
+    mult: float,
+    is_6dof: bool = False,
+    save_path: Optional[str] = None,
+    iteration: int = 0,
+) -> torch.Tensor:
+    """Render a pseudo-color image where capacity tiers are shown in different colors.
+    
+    Color scheme:
+    - Red: High capacity tier
+    - Yellow: Medium capacity tier
+    - Blue: Low capacity tier
+    - Dark grey: Static Gaussians
+    
+    The tier label is read directly from student_configs["tier"].
+    
+    Args:
+        gaussians: GaussianModel instance.
+        student_configs: Capacity config for each cluster (must include "tier" field).
+        cluster_labels: (N,) int32 tensor with cluster assignments (-1 for static).
+        viewpoint_cam: Camera for rendering.
+        deform: Deformation model.
+        pipe: Pipeline parameters.
+        bg_color: Background color tensor.
+        mult: FastGS mult parameter.
+        is_6dof: Whether this is a 6-DoF scene.
+        save_path: Path to save the rendered image.
+        iteration: Current iteration for logging.
+    
+    Returns:
+        rendered_image: (3, H, W) float tensor.
+    """
+    import math
+    import os
+    from diff_gaussian_rasterization_fastgs import (
+        GaussianRasterizationSettings,
+        GaussianRasterizer,
+    )
+    from utils.rigid_utils import from_homogenous, to_homogenous
+    
+    N = gaussians.get_xyz.shape[0]
+    n_clusters = len(student_configs)
+    
+    # ── 1. Build tier-to-color mapping from student_configs ──
+    # Read tier labels directly from configs (no inference needed)
+    tier_colors_map = {
+        "high": _CAPACITY_TIER_COLORS["high"],
+        "medium": _CAPACITY_TIER_COLORS["medium"],
+        "low": _CAPACITY_TIER_COLORS["low"],
+    }
+    
+    # Assign color to each cluster based on its tier label
+    tier_colors = torch.zeros(n_clusters, 3, dtype=torch.float32, device="cuda")
+    for k in range(n_clusters):
+        config = student_configs[k]
+        tier = config.get("tier", "low")  # Default to "low" if not specified
+        if tier in tier_colors_map:
+            tier_colors[k] = tier_colors_map[tier]
+        else:
+            # Unknown tier, use default (low/blue)
+            tier_colors[k] = _CAPACITY_TIER_COLORS["low"]
+    
+    # ── 2. Assign colors to Gaussians ──
+    colors = _STATIC_COLOR.unsqueeze(0).expand(N, 3).clone()  # Default: dark grey
+    for k in range(n_clusters):
+        mask = (cluster_labels == k)
+        if mask.any():
+            colors[mask] = tier_colors[k]
+    
+    # ── 3. Compute deformation ──
+    with torch.no_grad():
+        fid = viewpoint_cam.fid
+        xyz = gaussians.get_xyz
+        time_input = fid.unsqueeze(0).expand(N, -1)
+        d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input)
+        
+        if is_6dof and torch.is_tensor(d_xyz):
+            means3D = from_homogenous(
+                torch.bmm(d_xyz, to_homogenous(xyz).unsqueeze(-1)).squeeze(-1))
+        elif torch.is_tensor(d_xyz):
+            means3D = xyz + d_xyz
+        else:
+            means3D = xyz
+        
+        scales = gaussians.get_scaling + (d_scaling if torch.is_tensor(d_scaling) else 0)
+        rotations = gaussians.get_rotation + (d_rotation if torch.is_tensor(d_rotation) else 0)
+        opacity = gaussians.get_opacity
+    
+    # ── 4. Rasterize ──
+    tanfovx = math.tan(viewpoint_cam.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_cam.FoVy * 0.5)
+    H, W = int(viewpoint_cam.image_height), int(viewpoint_cam.image_width)
+    
+    screenspace_points = torch.zeros(N, 4, dtype=torch.float32, device="cuda")
+    metric_map = torch.zeros(H * W, dtype=torch.int, device="cuda")
+    
+    raster_settings = GaussianRasterizationSettings(
+        image_height=H,
+        image_width=W,
+        tanfovx=tanfovx,
+        tanfovy=tanfovy,
+        bg=bg_color,
+        scale_modifier=1.0,
+        viewmatrix=viewpoint_cam.world_view_transform,
+        projmatrix=viewpoint_cam.full_proj_transform,
+        sh_degree=0,
+        campos=viewpoint_cam.camera_center,
+        mult=mult,
+        prefiltered=False,
+        debug=False,
+        get_flag=None,
+        metric_map=metric_map,
+    )
+    
+    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+    
+    with torch.no_grad():
+        rendered_image, _, _, _ = rasterizer(
+            means3D=means3D,
+            means2D=screenspace_points,
+            opacities=opacity,
+            colors_precomp=colors,
+            scales=scales,
+            rotations=rotations,
+        )
+    
+    rendered_image = rendered_image.clamp(0.0, 1.0)
+    
+    # ── 5. Save ──
+    if save_path is not None:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        import torchvision
+        torchvision.utils.save_image(rendered_image, save_path)
+        _msg = f"[CAPACITY-VIS] Capacity allocation render saved to {save_path}"
+        if logger is not None:
+            logger.info(_msg)
+        print(_msg)
+    
+    return rendered_image

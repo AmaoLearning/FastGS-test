@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from utils.time_utils import DeformNetwork
 from utils.hexplane_utils import HexPlaneDeformNetwork
 import os
-from typing import Optional, Sequence, Tuple, Dict
+from typing import Optional, Sequence, Tuple, Dict, List
 from utils.system_utils import searchForMaxIteration
 from utils.general_utils import get_expon_lr_func
 
@@ -505,29 +505,55 @@ class ClusteredDeformModel:
         return loss_xyz + loss_rot + loss_scale
     
     def save_weights(self, model_path: str, iteration: int) -> None:
-        """Save all student model weights.
+        """Save all student model weights with tier labels from student_configs.
         
-        New format: deform/iteration_30000/deform_cluster_*.pth
+        New format: deform/iteration_*/deform_cluster_{tier}_{id}.pth
+        where tier ∈ {high, medium, low}
+        
+        The tier label is read directly from each student's configuration
+        in student_configs["tier"], avoiding the need for inference.
+        
+        Args:
+            model_path: Base model path.
+            iteration: Current iteration number.
         """
         deform_dir = os.path.join(model_path, "deform")
         iter_dir = os.path.join(deform_dir, f"iteration_{iteration}")
         os.makedirs(iter_dir, exist_ok=True)
         
+        # Read tier labels directly from student_configs
         for cluster_id, student in enumerate(self.students):
-            weights_path = os.path.join(iter_dir, f"deform_cluster_{cluster_id}.pth")
+            if cluster_id < len(self.student_configs):
+                config = self.student_configs[cluster_id]
+                tier = config.get("tier", "unknown")  # Default to "unknown" if not specified
+                
+                weights_path = os.path.join(iter_dir, f"deform_cluster_{tier}_{cluster_id}.pth")
+            else:
+                # Fallback to legacy format if config missing
+                weights_path = os.path.join(iter_dir, f"deform_cluster_{cluster_id}.pth")
+                tier = "unknown"
+            
             torch.save(student.state_dict(), weights_path)
+            print(f"[INFO] Saved cluster {cluster_id} ({tier}) to {weights_path}")
     
     def load_weights(self, model_path: str, iteration: int = -1) -> None:
-        """Load all student model weights.
+        """Load all student model weights with tier-based naming.
         
-        Supports both new format (deform/iteration_*/deform_cluster_*.pth)
-        and legacy format (deform_cluster_*/iteration_*/deform.pth).
+        Expected format: deform/iteration_*/deform_cluster_{tier}_{id}.pth
+        where tier ∈ {high, medium, low}
+        
+        Args:
+            model_path: Base model path.
+            iteration: Iteration to load (-1 for latest).
+        
+        Raises:
+            FileNotFoundError: If no tier-based weight files are found.
         """
         deform_dir = os.path.join(model_path, "deform")
         
-        # Try new format first
+        # Find iteration directory
         if iteration == -1:
-            # Search for max iteration in new format
+            # Search for max iteration
             import re
             iter_pattern = re.compile(r"iteration_(\d+)")
             max_iter = -1
@@ -542,28 +568,54 @@ class ClusteredDeformModel:
         else:
             loaded_iter = iteration
         
-        # Check new format
         iter_dir = os.path.join(deform_dir, f"iteration_{loaded_iter}")
-        if os.path.isdir(iter_dir):
-            # New format exists
-            for cluster_id in range(self.n_clusters):
-                weights_path = os.path.join(iter_dir, f"deform_cluster_{cluster_id}.pth")
-                if os.path.exists(weights_path):
-                    self.students[cluster_id].load_state_dict(torch.load(weights_path))
-            return
+        if not os.path.isdir(iter_dir):
+            raise FileNotFoundError(f"Cannot find deform weights directory at {iter_dir}")
         
-        # Fallback to legacy format
-        for cluster_id in range(self.n_clusters):
-            if iteration == -1:
-                loaded_iter = searchForMaxIteration(os.path.join(model_path, f"deform_cluster_{cluster_id}"))
-            else:
-                loaded_iter = iteration
-            
-            weights_path = os.path.join(
-                model_path, f"deform_cluster_{cluster_id}/iteration_{loaded_iter}/deform.pth"
+        # Scan directory for tier-based weight files
+        import re
+        weight_pattern = re.compile(r"deform_cluster_(?P<tier>high|medium|low)_(?P<cluster_id>\d+)\.pth")
+        
+        tier_files = {}  # {cluster_id: [(tier, filepath), ...]}
+        
+        print(f"[INFO] Scanning {iter_dir} for tier-based student model weights...")
+        
+        for filename in os.listdir(iter_dir):
+            match = weight_pattern.match(filename)
+            if match:
+                cluster_id = int(match.group("cluster_id"))
+                tier = match.group("tier")
+                filepath = os.path.join(iter_dir, filename)
+                
+                if cluster_id not in tier_files:
+                    tier_files[cluster_id] = []
+                tier_files[cluster_id].append((tier, filepath))
+                print(f"[INFO] Found: {filename} (cluster {cluster_id}, tier {tier})")
+        
+        if not tier_files:
+            raise FileNotFoundError(
+                f"No tier-based weight files found in {iter_dir}. "
+                f"Expected format: deform_cluster_{{high|medium|low}}_{{id}}.pth"
             )
-            if os.path.exists(weights_path):
-                self.students[cluster_id].load_state_dict(torch.load(weights_path))
+        
+        # Load weights into student models
+        print(f"[INFO] Loading {len(tier_files)} student models...")
+        loaded_count = 0
+        
+        for cluster_id in sorted(tier_files.keys()):
+            if cluster_id >= len(self.students):
+                print(f"[WARNING] Cluster {cluster_id} exceeds student count ({len(self.students)}), skipping")
+                continue
+            
+            for tier, filepath in tier_files[cluster_id]:
+                self.students[cluster_id].load_state_dict(torch.load(filepath))
+                print(f"[INFO] Loaded cluster {cluster_id} ({tier}) from {filepath}")
+                loaded_count += 1
+        
+        if loaded_count == 0:
+            raise FileNotFoundError(f"Failed to load any student models from {iter_dir}")
+        
+        print(f"[INFO] Successfully loaded {loaded_count} student models")
     
     def get_regularization_loss(self) -> torch.Tensor:
         """Get TV and L1 regularization from all student models."""

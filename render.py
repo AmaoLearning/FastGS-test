@@ -401,6 +401,7 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
                     is_6dof=dataset.is_6dof,
                 )
                 deform.load_weights(dataset.model_path, iteration if iteration >= 0 else -1)
+                print(f"[INFO] Loaded clustered deform model with {n_clusters} student models")
                 
                 # Set cluster labels from loaded Gaussians (saved in PLY)
                 if hasattr(gaussians, '_cluster_labels') and gaussians._cluster_labels is not None:
@@ -408,8 +409,6 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
                     print(f"[INFO] Loaded cluster labels: {gaussians._cluster_labels.shape[0]} Gaussians")
                 else:
                     print("[WARNING] No cluster labels found in loaded point cloud!")
-                
-                print(f"[INFO] Loaded clustered deform model with {n_clusters} student models")
             else:
                 # Load standard DeformModel_4DGS
                 deform = DeformModel_4DGS(

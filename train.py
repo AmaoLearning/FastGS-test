@@ -42,6 +42,7 @@ from utils.cluster_utils import (
     allocate_capacity_by_score,
     compute_cluster_mean_scores,
     visualize_capacity_allocation,
+    render_capacity_pseudocolor,
 )
 
 
@@ -181,6 +182,35 @@ def run_clustering_at_iteration(
     scene.release_cameras([_debug_cam])
     print(f"[INFO] Clustering at iter {iteration} saved to {_cluster_save}")
     
+    # ── Capacity allocation visualization (pseudo-color render) ──
+    # Render capacity tier pseudo-color image (separate from cluster ID visualization)
+    _capacity_vis_path = os.path.join(
+        dataset.model_path, "cluster",
+        f"capacity_vis_iter{iteration}.png")
+    
+    # Create a temporary deform model for visualization (if not yet switched to clustered)
+    # Use the student_configs to create a visualization-only deform
+    if use_clustered:
+        # Already using clustered deform model, can use it directly
+        # But we need to map cluster_labels to capacity tiers
+        from utils.cluster_utils import render_capacity_pseudocolor
+        
+        render_capacity_pseudocolor(
+            gaussians=gaussians,
+            student_configs=student_configs,
+            cluster_labels=cluster_result["labels"],
+            viewpoint_cam=_debug_cam,
+            deform=deform,
+            pipe=pipe,
+            bg_color=background,
+            mult=mult,
+            is_6dof=dataset.is_6dof,
+            save_path=_capacity_vis_path,
+            iteration=iteration,
+        )
+        _msg = f"[CAPACITY-VIS] Capacity allocation render saved to {_capacity_vis_path}"
+        print(_msg)
+
     # ── Switch to clustered deform model if enabled ──
     # Automatically enabled when teacher_checkpoint_path is provided
     teacher_checkpoint = getattr(dataset, 'teacher_checkpoint_path', '')

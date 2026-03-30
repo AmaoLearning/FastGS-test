@@ -8,3 +8,5 @@ settings.json
 output*
 trans/*
 *.7z
+
+*.md
