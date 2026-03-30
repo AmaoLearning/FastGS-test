@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from utils.time_utils import DeformNetwork
 from utils.hexplane_utils import HexPlaneDeformNetwork
 import os
-from typing import Optional, Sequence, Tuple
+from typing import Optional, Sequence, Tuple, Dict
 from utils.system_utils import searchForMaxIteration
 from utils.general_utils import get_expon_lr_func
 
@@ -218,6 +218,10 @@ class ClusteredDeformModel:
     Training objectives:
     1. Visual quality loss (L1 + SSIM) - same as original
     2. Knowledge distillation loss - student predictions match teacher
+    
+    Capacity Allocation:
+    - Supports per-cluster capacity configuration via student_configs list
+    - Backward compatible: accepts uniform parameters (auto-converted to list)
     """
     
     def __init__(
@@ -231,7 +235,9 @@ class ClusteredDeformModel:
         teacher_feat_dim: int = 16,
         teacher_mlp_hidden_dim: int = 128,
         teacher_mlp_num_hidden: int = 2,
-        # Student config (manually configured)
+        # Student config (supports per-cluster or uniform)
+        student_configs: Optional[Sequence[Dict]] = None,  # List of per-cluster configs (new)
+        # Legacy uniform parameters (backward compatible)
         student_feat_dim: int = 8,
         student_spatial_resolutions: Sequence[int] = (64, 128),
         student_time_resolutions: Sequence[int] = (64, 128),
@@ -258,14 +264,35 @@ class ClusteredDeformModel:
         self.teacher.eval()  # Teacher is frozen after clustering
         
         # Student models (configurable architecture)
+        # Support both per-cluster configs (new) and uniform configs (legacy)
+        if student_configs is not None:
+            # New mode: per-cluster capacity configuration
+            if len(student_configs) != n_clusters:
+                raise ValueError(f"student_configs length ({len(student_configs)}) must match n_clusters ({n_clusters})")
+            self.student_configs = student_configs
+        else:
+            # Legacy mode: uniform configuration for all clusters
+            # Convert to list format for unified processing
+            self.student_configs = [
+                {
+                    "spatial_resolutions": student_spatial_resolutions,
+                    "time_resolutions": student_time_resolutions,
+                    "feat_dim": student_feat_dim,
+                    "mlp_hidden_dim": student_mlp_hidden_dim,
+                    "mlp_num_hidden": student_mlp_num_hidden,
+                }
+                for _ in range(n_clusters)
+            ]
+        
+        # Create student networks
         self.students = nn.ModuleList()
-        for _ in range(n_clusters):
+        for cluster_id, config in enumerate(self.student_configs):
             student = HexPlaneDeformNetwork(
-                spatial_resolutions=student_spatial_resolutions,
-                time_resolutions=student_time_resolutions,
-                feat_dim=student_feat_dim,
-                mlp_hidden_dim=student_mlp_hidden_dim,
-                mlp_num_hidden=student_mlp_num_hidden,
+                spatial_resolutions=config["spatial_resolutions"],
+                time_resolutions=config["time_resolutions"],
+                feat_dim=config["feat_dim"],
+                mlp_hidden_dim=config["mlp_hidden_dim"],
+                mlp_num_hidden=config["mlp_num_hidden"],
                 fusion=fusion,
                 is_blender=is_blender,
                 is_6dof=is_6dof,

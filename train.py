@@ -36,7 +36,13 @@ except ImportError:
 
 import random
 from utils.fast_utils import compute_gaussian_score_fastgs, sampling_cameras
-from utils.cluster_utils import cluster_dynamic_gaussians, render_cluster_pseudocolor
+from utils.cluster_utils import (
+    cluster_dynamic_gaussians,
+    render_cluster_pseudocolor,
+    allocate_capacity_by_score,
+    compute_cluster_mean_scores,
+    visualize_capacity_allocation,
+)
 
 
 def run_clustering_at_iteration(
@@ -88,6 +94,62 @@ def run_clustering_at_iteration(
         dynamic_score_percentile=getattr(dataset, 'dynamic_score_percentile', 80.0),
     )
     gaussians._cluster_labels = cluster_result["labels"]
+    
+    # ── Capacity allocation based on dynamic score ──
+    # Compute mean dynamic score for each cluster
+    n_clusters = getattr(dataset, 'cluster_n_clusters', 8)
+    cluster_mean_scores = compute_cluster_mean_scores(
+        gaussians,
+        cluster_result["labels"],
+        n_clusters,
+    )
+    
+    # Load tier configuration from JSON
+    capacity_tier_config_path = getattr(dataset, 'capacity_tier_config_path', 'arguments/capacity_tier_configs.json')
+    capacity_tier_configs = None
+    if os.path.exists(capacity_tier_config_path):
+        import json
+        with open(capacity_tier_config_path, 'r') as f:
+            capacity_tier_configs = json.load(f)
+    
+    # Parse capacity allocation parameters
+    capacity_strategy = getattr(dataset, 'capacity_allocation_strategy', 'tiered')
+    capacity_tier_boundaries = [float(x) for x in getattr(dataset, 'capacity_tier_boundaries', '0.33,0.67').split(',')]
+    
+    min_spatial_res = tuple(int(x) for x in getattr(dataset, 'min_capacity_spatial', '64,96').split(','))
+    max_spatial_res = tuple(int(x) for x in getattr(dataset, 'max_capacity_spatial', '64,128,192').split(','))
+    min_time_res = tuple(int(x) for x in getattr(dataset, 'min_capacity_time', '64,96').split(','))
+    max_time_res = tuple(int(x) for x in getattr(dataset, 'max_capacity_time', '64,128,192').split(','))
+    min_mlp_hidden = getattr(dataset, 'min_capacity_mlp_hidden', 48)
+    max_mlp_hidden = getattr(dataset, 'max_capacity_mlp_hidden', 96)
+    min_feat_dim = getattr(dataset, 'min_capacity_feat_dim', 8)
+    max_feat_dim = getattr(dataset, 'max_capacity_feat_dim', 12)
+    
+    # Allocate capacity
+    student_configs = allocate_capacity_by_score(
+        cluster_mean_scores=cluster_mean_scores,
+        n_clusters=n_clusters,
+        capacity_tier_configs=capacity_tier_configs,
+        min_spatial_res=min_spatial_res,
+        max_spatial_res=max_spatial_res,
+        min_time_res=min_time_res,
+        max_time_res=max_time_res,
+        min_mlp_hidden=min_mlp_hidden,
+        max_mlp_hidden=max_mlp_hidden,
+        min_feat_dim=min_feat_dim,
+        max_feat_dim=max_feat_dim,
+        strategy=capacity_strategy,
+        tier_boundaries=capacity_tier_boundaries,
+    )
+    
+    # Visualize capacity allocation
+    visualize_capacity_allocation(
+        student_configs=student_configs,
+        cluster_mean_scores=cluster_mean_scores,
+        tb_writer=tb_writer,
+        iteration=iteration,
+        logger=logger,
+    )
 
     # Pseudo-color visualization
     _test_cams = scene.getTestCameras()
@@ -134,14 +196,8 @@ def run_clustering_at_iteration(
             _s_res = tuple(int(x) for x in dataset.hex_spatial_res.split(","))
             _t_res = tuple(int(x) for x in dataset.hex_time_res.split(","))
             
-            # Student model architecture parameters
-            _student_s_res = tuple(int(x) for x in dataset.student_spatial_res.split(","))
-            _student_t_res = tuple(int(x) for x in dataset.student_time_res.split(","))
-            _student_feat_dim = getattr(dataset, 'student_feat_dim', 8)
-            _student_mlp_hidden = getattr(dataset, 'student_mlp_hidden', 64)
-            _student_mlp_layers = getattr(dataset, 'student_mlp_layers', 2)
-            
-            # Create clustered deform model
+            # Use student_configs from capacity allocation (already computed above)
+            # Pass student_configs directly to ClusteredDeformModel
             clustered_deform = ClusteredDeformModel(
                 n_clusters=n_clusters,
                 is_blender=dataset.is_blender,
@@ -151,11 +207,7 @@ def run_clustering_at_iteration(
                 teacher_feat_dim=dataset.hex_feat_dim,
                 teacher_mlp_hidden_dim=dataset.hex_mlp_hidden,
                 teacher_mlp_num_hidden=dataset.hex_mlp_layers,
-                student_feat_dim=_student_feat_dim,
-                student_spatial_resolutions=_student_s_res,
-                student_time_resolutions=_student_t_res,
-                student_mlp_hidden_dim=_student_mlp_hidden,
-                student_mlp_num_hidden=_student_mlp_layers,
+                student_configs=student_configs,  # Use pre-computed per-cluster configs
                 fusion=dataset.hex_fusion,
             )
             

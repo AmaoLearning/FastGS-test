@@ -1,0 +1,37 @@
+{
+  "tiered": {
+    "description": "3-tier capacity allocation strategy (high/medium/low dynamic clusters)",
+    "boundaries": [0.33, 0.67],
+    "tiers": {
+      "high": {
+        "description": "High dynamic clusters (top 33%)",
+        "spatial_resolutions": [64, 128, 192],
+        "time_resolutions": [64, 128, 192],
+        "mlp_hidden_dim": 96,
+        "feat_dim": 12
+      },
+      "medium": {
+        "description": "Medium dynamic clusters (middle 33%)",
+        "spatial_resolutions": [64, 128, 128],
+        "time_resolutions": [64, 128, 128],
+        "mlp_hidden_dim": 64,
+        "feat_dim": 8
+      },
+      "low": {
+        "description": "Low dynamic clusters (bottom 33%)",
+        "spatial_resolutions": [64, 96],
+        "time_resolutions": [64, 96],
+        "mlp_hidden_dim": 48,
+        "feat_dim": 8
+      }
+    }
+  },
+  "constraints": {
+    "min_spatial_res": 64,
+    "max_spatial_res": 256,
+    "min_time_res": 64,
+    "max_time_res": 256,
+    "max_student_capacity_ratio": 0.5,
+    "max_total_capacity_ratio": 1.0
+  }
+}

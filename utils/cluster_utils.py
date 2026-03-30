@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -504,3 +504,238 @@ def render_cluster_pseudocolor(
         tb_writer.add_image("cluster/pseudocolor", rendered_image, iteration)
 
     return rendered_image
+
+
+# ---------------------------------------------------------------------------
+# Capacity allocation by dynamic score
+# ---------------------------------------------------------------------------
+
+# 8 high-contrast colors (Tab10-inspired) for cluster visualisation
+_CLUSTER_PALETTE = torch.tensor([
+    [1.00, 0.20, 0.20],   # red
+    [0.20, 0.60, 1.00],   # blue
+    [0.17, 0.80, 0.27],   # green
+    [1.00, 0.60, 0.00],   # orange
+    [0.60, 0.30, 0.90],   # purple
+    [0.00, 0.80, 0.80],   # cyan
+    [0.96, 0.80, 0.00],   # yellow
+    [0.96, 0.40, 0.70],   # pink
+], dtype=torch.float32)  # (8, 3)
+
+_STATIC_COLOR = torch.tensor([0.15, 0.15, 0.15], dtype=torch.float32)  # dark grey
+
+
+def allocate_capacity_by_score(
+    cluster_mean_scores: list[float],
+    n_clusters: int,
+    capacity_tier_configs: Optional[Dict] = None,
+    min_spatial_res: Tuple[int, ...] = (64, 96),
+    max_spatial_res: Tuple[int, ...] = (64, 128, 192),
+    min_time_res: Tuple[int, ...] = (64, 96),
+    max_time_res: Tuple[int, ...] = (64, 128, 192),
+    min_mlp_hidden: int = 48,
+    max_mlp_hidden: int = 96,
+    min_feat_dim: int = 8,
+    max_feat_dim: int = 12,
+    strategy: str = "tiered",
+    tier_boundaries: Optional[List[float]] = None,
+) -> List[Dict]:
+    """Allocate capacity for each cluster based on mean dynamic scores.
+    
+    Args:
+        cluster_mean_scores: List of average dynamic score for each cluster.
+        n_clusters: Number of clusters.
+        capacity_tier_configs: Predefined tier configurations (from JSON).
+        min_spatial_res: Minimum spatial resolutions (tuple of levels).
+        max_spatial_res: Maximum spatial resolutions (tuple of levels).
+        min_time_res: Minimum temporal resolutions.
+        max_time_res: Maximum temporal resolutions.
+        min_mlp_hidden: Minimum MLP hidden dimension.
+        max_mlp_hidden: Maximum MLP hidden dimension.
+        min_feat_dim: Minimum feature dimension.
+        max_feat_dim: Maximum feature dimension.
+        strategy: Allocation strategy ("tiered" or "linear").
+        tier_boundaries: Boundaries for tiered strategy (e.g., [0.33, 0.67]).
+    
+    Returns:
+        student_configs: List of dicts, each containing capacity config for one cluster.
+    """
+    assert len(cluster_mean_scores) == n_clusters, "Score count must match cluster count"
+    
+    if strategy == "tiered":
+        return _allocate_tiered(
+            cluster_mean_scores, n_clusters, capacity_tier_configs,
+            min_spatial_res, max_spatial_res, min_time_res, max_time_res,
+            min_mlp_hidden, max_mlp_hidden, min_feat_dim, max_feat_dim,
+            tier_boundaries
+        )
+    elif strategy == "linear":
+        return _allocate_linear(
+            cluster_mean_scores, n_clusters,
+            min_spatial_res, max_spatial_res, min_time_res, max_time_res,
+            min_mlp_hidden, max_mlp_hidden, min_feat_dim, max_feat_dim
+        )
+    else:
+        raise ValueError(f"Unknown strategy: {strategy}. Use 'tiered' or 'linear'.")
+
+
+def _allocate_tiered(
+    cluster_mean_scores: list[float],
+    n_clusters: int,
+    capacity_tier_configs: Optional[Dict],
+    min_spatial_res: Tuple[int, ...],
+    max_spatial_res: Tuple[int, ...],
+    min_time_res: Tuple[int, ...],
+    max_time_res: Tuple[int, ...],
+    min_mlp_hidden: int,
+    max_mlp_hidden: int,
+    min_feat_dim: int,
+    max_feat_dim: int,
+    tier_boundaries: Optional[List[float]],
+) -> List[Dict]:
+    """3-tier allocation: high/medium/low based on score ranking."""
+    if tier_boundaries is None:
+        tier_boundaries = [0.33, 0.67]
+    
+    # Get sorted indices (descending by score)
+    sorted_indices = sorted(range(n_clusters), key=lambda i: cluster_mean_scores[i], reverse=True)
+    
+    # Determine tier boundaries in terms of cluster count
+    n_high = max(1, int(n_clusters * tier_boundaries[0]))
+    n_medium = max(1, int(n_clusters * tier_boundaries[1]) - n_high)
+    # Low gets the rest
+    
+    # Use predefined configs if available
+    if capacity_tier_configs is not None and "tiers" in capacity_tier_configs:
+        tiers = capacity_tier_configs["tiers"]
+        high_config = {
+            "spatial_resolutions": tiers["high"]["spatial_resolutions"],
+            "time_resolutions": tiers["high"]["time_resolutions"],
+            "mlp_hidden_dim": tiers["high"]["mlp_hidden_dim"],
+            "feat_dim": tiers["high"]["feat_dim"],
+        }
+        medium_config = {
+            "spatial_resolutions": tiers["medium"]["spatial_resolutions"],
+            "time_resolutions": tiers["medium"]["time_resolutions"],
+            "mlp_hidden_dim": tiers["medium"]["mlp_hidden_dim"],
+            "feat_dim": tiers["medium"]["feat_dim"],
+        }
+        low_config = {
+            "spatial_resolutions": tiers["low"]["spatial_resolutions"],
+            "time_resolutions": tiers["low"]["time_resolutions"],
+            "mlp_hidden_dim": tiers["low"]["mlp_hidden_dim"],
+            "feat_dim": tiers["low"]["feat_dim"],
+        }
+    else:
+        # Fallback: construct configs from min/max parameters
+        high_config = {
+            "spatial_resolutions": list(max_spatial_res),
+            "time_resolutions": list(max_time_res),
+            "mlp_hidden_dim": max_mlp_hidden,
+            "feat_dim": max_feat_dim,
+        }
+        medium_config = {
+            "spatial_resolutions": list(min_spatial_res) + [(min_spatial_res[-1] + max_spatial_res[-1]) // 2],
+            "time_resolutions": list(min_time_res) + [(min_time_res[-1] + max_time_res[-1]) // 2],
+            "mlp_hidden_dim": (min_mlp_hidden + max_mlp_hidden) // 2,
+            "feat_dim": (min_feat_dim + max_feat_dim) // 2,
+        }
+        low_config = {
+            "spatial_resolutions": list(min_spatial_res),
+            "time_resolutions": list(min_time_res),
+            "mlp_hidden_dim": min_mlp_hidden,
+            "feat_dim": min_feat_dim,
+        }
+    
+    # Allocate configs
+    student_configs = [None] * n_clusters
+    for rank, cluster_idx in enumerate(sorted_indices):
+        if rank < n_high:
+            student_configs[cluster_idx] = high_config
+        elif rank < n_high + n_medium:
+            student_configs[cluster_idx] = medium_config
+        else:
+            student_configs[cluster_idx] = low_config
+    
+    return student_configs
+
+
+def _allocate_linear(
+    cluster_mean_scores: list[float],
+    n_clusters: int,
+    min_spatial_res: Tuple[int, ...],
+    max_spatial_res: Tuple[int, ...],
+    min_time_res: Tuple[int, ...],
+    max_time_res: Tuple[int, ...],
+    min_mlp_hidden: int,
+    max_mlp_hidden: int,
+    min_feat_dim: int,
+    max_feat_dim: int,
+) -> List[Dict]:
+    """Linear interpolation: capacity scales continuously with score."""
+    scores = np.array(cluster_mean_scores)
+    min_score = scores.min()
+    max_score = scores.max()
+    score_range = max_score - min_score + 1e-8
+    
+    # Normalize scores to [0, 1]
+    norm_scores = (scores - min_score) / score_range
+    
+    student_configs = []
+    for i in range(n_clusters):
+        alpha = norm_scores[i]  # Interpolation factor
+        
+        # Interpolate spatial resolutions (element-wise)
+        spatial_res = tuple(
+            int(min_r + alpha * (max_r - min_r))
+            for min_r, max_r in zip(min_spatial_res, max_spatial_res)
+        )
+        
+        # Interpolate time resolutions
+        time_res = tuple(
+            int(min_r + alpha * (max_r - min_r))
+            for min_r, max_r in zip(min_time_res, max_time_res)
+        )
+        
+        # Interpolate MLP hidden dim and feat_dim
+        mlp_hidden = int(min_mlp_hidden + alpha * (max_mlp_hidden - min_mlp_hidden))
+        feat_dim = int(min_feat_dim + alpha * (max_feat_dim - min_feat_dim))
+        
+        student_configs.append({
+            "spatial_resolutions": spatial_res,
+            "time_resolutions": time_res,
+            "mlp_hidden_dim": mlp_hidden,
+            "feat_dim": feat_dim,
+        })
+    
+    return student_configs
+
+
+def compute_cluster_mean_scores(
+    gaussians,
+    cluster_labels: torch.Tensor,
+    n_clusters: int,
+) -> List[float]:
+    """Compute mean dynamic score for each cluster.
+    
+    Args:
+        gaussians: GaussianModel with dynamic scores.
+        cluster_labels: (N,) int32 tensor with cluster assignments (-1 for static).
+        n_clusters: Number of clusters.
+    
+    Returns:
+        cluster_mean_scores: List of mean scores per cluster.
+    """
+    with torch.no_grad():
+        dyn_score = gaussians.compute_dynamic_score()  # (N,), range [0, 1]
+        
+        cluster_mean_scores = []
+        for k in range(n_clusters):
+            mask = (cluster_labels == k)
+            if mask.sum() > 0:
+                mean_score = dyn_score[mask].mean().item()
+            else:
+                mean_score = 0.0
+            cluster_mean_scores.append(mean_score)
+    
+    return cluster_mean_scores

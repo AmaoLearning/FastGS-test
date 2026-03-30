@@ -98,6 +98,20 @@ class ModelParams(ParamGroup):
         self.student_time_res = "64,128"  # Student temporal resolutions, comma-separated
         self.student_mlp_hidden = 64  # Student MLP hidden dimension
         self.student_mlp_layers = 2  # Student MLP layers
+        
+        # Capacity allocation parameters (for dynamic score-based allocation)
+        self.capacity_allocation_strategy = "tiered"  # "tiered" or "linear"
+        self.capacity_tier_boundaries = "0.33,0.67"  # Comma-separated boundaries for tiered strategy
+        self.capacity_tier_config_path = "arguments/capacity_tier_configs.json"  # Path to tier config JSON
+        self.min_capacity_spatial = "64,96"  # Minimum spatial resolutions
+        self.max_capacity_spatial = "64,128,192"  # Maximum spatial resolutions
+        self.min_capacity_time = "64,96"  # Minimum temporal resolutions
+        self.max_capacity_time = "64,128,192"  # Maximum temporal resolutions
+        self.min_capacity_mlp_hidden = 48  # Minimum MLP hidden dimension
+        self.max_capacity_mlp_hidden = 96  # Maximum MLP hidden dimension
+        self.min_capacity_feat_dim = 8  # Minimum feature dimension
+        self.max_capacity_feat_dim = 12  # Maximum feature dimension
+        self.capacity_budget_constraint = "none"  # "none", "sum", "max_per_student"
 
         # lazy loading — N3V large-scale dataset (zero OOM)
         self.lazy_load = False
