@@ -1023,3 +1023,51 @@ def render_capacity_pseudocolor(
         print(_msg)
     
     return rendered_image
+
+
+def infer_student_configs_from_weights(
+    cluster_tiers: Dict[int, str],
+    n_clusters: int,
+    capacity_tier_configs: Optional[Dict] = None,
+) -> List[Dict]:
+    """Infer student configs from weight file tier labels.
+    
+    This function reconstructs the student configuration list by parsing
+    tier labels (high/medium/low) from weight filenames.
+    
+    Args:
+        cluster_tiers: Dict mapping cluster_id to tier label (e.g., {0: 'high', 1: 'medium'}).
+        n_clusters: Total number of clusters.
+        capacity_tier_configs: Predefined tier configurations from JSON.
+    
+    Returns:
+        List of student configs, one per cluster.
+    """
+    # Default tier configs if not provided
+    if capacity_tier_configs is None or "tiered" not in capacity_tier_configs:
+        raise ValueError("[ERROR] capacity tier configs NOT FOUND!")
+    else:
+        # Use tier configs from JSON
+        default_tiers = capacity_tier_configs["tiered"]["tiers"]
+    
+    # Build student configs list
+    student_configs = []
+    for cluster_id in range(n_clusters):
+        if cluster_id in cluster_tiers:
+            tier = cluster_tiers[cluster_id]
+            if tier in default_tiers:
+                config = default_tiers[tier].copy()
+                config["tier"] = tier  # Preserve tier label for saving
+                student_configs.append(config)
+            else:
+                print(f"[WARNING] Unknown tier '{tier}' for cluster {cluster_id}, using medium config")
+                config = default_tiers["medium"].copy()
+                config["tier"] = "medium"
+                student_configs.append(config)
+        else:
+            print(f"[WARNING] No weight file found for cluster {cluster_id}, using default config")
+            config = default_tiers["medium"].copy()
+            config["tier"] = "medium"
+            student_configs.append(config)
+    
+    return student_configs

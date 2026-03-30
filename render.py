@@ -394,11 +394,65 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
             if _use_clustered:
                 # Load ClusteredDeformModel
                 from scene import ClusteredDeformModel
+                from utils.cluster_utils import infer_student_configs_from_weights
+                import os
+                
                 n_clusters = getattr(dataset, 'cluster_n_clusters', 8)
+                
+                # Load capacity tier configs
+                capacity_tier_config_path = getattr(dataset, 'capacity_tier_config_path', 'arguments/capacity_tier_configs.json')
+                capacity_tier_configs = None
+                if os.path.exists(capacity_tier_config_path):
+                    import json
+                    with open(capacity_tier_config_path, 'r') as f:
+                        capacity_tier_configs = json.load(f)
+                
+                # Infer student configs from weight files (by parsing tier labels from filenames)
+                deform_dir = os.path.join(dataset.model_path, "deform")
+                if os.path.isdir(deform_dir):
+                    # Find iteration directory
+                    import re
+                    iter_pattern = re.compile(r"iteration_(\d+)")
+                    max_iter = -1
+                    for dirname in os.listdir(deform_dir):
+                        match = iter_pattern.match(dirname)
+                        if match:
+                            iter_num = int(match.group(1))
+                            if iter_num > max_iter:
+                                max_iter = iter_num
+                    
+                    if max_iter >= 0:
+                        iter_dir = os.path.join(deform_dir, f"iteration_{max_iter}")
+                        # Parse weight filenames to infer tier for each cluster
+                        weight_pattern = re.compile(r"deform_cluster_(?P<tier>high|medium|low)_(?P<cluster_id>\d+)\.pth")
+                        cluster_tiers = {}
+                        for filename in os.listdir(iter_dir):
+                            match = weight_pattern.match(filename)
+                            if match:
+                                cluster_id = int(match.group("cluster_id"))
+                                tier = match.group("tier")
+                                cluster_tiers[cluster_id] = tier
+                        
+                        # Build student_configs list based on inferred tiers
+                        student_configs = infer_student_configs_from_weights(
+                            cluster_tiers=cluster_tiers,
+                            n_clusters=n_clusters,
+                            capacity_tier_configs=capacity_tier_configs
+                        )
+                        print(f"[INFO] Inferred student configs from weight files: {len(student_configs)} clusters")
+                    else:
+                        print("[WARNING] No iteration directory found, using default student configs")
+                        student_configs = None
+                else:
+                    print("[WARNING] No deform directory found, using default student configs")
+                    student_configs = None
+                
+                # Create ClusteredDeformModel with inferred configs
                 deform = ClusteredDeformModel(
                     n_clusters=n_clusters,
                     is_blender=dataset.is_blender,
                     is_6dof=dataset.is_6dof,
+                    student_configs=student_configs,
                 )
                 deform.load_weights(dataset.model_path, iteration if iteration >= 0 else -1)
                 print(f"[INFO] Loaded clustered deform model with {n_clusters} student models")
