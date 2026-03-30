@@ -216,12 +216,6 @@ def cluster_dynamic_gaussians(
                 f"selected={n_dynamic}/{N}")
         logger.info(_msg)
         print(_msg)
-            
-        # Log score distribution for debugging
-        if tb_writer is not None:
-            tb_writer.add_scalar('cluster/dynamic_score_thresh', score_thresh, iteration)
-            tb_writer.add_scalar('cluster/n_dynamic_gaussians', n_dynamic, iteration)
-            tb_writer.add_histogram('cluster/dynamic_scores', dyn_score, iteration)
 
     _msg = f"[CLUSTER] Selecting dynamic Gaussians: {n_dynamic}/{N}"
     logger.info(_msg)
@@ -840,27 +834,16 @@ def visualize_capacity_allocation(
     
     # ── 2. Log to TensorBoard ──
     if tb_writer is not None:
-        # Log FLOPs per cluster
-        for k in range(n_clusters):
-            tb_writer.add_scalar(f'capacity/flops_cluster_{k}', cluster_flops[k], iteration)
-            tb_writer.add_scalar(f'capacity/params_cluster_{k}', cluster_params[k], iteration)
-        
-        # Log aggregated stats
+        # Log aggregated stats only (simplified for TensorBoard 2.20.0 compatibility)
         total_flops = sum(cluster_flops)
         total_params = sum(cluster_params)
-        avg_flops = total_flops / n_clusters
-        avg_params = total_params / n_clusters
+        avg_flops = total_flops / n_clusters if n_clusters > 0 else 0
+        avg_params = total_params / n_clusters if n_clusters > 0 else 0
         
         tb_writer.add_scalar('capacity/total_flops', total_flops, iteration)
         tb_writer.add_scalar('capacity/total_params', total_params, iteration)
         tb_writer.add_scalar('capacity/avg_flops_per_cluster', avg_flops, iteration)
         tb_writer.add_scalar('capacity/avg_params_per_cluster', avg_params, iteration)
-        
-        # Log capacity distribution (normalized)
-        flops_distribution = [f / max_flops for f in cluster_flops]
-        params_distribution = [p / max_params for p in cluster_params]
-        tb_writer.add_histogram('capacity/flops_distribution', flops_distribution, iteration)
-        tb_writer.add_histogram('capacity/params_distribution', params_distribution, iteration)
     
     # Log summary
     if logger is not None:
