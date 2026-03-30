@@ -918,14 +918,18 @@ def render_capacity_pseudocolor(
     
     # ── 1. Build tier-to-color mapping from student_configs ──
     # Read tier labels directly from configs (no inference needed)
+    # Determine device from cluster_labels
+    device = cluster_labels.device
+    
+    # Map tier labels to colors (on correct device)
     tier_colors_map = {
-        "high": _CAPACITY_TIER_COLORS["high"],
-        "medium": _CAPACITY_TIER_COLORS["medium"],
-        "low": _CAPACITY_TIER_COLORS["low"],
+        "high": _CAPACITY_TIER_COLORS["high"].to(device=device),
+        "medium": _CAPACITY_TIER_COLORS["medium"].to(device=device),
+        "low": _CAPACITY_TIER_COLORS["low"].to(device=device),
     }
     
     # Assign color to each cluster based on its tier label
-    tier_colors = torch.zeros(n_clusters, 3, dtype=torch.float32, device="cuda")
+    tier_colors = torch.zeros(n_clusters, 3, dtype=torch.float32, device=device)
     for k in range(n_clusters):
         config = student_configs[k]
         tier = config.get("tier", "low")  # Default to "low" if not specified
@@ -933,10 +937,10 @@ def render_capacity_pseudocolor(
             tier_colors[k] = tier_colors_map[tier]
         else:
             # Unknown tier, use default (low/blue)
-            tier_colors[k] = _CAPACITY_TIER_COLORS["low"]
+            tier_colors[k] = tier_colors_map["low"]
     
     # ── 2. Assign colors to Gaussians ──
-    colors = _STATIC_COLOR.unsqueeze(0).expand(N, 3).clone()  # Default: dark grey
+    colors = _STATIC_COLOR.to(device=device).unsqueeze(0).expand(N, 3).clone()  # Default: dark grey
     for k in range(n_clusters):
         mask = (cluster_labels == k)
         if mask.any():
