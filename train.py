@@ -182,103 +182,91 @@ def run_clustering_at_iteration(
     scene.release_cameras([_debug_cam])
     print(f"[INFO] Clustering at iter {iteration} saved to {_cluster_save}")
     
+    # ── Switch to clustered deform model if enabled ──
+    # Automatically enabled when teacher_checkpoint_path is provided
+    teacher_checkpoint = getattr(dataset, 'teacher_checkpoint_path', '')
+
     # ── Capacity allocation visualization (pseudo-color render) ──
+    from utils.cluster_utils import render_capacity_pseudocolor
     # Render capacity tier pseudo-color image (separate from cluster ID visualization)
     _capacity_vis_path = os.path.join(
         dataset.model_path, "cluster",
         f"capacity_vis_iter{iteration}.png")
     
-    # Create a temporary deform model for visualization (if not yet switched to clustered)
-    # Use the student_configs to create a visualization-only deform
-    if use_clustered:
-        # Already using clustered deform model, can use it directly
-        # But we need to map cluster_labels to capacity tiers
-        from utils.cluster_utils import render_capacity_pseudocolor
-        
-        render_capacity_pseudocolor(
-            gaussians=gaussians,
-            student_configs=student_configs,
-            cluster_labels=cluster_result["labels"],
-            viewpoint_cam=_debug_cam,
-            deform=deform,
-            pipe=pipe,
-            bg_color=background,
-            mult=mult,
-            is_6dof=dataset.is_6dof,
-            save_path=_capacity_vis_path,
-            iteration=iteration,
-        )
-        _msg = f"[CAPACITY-VIS] Capacity allocation render saved to {_capacity_vis_path}"
-        print(_msg)
+    render_capacity_pseudocolor(
+        gaussians=gaussians,
+        student_configs=student_configs,
+        cluster_labels=cluster_result["labels"],
+        viewpoint_cam=_debug_cam,
+        deform=deform,
+        pipe=pipe,
+        bg_color=background,
+        mult=mult,
+        is_6dof=dataset.is_6dof,
+        save_path=_capacity_vis_path,
+        iteration=iteration,
+    )
+    _msg = f"[CAPACITY-VIS] Capacity allocation render saved to {_capacity_vis_path}"
+    print(_msg)
 
-    # ── Switch to clustered deform model if enabled ──
-    # Automatically enabled when teacher_checkpoint_path is provided
-    teacher_checkpoint = getattr(dataset, 'teacher_checkpoint_path', '')
-    use_clustered = teacher_checkpoint and iteration >= getattr(dataset, 'clustered_deform_start_iter', 15000)
+    from scene.deform_model import ClusteredDeformModel
     
-    if use_clustered:
-        from scene.deform_model import ClusteredDeformModel
-        
-        n_clusters = getattr(dataset, 'cluster_n_clusters', 8)
-        _deform_type = getattr(dataset, "deform_type", "mlp")
-        
-        if _deform_type == "4dgs":
-            _s_res = tuple(int(x) for x in dataset.hex_spatial_res.split(","))
-            _t_res = tuple(int(x) for x in dataset.hex_time_res.split(","))
-            
-            # Use student_configs from capacity allocation (already computed above)
-            # Pass student_configs directly to ClusteredDeformModel
-            clustered_deform = ClusteredDeformModel(
-                n_clusters=n_clusters,
-                is_blender=dataset.is_blender,
-                is_6dof=dataset.is_6dof,
-                teacher_spatial_resolutions=_s_res,
-                teacher_time_resolutions=_t_res,
-                teacher_feat_dim=dataset.hex_feat_dim,
-                teacher_mlp_hidden_dim=dataset.hex_mlp_hidden,
-                teacher_mlp_num_hidden=dataset.hex_mlp_layers,
-                student_configs=student_configs,  # Use pre-computed per-cluster configs
-                fusion=dataset.hex_fusion,
-            )
-            
-            # Load pre-trained teacher weights (REQUIRED - must be manually set)
-            teacher_checkpoint = getattr(dataset, 'teacher_checkpoint_path', '')
-            if not teacher_checkpoint:
-                raise ValueError(
-                    "[ERROR] teacher_checkpoint_path is required for clustered deform model. "
-                    "Please set --teacher_checkpoint_path /path/to/deform.pth"
-                )
-            
-            if not os.path.exists(teacher_checkpoint):
-                raise FileNotFoundError(
-                    f"[ERROR] Teacher checkpoint not found: {teacher_checkpoint}\n"
-                    "Please check the path and ensure the pre-trained weights exist."
-                )
-            
-            # Load teacher weights
-            clustered_deform.teacher.load_state_dict(torch.load(teacher_checkpoint))
-            clustered_deform.teacher.eval()  # Ensure teacher is in eval mode (frozen)
-            
-            logger.info("[ITER %d] Loaded teacher weights from %s", iteration, teacher_checkpoint)
-            print(f"[INFO] Loaded teacher weights from: {teacher_checkpoint}")
-            
-            # Set AABB
-            clustered_deform.set_aabb(gaussians.get_xyz.detach(), padding=0.1)
-            
-            # Set cluster labels
-            clustered_deform.set_cluster_labels(gaussians._cluster_labels)
-            
-            # Initialize optimizer
-            clustered_deform.train_setting(opt)
-            
-            logger.info("[ITER %d] Switched to clustered deform model with %d students", iteration, n_clusters)
-            print(f"[INFO] Switched to clustered deform model with {n_clusters} student models")
-            
-            # Replace deform object
-            deform = clustered_deform
-            
-            return cluster_result, deform
+    n_clusters = getattr(dataset, 'cluster_n_clusters', 8)
 
+    _s_res = tuple(int(x) for x in dataset.hex_spatial_res.split(","))
+    _t_res = tuple(int(x) for x in dataset.hex_time_res.split(","))
+    
+    # Use student_configs from capacity allocation (already computed above)
+    # Pass student_configs directly to ClusteredDeformModel
+    clustered_deform = ClusteredDeformModel(
+        n_clusters=n_clusters,
+        is_blender=dataset.is_blender,
+        is_6dof=dataset.is_6dof,
+        teacher_spatial_resolutions=_s_res,
+        teacher_time_resolutions=_t_res,
+        teacher_feat_dim=dataset.hex_feat_dim,
+        teacher_mlp_hidden_dim=dataset.hex_mlp_hidden,
+        teacher_mlp_num_hidden=dataset.hex_mlp_layers,
+        student_configs=student_configs,  # Use pre-computed per-cluster configs
+        fusion=dataset.hex_fusion,
+    )
+    
+    # Load pre-trained teacher weights (REQUIRED - must be manually set)
+    teacher_checkpoint = getattr(dataset, 'teacher_checkpoint_path', '')
+    if not teacher_checkpoint:
+        raise ValueError(
+            "[ERROR] teacher_checkpoint_path is required for clustered deform model. "
+            "Please set --teacher_checkpoint_path /path/to/deform.pth"
+        )
+    
+    if not os.path.exists(teacher_checkpoint):
+        raise FileNotFoundError(
+            f"[ERROR] Teacher checkpoint not found: {teacher_checkpoint}\n"
+            "Please check the path and ensure the pre-trained weights exist."
+        )
+    
+    # Load teacher weights
+    clustered_deform.teacher.load_state_dict(torch.load(teacher_checkpoint))
+    clustered_deform.teacher.eval()  # Ensure teacher is in eval mode (frozen)
+    
+    logger.info("[ITER %d] Loaded teacher weights from %s", iteration, teacher_checkpoint)
+    print(f"[INFO] Loaded teacher weights from: {teacher_checkpoint}")
+    
+    # Set AABB
+    clustered_deform.set_aabb(gaussians.get_xyz.detach(), padding=0.1)
+    
+    # Set cluster labels
+    clustered_deform.set_cluster_labels(gaussians._cluster_labels)
+    
+    # Initialize optimizer
+    clustered_deform.train_setting(opt)
+    
+    logger.info("[ITER %d] Switched to clustered deform model with %d students", iteration, n_clusters)
+    print(f"[INFO] Switched to clustered deform model with {n_clusters} student models")
+    
+    # Replace deform object
+    deform = clustered_deform
+    
     return cluster_result, deform
 
 
