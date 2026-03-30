@@ -557,12 +557,7 @@ def allocate_capacity_by_score(
     assert len(cluster_mean_scores) == n_clusters, "Score count must match cluster count"
     
     if strategy == "tiered":
-        return _allocate_tiered(
-            cluster_mean_scores, n_clusters, capacity_tier_configs,
-            min_spatial_res, max_spatial_res, min_time_res, max_time_res,
-            min_mlp_hidden, max_mlp_hidden, min_feat_dim, max_feat_dim,
-            tier_boundaries
-        )
+        return _allocate_tiered(cluster_mean_scores, n_clusters, capacity_tier_configs,tier_boundaries)
     elif strategy == "linear":
         return _allocate_linear(
             cluster_mean_scores, n_clusters,
@@ -577,14 +572,6 @@ def _allocate_tiered(
     cluster_mean_scores: list[float],
     n_clusters: int,
     capacity_tier_configs: Optional[Dict],
-    min_spatial_res: Tuple[int, ...],
-    max_spatial_res: Tuple[int, ...],
-    min_time_res: Tuple[int, ...],
-    max_time_res: Tuple[int, ...],
-    min_mlp_hidden: int,
-    max_mlp_hidden: int,
-    min_feat_dim: int,
-    max_feat_dim: int,
     tier_boundaries: Optional[List[float]],
 ) -> List[Dict]:
     """3-tier allocation: high/medium/low based on score ranking."""
@@ -600,8 +587,8 @@ def _allocate_tiered(
     # Low gets the rest
     
     # Use predefined configs if available
-    if capacity_tier_configs is not None and "tiers" in capacity_tier_configs:
-        tiers = capacity_tier_configs["tiers"]
+    if capacity_tier_configs is not None:
+        tiers = capacity_tier_configs["tiered"]["tiers"]
         high_config = {
             "tier": "high",
             "spatial_resolutions": tiers["high"]["spatial_resolutions"],
@@ -626,33 +613,10 @@ def _allocate_tiered(
             "mlp_layer_num": tiers["low"].get("mlp_layer_num", 2),
             "feat_dim": tiers["low"]["feat_dim"],
         }
+        print("[INFO] Load capacity tier configs successfully!")
     else:
-        # Fallback: construct configs from min/max parameters
-        high_config = {
-            "tier": "high",
-            "spatial_resolutions": list(max_spatial_res),
-            "time_resolutions": list(max_time_res),
-            "mlp_hidden_dim": max_mlp_hidden,
-            "mlp_layer_num": 2,
-            "feat_dim": max_feat_dim,
-        }
-        medium_config = {
-            "tier": "medium",
-            "spatial_resolutions": list(min_spatial_res) + [(min_spatial_res[-1] + max_spatial_res[-1]) // 2],
-            "time_resolutions": list(min_time_res) + [(min_time_res[-1] + max_time_res[-1]) // 2],
-            "mlp_hidden_dim": (min_mlp_hidden + max_mlp_hidden) // 2,
-            "mlp_layer_num": 2,
-            "feat_dim": (min_feat_dim + max_feat_dim) // 2,
-        }
-        low_config = {
-            "tier": "low",
-            "spatial_resolutions": list(min_spatial_res),
-            "time_resolutions": list(min_time_res),
-            "mlp_hidden_dim": min_mlp_hidden,
-            "mlp_layer_num": 2,
-            "feat_dim": min_feat_dim,
-        }
-    
+        raise ValueError(f"[ERROR] capacity tier configs not found, please check tier config path")
+
     # Allocate configs
     student_configs = [None] * n_clusters
     for rank, cluster_idx in enumerate(sorted_indices):
