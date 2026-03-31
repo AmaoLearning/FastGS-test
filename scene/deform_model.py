@@ -7,6 +7,9 @@ import os
 from typing import Optional, Sequence, Tuple, Dict, List
 from utils.system_utils import searchForMaxIteration
 from utils.general_utils import get_expon_lr_func
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class DeformModel:
@@ -304,7 +307,7 @@ class ClusteredDeformModel:
         
         # Cluster assignments (updated during training)
         self._cluster_labels: Optional[torch.Tensor] = None  # (N,) int32
-        
+    
     def set_aabb(self, points: torch.Tensor, padding: float = 0.1) -> None:
         """Set AABB for all deform models."""
         self.teacher.set_aabb(points, padding=padding)
@@ -616,6 +619,52 @@ class ClusteredDeformModel:
             raise FileNotFoundError(f"Failed to load any student models from {iter_dir}")
         
         print(f"[INFO] Successfully loaded {loaded_count} student models")
+    
+    def initialize_students_with_warm_init(
+        self,
+        warm_init_cfg,
+        noise_std_per_student: Optional[List[float]] = None,
+    ) -> None:
+        """
+        使用热启动初始化所有学生网络。
+        
+        在第 15000 轮聚类完成后调用，将教师 HexPlane 参数降采样迁移到学生。
+        
+        Args:
+            warm_init_cfg: WarmInitConfig 实例，包含热启动配置。
+            noise_std_per_student: 可选，每个学生的噪声标准差 (打破对称性)。
+                若为 None，则使用 warm_init_cfg.noise_std 统一值。
+        """
+        if not warm_init_cfg.enabled:
+            logger.info("WarmInit 已禁用，跳过学生初始化。")
+            return
+        
+        # 确保教师处于 eval 模式且参数冻结
+        self.teacher.eval()
+        for p in self.teacher.parameters():
+            p.requires_grad_(False)
+        
+        # 为不同学生设置递增噪声 (打破对称性)
+        n = len(self.students)
+        if noise_std_per_student is None:
+            base_noise = warm_init_cfg.noise_std
+            noise_std_per_student = [
+                base_noise * (1.0 + 0.5 * i / max(n - 1, 1))
+                for i in range(n)
+            ]
+
+        from utils.warm_init_utils import warm_init_all_students
+        
+        # 执行热启动初始化
+        warm_init_all_students(
+            teacher_network=self.teacher,
+            student_networks=list(self.students),
+            student_configs=self.student_configs,
+            cfg=warm_init_cfg,
+            noise_std_per_student=noise_std_per_student,
+        )
+        
+        logger.info(f"所有 {n} 个学生网络热启动初始化完成。")
     
     def get_regularization_loss(self) -> torch.Tensor:
         """Get TV and L1 regularization from all student models."""

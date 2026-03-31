@@ -1,7 +1,5 @@
 {
   "tiered": {
-    "description": "3-tier capacity allocation strategy (high/medium/low dynamic clusters)",
-    "boundaries": [0.33, 0.67],
     "tiers": {
       "high": {
         "description": "High dynamic clusters (top 33%)",

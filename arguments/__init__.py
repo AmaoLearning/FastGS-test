@@ -99,6 +99,16 @@ class ModelParams(ParamGroup):
         self.student_mlp_hidden = 64  # Student MLP hidden dimension
         self.student_mlp_layers = 2  # Student MLP layers
         
+        # Warm initialization (teacher → student knowledge transfer)
+        self.warm_init_enabled = False
+        self.warm_init_downsample_planes = False
+        self.warm_init_interpolation_mode = "bilinear"
+        self.warm_init_compress_feat = False
+        self.warm_init_feat_method = "truncate"  # truncate / pca / random_proj
+        self.warm_init_transfer_mlp = False
+        self.warm_init_normalize_scale = False
+        self.warm_init_noise_std = 1e-4
+        
         # Capacity allocation parameters (for dynamic score-based allocation)
         self.capacity_allocation_strategy = "tiered"  # "tiered" or "linear"
         self.capacity_tier_boundaries = "0.33,0.67"  # Comma-separated boundaries for tiered strategy

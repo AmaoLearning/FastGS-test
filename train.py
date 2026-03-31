@@ -115,7 +115,7 @@ def run_clustering_at_iteration(
     
     # Parse capacity allocation parameters
     capacity_strategy = getattr(dataset, 'capacity_allocation_strategy', 'tiered')
-    capacity_tier_boundaries = [float(x) for x in getattr(dataset, 'capacity_tier_boundaries', '0.33,0.67').split(',')]
+    capacity_tier_boundaries = [float(x) for x in getattr(dataset, 'capacity_tier_boundaries', '').split(',')]
     
     min_spatial_res = tuple(int(x) for x in getattr(dataset, 'min_capacity_spatial', '64,96').split(','))
     max_spatial_res = tuple(int(x) for x in getattr(dataset, 'max_capacity_spatial', '64,128,192').split(','))
@@ -257,6 +257,23 @@ def run_clustering_at_iteration(
     
     # Set cluster labels
     clustered_deform.set_cluster_labels(gaussians._cluster_labels)
+    
+    # ── Warm initialization: teacher → student knowledge transfer ──
+    # Import warm init utilities
+    from utils.warm_init_utils import WarmInitConfig
+    warm_init_cfg = WarmInitConfig(
+        enabled=getattr(dataset, 'warm_init_enabled', False),
+        downsample_planes=getattr(dataset, 'warm_init_downsample_planes', False),
+        interpolation_mode=getattr(dataset, 'warm_init_interpolation_mode', 'bilinear'),
+        compress_feat_dim=getattr(dataset, 'warm_init_compress_feat', False),
+        feat_compression_method=getattr(dataset, 'warm_init_feat_method', 'truncate'),
+        transfer_mlp=getattr(dataset, 'warm_init_transfer_mlp', False),
+        normalize_scale=getattr(dataset, 'warm_init_normalize_scale', False),
+        noise_std=getattr(dataset, 'warm_init_noise_std', 1e-4),
+    )
+    
+    # Initialize students with warm start from teacher
+    clustered_deform.initialize_students_with_warm_init(warm_init_cfg)
     
     # Initialize optimizer
     clustered_deform.train_setting(opt)
