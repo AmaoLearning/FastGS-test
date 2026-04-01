@@ -76,7 +76,7 @@ def run_clustering_at_iteration(
         tb_writer: TensorBoard writer (optional).
         logger: Logger instance (optional).
     """
-    if not getattr(dataset, 'use_dynamic_sep', False):
+    if not dataset.use_dynamic_sep:
         return None
 
     _cluster_save = os.path.join(dataset.model_path, "cluster")
@@ -84,21 +84,21 @@ def run_clustering_at_iteration(
 
     cluster_result = cluster_dynamic_gaussians(
         gaussians,
-        dynamic_thresh=getattr(dataset, 'cluster_dynamic_thresh', 0.5),
-        n_clusters=getattr(dataset, 'cluster_n_clusters', 8),
-        w_xyz=getattr(dataset, 'cluster_w_xyz', 1.0),
-        w_color=getattr(dataset, 'cluster_w_color', 0.5),
-        w_motion=getattr(dataset, 'cluster_w_motion', 1.0),
+        dynamic_thresh=dataset.cluster_dynamic_thresh,
+        n_clusters=dataset.cluster_n_clusters,
+        w_xyz=dataset.cluster_w_xyz,
+        w_color=dataset.cluster_w_color,
+        w_motion=dataset.cluster_w_motion,
         temperature=temperature,
         tb_writer=tb_writer,
         iteration=iteration,
-        dynamic_score_percentile=getattr(dataset, 'dynamic_score_percentile', 80.0),
+        dynamic_score_percentile=dataset.dynamic_score_percentile,
     )
     gaussians._cluster_labels = cluster_result["labels"]
     
     # ── Capacity allocation based on dynamic score ──
     # Compute mean dynamic score for each cluster
-    n_clusters = getattr(dataset, 'cluster_n_clusters', 8)
+    n_clusters = dataset.cluster_n_clusters
     cluster_mean_scores = compute_cluster_mean_scores(
         gaussians,
         cluster_result["labels"],
@@ -106,7 +106,7 @@ def run_clustering_at_iteration(
     )
     
     # Load tier configuration from JSON
-    capacity_tier_config_path = getattr(dataset, 'capacity_tier_config_path', 'arguments/capacity_tier_configs.json')
+    capacity_tier_config_path = dataset.capacity_tier_config_path
     capacity_tier_configs = None
     if os.path.exists(capacity_tier_config_path):
         import json
@@ -114,17 +114,17 @@ def run_clustering_at_iteration(
             capacity_tier_configs = json.load(f)
     
     # Parse capacity allocation parameters
-    capacity_strategy = getattr(dataset, 'capacity_allocation_strategy', 'tiered')
-    capacity_tier_boundaries = [float(x) for x in getattr(dataset, 'capacity_tier_boundaries', '').split(',')]
+    capacity_strategy = dataset.capacity_allocation_strategy
+    capacity_tier_boundaries = [float(x) for x in dataset.capacity_tier_boundaries.split(',')]
     
-    min_spatial_res = tuple(int(x) for x in getattr(dataset, 'min_capacity_spatial', '64,96').split(','))
-    max_spatial_res = tuple(int(x) for x in getattr(dataset, 'max_capacity_spatial', '64,128,192').split(','))
-    min_time_res = tuple(int(x) for x in getattr(dataset, 'min_capacity_time', '64,96').split(','))
-    max_time_res = tuple(int(x) for x in getattr(dataset, 'max_capacity_time', '64,128,192').split(','))
-    min_mlp_hidden = getattr(dataset, 'min_capacity_mlp_hidden', 48)
-    max_mlp_hidden = getattr(dataset, 'max_capacity_mlp_hidden', 96)
-    min_feat_dim = getattr(dataset, 'min_capacity_feat_dim', 8)
-    max_feat_dim = getattr(dataset, 'max_capacity_feat_dim', 12)
+    min_spatial_res = tuple(int(x) for x in dataset.min_capacity_spatial.split(','))
+    max_spatial_res = tuple(int(x) for x in dataset.max_capacity_spatial.split(','))
+    min_time_res = tuple(int(x) for x in dataset.min_capacity_time.split(','))
+    max_time_res = tuple(int(x) for x in dataset.max_capacity_time.split(','))
+    min_mlp_hidden = dataset.min_capacity_mlp_hidden
+    max_mlp_hidden = dataset.max_capacity_mlp_hidden
+    min_feat_dim = dataset.min_capacity_feat_dim
+    max_feat_dim = dataset.max_capacity_feat_dim
     
     # Allocate capacity
     student_configs = allocate_capacity_by_score(
@@ -184,7 +184,7 @@ def run_clustering_at_iteration(
     
     # ── Switch to clustered deform model if enabled ──
     # Automatically enabled when teacher_checkpoint_path is provided
-    teacher_checkpoint = getattr(dataset, 'teacher_checkpoint_path', '')
+    teacher_checkpoint = dataset.teacher_checkpoint_path
 
     # ── Capacity allocation visualization (pseudo-color render) ──
     from utils.cluster_utils import render_capacity_pseudocolor
@@ -211,7 +211,7 @@ def run_clustering_at_iteration(
 
     from scene.deform_model import ClusteredDeformModel
     
-    n_clusters = getattr(dataset, 'cluster_n_clusters', 8)
+    n_clusters = dataset.cluster_n_clusters
 
     _s_res = tuple(int(x) for x in dataset.hex_spatial_res.split(","))
     _t_res = tuple(int(x) for x in dataset.hex_time_res.split(","))
@@ -232,7 +232,7 @@ def run_clustering_at_iteration(
     )
     
     # Load pre-trained teacher weights (REQUIRED - must be manually set)
-    teacher_checkpoint = getattr(dataset, 'teacher_checkpoint_path', '')
+    teacher_checkpoint = dataset.teacher_checkpoint_path
     if not teacher_checkpoint:
         raise ValueError(
             "[ERROR] teacher_checkpoint_path is required for clustered deform model. "
@@ -262,13 +262,13 @@ def run_clustering_at_iteration(
     # Import warm init utilities
     from utils.warm_init_utils import WarmInitConfig
     warm_init_cfg = WarmInitConfig(
-        enabled=getattr(dataset, 'warm_init_enabled', False),
-        downsample_planes=getattr(dataset, 'warm_init_downsample_planes', False),
-        interpolation_mode=getattr(dataset, 'warm_init_interpolation_mode', 'bilinear'),
-        feat_compression_method=getattr(dataset, 'warm_init_feat_method', 'none'),
-        transfer_mlp=getattr(dataset, 'warm_init_transfer_mlp', False),
-        normalize_scale=getattr(dataset, 'warm_init_normalize_scale', False),
-        noise_std=getattr(dataset, 'warm_init_noise_std', 1e-4),
+        enabled=dataset.warm_init_enabled,
+        downsample_planes=dataset.warm_init_downsample_planes,
+        interpolation_mode=dataset.warm_init_interpolation_mode,
+        feat_compression_method=dataset.warm_init_feat_method,
+        transfer_mlp=dataset.warm_init_transfer_mlp,
+        normalize_scale=dataset.warm_init_normalize_scale,
+        noise_std=dataset.warm_init_noise_std,
     )
     
     # Initialize students with warm start from teacher
@@ -298,11 +298,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
     gaussians = GaussianModel(dataset.sh_degree)
 
     # ── Select deformation network ──
-    _deform_type = getattr(dataset, "deform_type", "mlp")
+    _deform_type = dataset.deform_type
     
     # Check if we will use clustered deform model (auto-detected from teacher_checkpoint_path)
-    _use_clustered = bool(getattr(dataset, 'teacher_checkpoint_path', ''))
-    _cluster_start_iter = getattr(dataset, 'clustered_deform_start_iter', 15000)
+    _use_clustered = bool(dataset.teacher_checkpoint_path)
+    _cluster_start_iter = dataset.clustered_deform_start_iter
     
     if _deform_type == "4dgs":
         _s_res = tuple(int(x) for x in dataset.hex_spatial_res.split(","))
@@ -549,14 +549,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
         # ── Knowledge distillation loss for clustered deform model ──
         # Compute distillation loss sparsely (every 5 iterations) to reduce overhead
         # Student models are already supervised by rendering loss every iteration
-        _distill_interval = getattr(dataset, 'distill_loss_interval', 5)
+        _distill_interval = opt.distill_loss_interval
         if (isinstance(deform, ClusteredDeformModel) 
-                and iteration > getattr(dataset, 'clustered_deform_start_iter', 15000)
+                and iteration > dataset.clustered_deform_start_iter
                 and iteration % _distill_interval == 0):
             N = gaussians.get_xyz.shape[0]
             time_input = fid.unsqueeze(0).expand(N, -1)
             
-            kl_weight = getattr(opt, 'kl_distill_weight', 1.0)
+            kl_weight = opt.kl_distill_weight
             
             # Pass pre-computed student deformations (from rendering step) to avoid recomputation
             distill_loss = deform.get_distillation_loss(
@@ -891,9 +891,9 @@ def run_training(args, lp: ModelParams, op: OptimizationParams, pp: PipelinePara
         training(
             lp.extract(args), op.extract(args), pp.extract(args),
             args.test_iterations, args.save_iterations,
-            profile=getattr(args, 'profile', False),
-            profile_start=getattr(args, 'profile_start', 500),
-            profile_steps=getattr(args, 'profile_steps', 50),
+            profile=args.profile,
+            profile_start=args.profile_start,
+            profile_steps=args.profile_steps,
             logger=logger,
         )
     except Exception:

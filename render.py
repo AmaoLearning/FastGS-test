@@ -382,10 +382,10 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
-        _deform_type = getattr(dataset, "deform_type", "mlp")
+        _deform_type = dataset.deform_type
         
         # Detect if using clustered deform model
-        _use_clustered = bool(getattr(dataset, 'teacher_checkpoint_path', ''))
+        _use_clustered = bool(dataset.teacher_checkpoint_path)
         
         if _deform_type == "4dgs":
             _s_res = tuple(int(x) for x in dataset.hex_spatial_res.split(","))
@@ -397,10 +397,10 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
                 from utils.cluster_utils import infer_student_configs_from_weights
                 import os
                 
-                n_clusters = getattr(dataset, 'cluster_n_clusters', 8)
+                n_clusters = dataset.cluster_n_clusters
                 
                 # Load capacity tier configs
-                capacity_tier_config_path = getattr(dataset, 'capacity_tier_config_path', 'arguments/capacity_tier_configs.json')
+                capacity_tier_config_path = dataset.capacity_tier_config_path
                 capacity_tier_configs = None
                 if os.path.exists(capacity_tier_config_path):
                     import json
@@ -480,7 +480,7 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
             deform = DeformModel(dataset.is_blender, dataset.is_6dof)
             deform.load_weights(dataset.model_path)
 
-        _use_dynamic_sep = getattr(dataset, "use_dynamic_sep", True)
+        _use_dynamic_sep = dataset.use_dynamic_sep
         
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")

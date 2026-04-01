@@ -73,6 +73,10 @@ class ModelParams(ParamGroup):
         self.hex_mlp_layers = 2
         self.hex_fusion = "concat"
 
+        # flow-guided losses
+        self.use_flow_loss = False     # 启用光流引导的渲染损失
+        self.use_flow_mask = False     # 启用光流掩码（仅动态区域计算损失）
+
         # soft dynamic-static separation
         self.use_dynamic_sep = True   # 启用动静分离：积累形变统计、执行聚类（默认启用）
         self.log_deform_hist = False   # 每隔3000轮记录全局形变分布柱状图

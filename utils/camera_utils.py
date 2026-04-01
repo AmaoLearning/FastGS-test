@@ -107,8 +107,8 @@ def loadLazyCam(args, id, cam_info, resolution_scale):
         data_device=args.data_device if not args.load2gpu_on_the_fly else 'cpu',
         fid=cam_info.fid,
         depth=cam_info.depth,
-        flow_fwd_path=getattr(cam_info, 'flow_fwd_path', None),
-        flow_bwd_path=getattr(cam_info, 'flow_bwd_path', None),
+        flow_fwd_path=cam_info.flow_fwd_path,
+        flow_bwd_path=cam_info.flow_bwd_path,
     )
 
 

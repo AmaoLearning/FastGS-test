@@ -95,7 +95,7 @@ class GUI:
 
         self.tb_writer = prepare_output_and_logger(dataset)
         self.gaussians = GaussianModel(dataset.sh_degree)
-        _deform_type = getattr(dataset, "deform_type", "mlp")
+        _deform_type = dataset.deform_type
         if _deform_type == "4dgs":
             _s_res = tuple(int(x) for x in dataset.hex_spatial_res.split(","))
             _t_res = tuple(int(x) for x in dataset.hex_time_res.split(","))

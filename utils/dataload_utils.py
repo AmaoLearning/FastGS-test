@@ -184,8 +184,8 @@ def create_camera_dataloader(
     flow_fwd_paths: Optional[List[Optional[str]]] = None
     flow_bwd_paths: Optional[List[Optional[str]]] = None
     if load_flow:
-        flow_fwd_paths = [getattr(c, 'flow_fwd_path', None) for c in cameras]
-        flow_bwd_paths = [getattr(c, 'flow_bwd_path', None) for c in cameras]
+        flow_fwd_paths = [c.flow_fwd_path for c in cameras]
+        flow_bwd_paths = [c.flow_bwd_path for c in cameras]
 
     dataset = CameraDataset(
         image_paths, target_resolutions,

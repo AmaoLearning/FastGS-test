@@ -47,8 +47,8 @@ class Scene:
         self.test_cameras = {}
 
         # ── Lazy loading state ──
-        self._lazy_mode: bool = getattr(args, 'lazy_load', False)
-        self._load2gpu_on_the_fly: bool = getattr(args, 'load2gpu_on_the_fly', False)
+        self._lazy_mode: bool = args.lazy_load
+        self._load2gpu_on_the_fly: bool = args.load2gpu_on_the_fly
         self._lazy_data_iter = None
         self._gpu_image_buffers: Optional[List[torch.Tensor]] = None
         self._lazy_cameras: Optional[List] = None
@@ -57,15 +57,15 @@ class Scene:
         self._prefetch_ready: Optional[Tuple[int, int, torch.cuda.Event]] = None
         self._viewpoint_stack: list = []  # for non-lazy random sampling
 
-        self._lazy_num_workers: int = int(getattr(args, 'lazy_num_workers', 8))
-        self._lazy_prefetch_factor: int = int(getattr(args, 'lazy_prefetch_factor', 4))
-        self._lazy_image_buffer_count: int = max(2, int(getattr(args, 'lazy_image_buffer_count', 2)))
-        self._lazy_prefetch_flow_to_cache: bool = bool(getattr(args, 'lazy_prefetch_flow_to_cache', False))
-        self._enable_flow_preload_cache: bool = bool(getattr(args, 'enable_flow_preload_cache', False))
-        self._flow_preload_cache_size: int = int(getattr(args, 'flow_preload_cache_size', 0))
-        self._flow_preload_cache_device: str = str(getattr(args, 'flow_preload_cache_device', 'cpu'))
+        self._lazy_num_workers: int = int(args.lazy_num_workers)
+        self._lazy_prefetch_factor: int = int(args.lazy_prefetch_factor)
+        self._lazy_image_buffer_count: int = max(2, int(args.lazy_image_buffer_count))
+        self._lazy_prefetch_flow_to_cache: bool = bool(args.lazy_prefetch_flow_to_cache)
+        self._enable_flow_preload_cache: bool = bool(args.enable_flow_preload_cache)
+        self._flow_preload_cache_size: int = int(args.flow_preload_cache_size)
+        self._flow_preload_cache_device: str = str(args.flow_preload_cache_device)
 
-        load_flow = getattr(args, 'use_flow_loss', False) or getattr(args, 'use_flow_mask', False) or getattr(args, 'use_dynamic_sep', False)
+        load_flow = args.use_flow_loss or args.use_flow_mask or args.use_dynamic_sep
         self._load_flow: bool = load_flow
 
         # Number of *temporal* frames (used for time_interval in velocity
@@ -74,8 +74,8 @@ class Scene:
         self._num_temporal_frames: Optional[int] = None
 
         if os.path.exists(os.path.join(args.source_path, "poses_bounds.npy")):
-            if getattr(args, 'lazy_load', False):
-                _n_frames = getattr(args, 'num_images', 300)
+            if args.lazy_load:
+                _n_frames = args.num_images
                 self._num_temporal_frames = _n_frames
                 print(f"Found poses_bounds.npy, using N3V lazy loader "
                       f"(metadata only, {_n_frames} frames/cam, flow={load_flow})")
@@ -278,8 +278,8 @@ class Scene:
             from scene.cameras import preload_flow_cache_from_tensors
             _cam = self._lazy_cameras[cam_idx]
             preload_flow_cache_from_tensors(
-                getattr(_cam, 'flow_fwd_path', None),
-                getattr(_cam, 'flow_bwd_path', None),
+                _cam.flow_fwd_path,
+                _cam.flow_bwd_path,
                 _batch_flow_fwd,
                 _batch_flow_bwd,
                 cache_device=self._flow_preload_cache_device,
