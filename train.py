@@ -274,8 +274,9 @@ def run_clustering_at_iteration(
     # Initialize students with warm start from teacher
     clustered_deform.initialize_students_with_warm_init(warm_init_cfg)
     
-    # Initialize optimizer
-    clustered_deform.train_setting(opt)
+    # Initialize optimizer — pass current iteration so LR schedulers start
+    # from lr_init and decay over the *remaining* training steps.
+    clustered_deform.train_setting(opt, start_iteration=iteration)
     
     logger.info("[ITER %d] Switched to clustered deform model with %d students", iteration, n_clusters)
     print(f"[INFO] Switched to clustered deform model with {n_clusters} student models")

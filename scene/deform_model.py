@@ -418,8 +418,17 @@ class ClusteredDeformModel:
         """Forward pass through teacher model (for distillation target)."""
         return self.teacher(xyz, time_emb)
     
-    def train_setting(self, training_args) -> None:
-        """Initialize optimizers for all student models."""
+    def train_setting(self, training_args, start_iteration: int = 0) -> None:
+        """Initialize optimizers for all student models.
+
+        Args:
+            training_args: OptimizationParams instance.
+            start_iteration: The global iteration at which students are created.
+                LR schedulers are built over the *remaining* steps so that
+                students start from ``lr_init`` and decay to ``lr_final`` by
+                ``deform_lr_max_steps``.
+        """
+        self._lr_start_iter = start_iteration
         param_groups = []
         
         for cluster_id, student in enumerate(self.students):
@@ -442,25 +451,38 @@ class ClusteredDeformModel:
         
         self.optimizer = torch.optim.Adam(param_groups, lr=0.0, eps=1e-15)
         
-        # LR schedulers
-        _max_steps = training_args.deform_lr_max_steps
+        # LR schedulers — use *remaining* steps so students start from lr_init.
+        _remaining_steps = max(training_args.deform_lr_max_steps - start_iteration, 1)
         self._plane_lr_func = get_expon_lr_func(
             lr_init=training_args.hex_plane_lr_init,
             lr_final=training_args.hex_plane_lr_final,
             lr_delay_mult=0.01,
-            max_steps=_max_steps,
+            max_steps=_remaining_steps,
         )
         self._mlp_lr_func = get_expon_lr_func(
             lr_init=training_args.hex_mlp_lr_init,
             lr_final=training_args.hex_mlp_lr_final,
             lr_delay_mult=0.01,
-            max_steps=_max_steps,
+            max_steps=_remaining_steps,
+        )
+        logger.info(
+            "[ClusteredDeform] LR scheduler: start_iter=%d, remaining_steps=%d, "
+            "plane_lr_init=%.4f→%.4f, mlp_lr_init=%.6f→%.6f",
+            start_iteration, _remaining_steps,
+            training_args.hex_plane_lr_init, training_args.hex_plane_lr_final,
+            training_args.hex_mlp_lr_init, training_args.hex_mlp_lr_final,
         )
     
     def update_learning_rate(self, iteration: int) -> Optional[float]:
-        """Update learning rates for all student models."""
-        plane_lr = self._plane_lr_func(iteration)
-        mlp_lr = self._mlp_lr_func(iteration)
+        """Update learning rates for all student models.
+
+        Uses the *relative* iteration count (iteration - start_iteration)
+        so that students begin training from ``lr_init`` regardless of when
+        they are created during the global training loop.
+        """
+        relative_iter = max(iteration - self._lr_start_iter, 0)
+        plane_lr = self._plane_lr_func(relative_iter)
+        mlp_lr = self._mlp_lr_func(relative_iter)
         
         for param_group in self.optimizer.param_groups:
             if "planes" in param_group["name"]:
