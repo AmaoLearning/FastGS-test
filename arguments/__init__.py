@@ -82,7 +82,7 @@ class ModelParams(ParamGroup):
         self.cluster_n_clusters = 8        # KMeans 聚类数
         self.cluster_dynamic_thresh = 0.5  # 动态概率阈值，仅 prob > thresh 的高斯参与聚类（用于旧版本兼容）
         self.cluster_w_xyz = 1.0           # 聚类特征权重：3D 位置
-        self.cluster_w_color = 0.5         # 聚类特征权重：SH 0阶 (RGB)
+        self.cluster_w_color = 0.1         # 聚类特征权重：SH 0阶 (RGB)
         self.cluster_w_motion = 0.5        # 聚类特征权重：历史平均形变
 
         # mapo
@@ -103,8 +103,7 @@ class ModelParams(ParamGroup):
         self.warm_init_enabled = False
         self.warm_init_downsample_planes = False
         self.warm_init_interpolation_mode = "bilinear"
-        self.warm_init_compress_feat = False
-        self.warm_init_feat_method = "truncate"  # truncate / pca / random_proj
+        self.warm_init_feat_method = "pca"  # none / truncate / pca / random_proj
         self.warm_init_transfer_mlp = False
         self.warm_init_normalize_scale = False
         self.warm_init_noise_std = 1e-4

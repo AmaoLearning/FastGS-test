@@ -5,7 +5,7 @@
         "description": "High dynamic clusters (top 33%)",
         "spatial_resolutions": [64, 128, 192],
         "time_resolutions": [64, 128, 192],
-        "mlp_hidden_dim": 96,
+        "mlp_hidden_dim": 108,
         "mlp_layer_num": 2,
         "feat_dim": 12
       },
@@ -13,15 +13,15 @@
         "description": "Medium dynamic clusters (middle 33%)",
         "spatial_resolutions": [64, 128, 128],
         "time_resolutions": [64, 128, 128],
-        "mlp_hidden_dim": 64,
+        "mlp_hidden_dim": 96,
         "mlp_layer_num": 2,
         "feat_dim": 8
       },
       "low": {
         "description": "Low dynamic clusters (bottom 33%)",
-        "spatial_resolutions": [64, 96],
-        "time_resolutions": [64, 96],
-        "mlp_hidden_dim": 48,
+        "spatial_resolutions": [64, 128],
+        "time_resolutions": [64, 128],
+        "mlp_hidden_dim": 64,
         "mlp_layer_num": 2,
         "feat_dim": 8
       }

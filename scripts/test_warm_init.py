@@ -56,7 +56,6 @@ def test_warm_init_basic():
     cfg = WarmInitConfig(
         enabled=True,
         downsample_planes=True,  # 保持开启，避免尺寸不匹配
-        compress_feat_dim=True,
         feat_compression_method="truncate",
         transfer_mlp=True,  # 仅测试 MLP 迁移
         normalize_scale=True,
@@ -219,7 +218,7 @@ def test_mlp_transfer():
     cfg = WarmInitConfig(
         enabled=True,
         downsample_planes=False,  # 关闭平面迁移
-        compress_feat_dim=False,
+        feat_compression_method="none",
         transfer_mlp=True,  # 仅测试 MLP 迁移
         noise_std=0.0,
     )

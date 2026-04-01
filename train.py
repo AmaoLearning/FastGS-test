@@ -265,8 +265,7 @@ def run_clustering_at_iteration(
         enabled=getattr(dataset, 'warm_init_enabled', False),
         downsample_planes=getattr(dataset, 'warm_init_downsample_planes', False),
         interpolation_mode=getattr(dataset, 'warm_init_interpolation_mode', 'bilinear'),
-        compress_feat_dim=getattr(dataset, 'warm_init_compress_feat', False),
-        feat_compression_method=getattr(dataset, 'warm_init_feat_method', 'truncate'),
+        feat_compression_method=getattr(dataset, 'warm_init_feat_method', 'none'),
         transfer_mlp=getattr(dataset, 'warm_init_transfer_mlp', False),
         normalize_scale=getattr(dataset, 'warm_init_normalize_scale', False),
         noise_std=getattr(dataset, 'warm_init_noise_std', 1e-4),
@@ -527,11 +526,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             tb_writer.add_scalar('train_loss_patches/total_loss_final', loss.item(), iteration)
 
         # ── HexPlane regularisation (4DGS / ClusteredDeform) ──
+        # For ClusteredDeformModel, per-student reg losses are computed here
+        # but backward is deferred to parallel CUDA streams (Plan A).
+        _reg_loss_scalar = None  # for TensorBoard logging
+        _per_student_reg_losses = None  # list of per-student reg losses (ClusteredDeformModel only)
         if _deform_type == "4dgs" and iteration >= opt.warm_up:
-            _reg_loss = deform.get_regularization_loss()
-            loss = loss + _reg_loss
+            if isinstance(deform, ClusteredDeformModel):
+                # Defer backward — collect individual losses now, backward later in parallel
+                _per_student_reg_losses = deform.get_per_student_regularization_losses()
+                # Compute scalar for logging (detached, no graph)
+                with torch.no_grad():
+                    _reg_loss_scalar = sum(r.detach() for r in _per_student_reg_losses)
+            else:
+                _reg_loss = deform.get_regularization_loss()
+                loss = loss + _reg_loss
+                _reg_loss_scalar = _reg_loss.detach()
             if tb_writer and iteration % 100 == 0:
-                tb_writer.add_scalar('train_loss_patches/hexplane_reg', _reg_loss.item(), iteration)
+                tb_writer.add_scalar('train_loss_patches/hexplane_reg',
+                                     _reg_loss_scalar.item() if _reg_loss_scalar is not None else 0.0,
+                                     iteration)
         
         # ── Knowledge distillation loss for clustered deform model ──
         # Compute distillation loss sparsely (every 5 iterations) to reduce overhead
@@ -568,7 +581,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             _phase_accum["loss_fwd"] += time.perf_counter() - _t0
             _t0 = time.perf_counter()
 
-        loss.backward()
+        # ── Backward pass ──
+        # Plan A: when using ClusteredDeformModel, per-student regularization
+        # losses have independent computation graphs (no shared tensors with the
+        # render / distillation losses).  We backward them on separate CUDA
+        # streams so their gradient computations overlap with each other and
+        # (partially) with the main loss backward on the default stream.
+        if _per_student_reg_losses is not None:
+            # Phase 1: launch per-student reg backward on parallel streams
+            _n_reg = len(_per_student_reg_losses)
+            _reg_streams = [torch.cuda.Stream() for _ in range(_n_reg)]
+            for _k in range(_n_reg):
+                with torch.cuda.stream(_reg_streams[_k]):
+                    _per_student_reg_losses[_k].backward()
+
+            # Phase 2: main loss backward on default stream (render + distill)
+            loss.backward()
+
+            # Phase 3: ensure all reg streams finished before optimizer.step()
+            for _s in _reg_streams:
+                torch.cuda.current_stream().wait_stream(_s)
+        else:
+            loss.backward()
 
         if _enable_phase_timer:
             torch.cuda.synchronize()

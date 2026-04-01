@@ -49,11 +49,13 @@ class WarmInitConfig:
     """F.interpolate 的 align_corners 参数。"""
 
     # ── 方案 B:特征维度压缩 ──
-    compress_feat_dim: bool = True
-    """是否压缩特征通道维度。"""
-
-    feat_compression_method: Literal["truncate", "pca", "random_proj"] = "truncate"
-    """特征压缩方法：truncate(截断) / pca(主成分) / random_proj(随机投影)。"""
+    feat_compression_method: Literal["none", "truncate", "pca", "random_proj"] = "truncate"
+    """特征压缩方法。
+    - none: 不做显式压缩，维度不匹配时仅截断/零填充。
+    - truncate: 截取前 target_dim 个通道。
+    - pca: SVD 主成分保留（保留最大方差方向）。
+    - random_proj: 随机正交投影（固定种子可复现）。
+    """
 
     # ── 方案 C:MLP 权重迁移 ──
     transfer_mlp: bool = True
@@ -203,23 +205,16 @@ def _transfer_single_plane(
     plane = teacher_plane  # [1, C_t, H_t, W_t]
 
     # ── 步骤 1: 特征维度压缩 ──
-    if cfg.compress_feat_dim and plane.shape[1] != target_feat_dim:
-        if plane.shape[1] > target_feat_dim:
-            plane = _compress_feat_dim(plane, target_feat_dim,
-                                       method=cfg.feat_compression_method)
-        elif plane.shape[1] < target_feat_dim:
-            # 目标维度更大：用零填充 (不应出现，但防御性处理)
-            pad_c = target_feat_dim - plane.shape[1]
-            padding = torch.zeros(1, pad_c, plane.shape[2], plane.shape[3],
-                                  device=plane.device, dtype=plane.dtype)
-            plane = torch.cat([plane, padding], dim=1)
-    elif plane.shape[1] != target_feat_dim:
-        # 如果未启用压缩但维度不匹配，需要处理
-        if plane.shape[1] > target_feat_dim:
-            # 截断到目标维度
+    if plane.shape[1] != target_feat_dim:
+        method = cfg.feat_compression_method
+        if method != "none" and plane.shape[1] > target_feat_dim:
+            # 使用指定的压缩方法 (truncate / pca / random_proj)
+            plane = _compress_feat_dim(plane, target_feat_dim, method=method)
+        elif plane.shape[1] > target_feat_dim:
+            # method == "none": 仅截断，不做花式压缩
             plane = plane[:, :target_feat_dim, :, :]
         else:
-            # 填充到目标维度
+            # 目标维度更大：用零填充 (不应出现，但防御性处理)
             pad_c = target_feat_dim - plane.shape[1]
             padding = torch.zeros(1, pad_c, plane.shape[2], plane.shape[3],
                                   device=plane.device, dtype=plane.dtype)

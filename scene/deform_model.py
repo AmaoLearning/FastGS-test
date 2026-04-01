@@ -671,3 +671,16 @@ class ClusteredDeformModel:
         tv_loss = sum(student.get_plane_tv_loss() for student in self.students)
         l1_loss = sum(student.get_plane_l1_loss() for student in self.students)
         return 1e-3 * tv_loss + 1e-4 * l1_loss
+
+    def get_per_student_regularization_losses(self) -> List[torch.Tensor]:
+        """Return per-student regularization losses for parallel backward.
+
+        Each element is ``1e-3 * TV_k + 1e-4 * L1_k`` for student *k*.
+        The losses are **not** summed so callers can backward them on
+        independent CUDA streams.
+        """
+        losses: List[torch.Tensor] = []
+        for student in self.students:
+            reg_k = 1e-3 * student.get_plane_tv_loss() + 1e-4 * student.get_plane_l1_loss()
+            losses.append(reg_k)
+        return losses
