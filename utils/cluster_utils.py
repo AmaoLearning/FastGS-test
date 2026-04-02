@@ -235,19 +235,19 @@ def cluster_dynamic_gaussians(
         xyz_np = gaussians.get_xyz[dynamic_mask].detach().cpu().numpy()  # (M, 3)
         # SH DC: _features_dc is (N, 1, 3) → squeeze to (N, 3)
         sh_dc_np = gaussians._features_dc[dynamic_mask].detach().squeeze(1).cpu().numpy()  # (M, 3)
-        # Mean deformation
-        if hasattr(gaussians, 'get_mean_deform'):
-            mean_def_np = gaussians.get_mean_deform()[dynamic_mask].detach().cpu().numpy()  # (M, 3)
+        # Deformation variance (replaces mean deformation for better high-freq separation)
+        if hasattr(gaussians, 'get_deform_var'):
+            deform_var_np = gaussians.get_deform_var()[dynamic_mask].detach().cpu().numpy()  # (M, 3)
         else:
-            mean_def_np = np.zeros_like(xyz_np)
-            logger.warning("[CLUSTER] No deform history available, using zero motion features")
+            deform_var_np = np.zeros_like(xyz_np)
+            logger.warning("[CLUSTER] No deform variance available, using zero motion features")
 
     _msg = (f"[CLUSTER] Building feature matrix: "
             f"xyz(w={w_xyz}), color(w={w_color}), motion(w={w_motion})")
     logger.info(_msg)
     print(_msg)
 
-    features = _build_feature_matrix(xyz_np, sh_dc_np, mean_def_np,
+    features = _build_feature_matrix(xyz_np, sh_dc_np, deform_var_np,
                                      w_xyz, w_color, w_motion)
     feat_dim = features.shape[1]
     _msg = f"[CLUSTER] Feature matrix: {features.shape[0]} points × {feat_dim} dims"
