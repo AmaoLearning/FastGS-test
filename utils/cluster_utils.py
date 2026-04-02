@@ -899,16 +899,23 @@ def render_capacity_pseudocolor(
         "low": _CAPACITY_TIER_COLORS["low"].to(device=device),
     }
     
-    # Assign color to each cluster based on its tier label
+    # Assign color to each cluster based on its tier label.
+    # When frequency-based allocation provides independent hex_tier / mlp_tier,
+    # blend 70% HexPlane tier color + 30% MLP tier color so both dimensions
+    # are visible in a single pseudo-color render.
     tier_colors = torch.zeros(n_clusters, 3, dtype=torch.float32, device=device)
     for k in range(n_clusters):
         config = student_configs[k]
-        tier = config.get("tier", "low")  # Default to "low" if not specified
-        if tier in tier_colors_map:
-            tier_colors[k] = tier_colors_map[tier]
+        hex_tier = config.get("hex_tier", None)
+        mlp_tier = config.get("mlp_tier", None)
+        if hex_tier is not None and mlp_tier is not None:
+            # Dual-tier blending for frequency-based allocation
+            hex_color = tier_colors_map.get(hex_tier, tier_colors_map["low"])
+            mlp_color = tier_colors_map.get(mlp_tier, tier_colors_map["low"])
+            tier_colors[k] = 0.7 * hex_color + 0.3 * mlp_color
         else:
-            # Unknown tier, use default (low/blue)
-            tier_colors[k] = tier_colors_map["low"]
+            tier = config.get("tier", "low")
+            tier_colors[k] = tier_colors_map.get(tier, tier_colors_map["low"])
     
     # ── 2. Assign colors to Gaussians ──
     colors = _STATIC_COLOR.to(device=device).unsqueeze(0).expand(N, 3).clone()  # Default: dark grey
@@ -1034,4 +1041,228 @@ def infer_student_configs_from_weights(
             config["tier"] = "medium"
             student_configs.append(config)
     
+    return student_configs
+
+
+# ---------------------------------------------------------------------------
+# Frequency-based capacity analysis (plan_frequency_capacity.md)
+# ---------------------------------------------------------------------------
+
+def analyze_cluster_capacity_needs(
+    gaussians,
+    deform,
+    cluster_labels: torch.Tensor,
+    n_clusters: int,
+    n_time_samples: int = 32,
+) -> Dict[str, List]:
+    """Compute per-cluster temporal complexity and motion heterogeneity in one pass.
+
+    Shares teacher inference across both metrics to avoid redundant forward passes.
+
+    **Metric A – temporal_complexity** (RMS acceleration):
+        Acceleration = d²(displacement)/dt².  In the frequency domain this is
+        proportional to ω² |F(ω)|, so a large RMS acceleration indicates that
+        the motion signal has significant high-frequency energy and therefore
+        requires higher HexPlane resolution (Nyquist bandwidth).
+
+    **Metric B – heterogeneity** (intra-cluster trajectory variance):
+        Each Gaussian's displacement trajectory is flattened into a (T×3)-dim
+        feature vector.  The mean squared distance from each trajectory to the
+        cluster centroid measures how diverse the motion patterns are within
+        the cluster.  High heterogeneity → MLP needs more capacity to
+        discriminate different motion modes.
+
+    Args:
+        gaussians: GaussianModel instance (must have ``get_xyz``).
+        deform: Teacher deformation network (``DeformModel_4DGS`` or
+            ``ClusteredDeformModel`` with ``step_teacher``).
+        cluster_labels: ``(N,)`` int32 tensor, -1 = static, 0..K-1 = cluster.
+        n_clusters: Number of clusters K.
+        n_time_samples: Number of uniform time steps for teacher sampling.
+
+    Returns:
+        Dict with keys:
+          - ``"temporal_complexity"``: ``List[float]`` of length *n_clusters*.
+          - ``"heterogeneity"``: ``List[float]`` of length *n_clusters*.
+          - ``"n_gaussians"``: ``List[int]``, number of Gaussians per cluster.
+    """
+    xyz = gaussians.get_xyz.detach()  # (N, 3)
+    N = xyz.shape[0]
+    time_steps = torch.linspace(0, 1, n_time_samples, device=xyz.device)
+
+    # ── Shared teacher inference ──
+    displacements: List[torch.Tensor] = []
+    with torch.no_grad():
+        for t_val in time_steps:
+            t_input = t_val.unsqueeze(0).expand(N, 1)  # (N, 1)
+            if hasattr(deform, 'step_teacher'):
+                d_xyz, _, _ = deform.step_teacher(xyz, t_input)
+            elif hasattr(deform, 'step'):
+                d_xyz, _, _ = deform.step(xyz, t_input)
+            else:
+                d_xyz = deform.deform(xyz, t_input)[0]
+
+            if not torch.is_tensor(d_xyz):
+                d_xyz = torch.zeros_like(xyz)
+            displacements.append(d_xyz)
+
+    disp = torch.stack(displacements, dim=0)  # (T, N, 3)
+
+    # ── Metric A: temporal complexity (RMS acceleration) ──
+    velocity = disp[1:] - disp[:-1]              # (T-1, N, 3)
+    acceleration = velocity[1:] - velocity[:-1]   # (T-2, N, 3)
+    # per-Gaussian RMS acceleration magnitude
+    per_gaussian_accel = acceleration.pow(2).mean(dim=0).sum(dim=-1).sqrt()  # (N,)
+
+    # ── Metric B: trajectory feature for heterogeneity ──
+    traj_feat = disp.permute(1, 0, 2).reshape(N, -1)  # (N, T*3)
+
+    # ── Aggregate per cluster ──
+    temporal_complexity: List[float] = []
+    heterogeneity: List[float] = []
+    n_gaussians_list: List[int] = []
+
+    for k in range(n_clusters):
+        mask = (cluster_labels == k)
+        count = int(mask.sum().item())
+        n_gaussians_list.append(count)
+
+        if count == 0:
+            temporal_complexity.append(0.0)
+            heterogeneity.append(0.0)
+            continue
+
+        # Metric A
+        temporal_complexity.append(float(per_gaussian_accel[mask].mean().item()))
+
+        # Metric B
+        if count < 2:
+            heterogeneity.append(0.0)
+        else:
+            cluster_traj = traj_feat[mask]  # (M_k, T*3)
+            centroid = cluster_traj.mean(dim=0, keepdim=True)
+            intra_var = float((cluster_traj - centroid).pow(2).mean().item())
+            heterogeneity.append(intra_var)
+
+    logger.info(
+        "[FREQ-CAPACITY] Temporal complexity: %s",
+        [f"{v:.6f}" for v in temporal_complexity],
+    )
+    logger.info(
+        "[FREQ-CAPACITY] Heterogeneity: %s",
+        [f"{v:.6f}" for v in heterogeneity],
+    )
+
+    return {
+        "temporal_complexity": temporal_complexity,
+        "heterogeneity": heterogeneity,
+        "n_gaussians": n_gaussians_list,
+    }
+
+
+def allocate_capacity_by_frequency(
+    temporal_complexity: List[float],
+    heterogeneity: List[float],
+    n_clusters: int,
+    capacity_tier_configs: Dict,
+    strategy: str = "independent_tiered",
+) -> List[Dict]:
+    """Frequency-driven capacity allocation (independent HexPlane / MLP tiers).
+
+    Unlike :func:`allocate_capacity_by_score` which uses a single dynamic-score
+    ranking for all parameters, this function ranks clusters independently:
+
+    * **HexPlane resolution tier** ← ``temporal_complexity`` ranking
+      (high-frequency motion needs higher Nyquist bandwidth)
+    * **MLP hidden width tier** ← ``heterogeneity`` ranking
+      (diverse intra-cluster motion needs more expressive decoder)
+
+    This decoupling allows combinations such as *High HexPlane + Low MLP*
+    (fast but uniform motion) or *Low HexPlane + High MLP* (slow but diverse
+    motion) that were impossible with the old single-score scheme.
+
+    Args:
+        temporal_complexity: Per-cluster Metric A values.
+        heterogeneity: Per-cluster Metric B values.
+        n_clusters: Number of clusters K.
+        capacity_tier_configs: Full JSON config dict (must contain
+            ``"frequency_based"`` key).
+        strategy: ``"independent_tiered"`` (recommended) — HexPlane and MLP
+            tiers assigned independently.
+
+    Returns:
+        ``student_configs``: list of K dicts, each compatible with
+        ``ClusteredDeformModel.__init__``.
+    """
+    if strategy != "independent_tiered":
+        raise ValueError(
+            f"Unknown frequency strategy: {strategy!r}. "
+            "Currently only 'independent_tiered' is supported."
+        )
+
+    fb_cfg = capacity_tier_configs["frequency_based"]
+    hex_tiers_cfg = fb_cfg["hex_tiers"]
+    mlp_tiers_cfg = fb_cfg["mlp_tiers"]
+
+    n_high = max(1, n_clusters // 3)
+
+    # ── HexPlane tier by temporal_complexity (descending) ──
+    hex_sorted = sorted(
+        range(n_clusters),
+        key=lambda i: temporal_complexity[i],
+        reverse=True,
+    )
+    hex_tier: Dict[int, str] = {}
+    for rank, cid in enumerate(hex_sorted):
+        if rank < n_high:
+            hex_tier[cid] = "high"
+        elif rank < 2 * n_high:
+            hex_tier[cid] = "medium"
+        else:
+            hex_tier[cid] = "low"
+
+    # ── MLP tier by heterogeneity (descending) ──
+    mlp_sorted = sorted(
+        range(n_clusters),
+        key=lambda i: heterogeneity[i],
+        reverse=True,
+    )
+    mlp_tier: Dict[int, str] = {}
+    for rank, cid in enumerate(mlp_sorted):
+        if rank < n_high:
+            mlp_tier[cid] = "high"
+        elif rank < 2 * n_high:
+            mlp_tier[cid] = "medium"
+        else:
+            mlp_tier[cid] = "low"
+
+    # ── Compose student configs ──
+    student_configs: List[Dict] = []
+    for k in range(n_clusters):
+        h_tier = hex_tier[k]
+        m_tier = mlp_tier[k]
+        h_cfg = hex_tiers_cfg[h_tier]
+        m_cfg = mlp_tiers_cfg[m_tier]
+
+        config = {
+            "spatial_resolutions": list(h_cfg["spatial_resolutions"]),
+            "time_resolutions": list(h_cfg["time_resolutions"]),
+            "feat_dim": h_cfg["feat_dim"],
+            "mlp_hidden_dim": m_cfg["mlp_hidden_dim"],
+            "mlp_layer_num": m_cfg.get("mlp_layer_num", 2),
+            "hex_tier": h_tier,
+            "mlp_tier": m_tier,
+            "tier": h_tier,  # backward-compat: use HexPlane tier as overall label
+        }
+        student_configs.append(config)
+
+        logger.info(
+            "[FREQ-CAPACITY] Cluster %d: hex_tier=%s (complexity=%.6f), "
+            "mlp_tier=%s (heterogeneity=%.6f) → spatial=%s, feat=%d, mlp_hidden=%d",
+            k, h_tier, temporal_complexity[k],
+            m_tier, heterogeneity[k],
+            config["spatial_resolutions"], config["feat_dim"],
+            config["mlp_hidden_dim"],
+        )
+
     return student_configs

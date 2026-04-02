@@ -113,7 +113,7 @@ class ModelParams(ParamGroup):
         self.warm_init_noise_std = 1e-4
         
         # Capacity allocation parameters (for dynamic score-based allocation)
-        self.capacity_allocation_strategy = "tiered"  # "tiered" or "linear"
+        self.capacity_allocation_strategy = "tiered"  # "tiered", "linear", or "frequency"
         self.capacity_tier_boundaries = "0.33,0.67"  # Comma-separated boundaries for tiered strategy
         self.capacity_tier_config_path = "arguments/capacity_tier_configs.json"  # Path to tier config JSON
         self.min_capacity_spatial = "64,96"  # Minimum spatial resolutions
@@ -125,6 +125,9 @@ class ModelParams(ParamGroup):
         self.min_capacity_feat_dim = 8  # Minimum feature dimension
         self.max_capacity_feat_dim = 12  # Maximum feature dimension
         self.capacity_budget_constraint = "none"  # "none", "sum", "max_per_student"
+        
+        # Frequency-based capacity analysis (only effective when capacity_allocation_strategy="frequency")
+        self.freq_n_time_samples = 32  # Number of uniform time steps for teacher sampling
 
         # lazy loading — N3V large-scale dataset (zero OOM)
         self.lazy_load = False

@@ -5,14 +5,14 @@
         "description": "High dynamic clusters (top 33%)",
         "spatial_resolutions": [64, 128, 192],
         "time_resolutions": [64, 128, 192],
-        "mlp_hidden_dim": 108,
+        "mlp_hidden_dim": 128,
         "mlp_layer_num": 2,
         "feat_dim": 12
       },
       "medium": {
         "description": "Medium dynamic clusters (middle 33%)",
-        "spatial_resolutions": [64, 128, 128],
-        "time_resolutions": [64, 128, 128],
+        "spatial_resolutions": [64, 96, 128],
+        "time_resolutions": [64, 96, 128],
         "mlp_hidden_dim": 96,
         "mlp_layer_num": 2,
         "feat_dim": 8
@@ -23,7 +23,46 @@
         "time_resolutions": [64, 128],
         "mlp_hidden_dim": 64,
         "mlp_layer_num": 2,
+        "feat_dim": 4
+      }
+    }
+  },
+  "frequency_based": {
+    "hex_tiers": {
+      "high": {
+        "description": "High temporal-frequency complexity: fast oscillations / vibrations",
+        "spatial_resolutions": [64, 128, 192],
+        "time_resolutions": [64, 128, 192],
+        "feat_dim": 12
+      },
+      "medium": {
+        "description": "Medium temporal-frequency complexity",
+        "spatial_resolutions": [64, 96, 128],
+        "time_resolutions": [64, 96, 128],
         "feat_dim": 8
+      },
+      "low": {
+        "description": "Low temporal-frequency: slow smooth motion",
+        "spatial_resolutions": [64, 128],
+        "time_resolutions": [64, 128],
+        "feat_dim": 4
+      }
+    },
+    "mlp_tiers": {
+      "high": {
+        "description": "High intra-cluster heterogeneity: multiple motion modes coexist",
+        "mlp_hidden_dim": 128,
+        "mlp_layer_num": 2
+      },
+      "medium": {
+        "description": "Medium heterogeneity",
+        "mlp_hidden_dim": 96,
+        "mlp_layer_num": 2
+      },
+      "low": {
+        "description": "Low heterogeneity: near-rigid cluster motion",
+        "mlp_hidden_dim": 64,
+        "mlp_layer_num": 2
       }
     }
   },

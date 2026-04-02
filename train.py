@@ -43,6 +43,8 @@ from utils.cluster_utils import (
     compute_cluster_mean_scores,
     visualize_capacity_allocation,
     render_capacity_pseudocolor,
+    analyze_cluster_capacity_needs,
+    allocate_capacity_by_frequency,
 )
 
 
@@ -96,14 +98,9 @@ def run_clustering_at_iteration(
     )
     gaussians._cluster_labels = cluster_result["labels"]
     
-    # ── Capacity allocation based on dynamic score ──
-    # Compute mean dynamic score for each cluster
+    # ── Capacity allocation ──
     n_clusters = dataset.cluster_n_clusters
-    cluster_mean_scores = compute_cluster_mean_scores(
-        gaussians,
-        cluster_result["labels"],
-        n_clusters,
-    )
+    capacity_strategy = dataset.capacity_allocation_strategy
     
     # Load tier configuration from JSON
     capacity_tier_config_path = dataset.capacity_tier_config_path
@@ -113,37 +110,83 @@ def run_clustering_at_iteration(
         with open(capacity_tier_config_path, 'r') as f:
             capacity_tier_configs = json.load(f)
     
-    # Parse capacity allocation parameters
-    capacity_strategy = dataset.capacity_allocation_strategy
-    capacity_tier_boundaries = [float(x) for x in dataset.capacity_tier_boundaries.split(',')]
+    if capacity_strategy == "frequency":
+        # ── Frequency-based capacity allocation (plan_frequency_capacity.md) ──
+        logger.info("[ITER %d] Using frequency-based capacity allocation", iteration)
+        print(f"[INFO] Using frequency-based capacity allocation (n_time_samples={dataset.freq_n_time_samples})")
+        
+        analysis = analyze_cluster_capacity_needs(
+            gaussians=gaussians,
+            deform=deform,
+            cluster_labels=cluster_result["labels"],
+            n_clusters=n_clusters,
+            n_time_samples=dataset.freq_n_time_samples,
+        )
+        
+        student_configs = allocate_capacity_by_frequency(
+            temporal_complexity=analysis["temporal_complexity"],
+            heterogeneity=analysis["heterogeneity"],
+            n_clusters=n_clusters,
+            capacity_tier_configs=capacity_tier_configs,
+            strategy="independent_tiered",
+        )
+        
+        # TensorBoard: per-cluster frequency analysis metrics
+        if tb_writer is not None:
+            for k in range(n_clusters):
+                tb_writer.add_scalar(
+                    f'capacity/temporal_complexity_{k}',
+                    analysis["temporal_complexity"][k], iteration)
+                tb_writer.add_scalar(
+                    f'capacity/heterogeneity_{k}',
+                    analysis["heterogeneity"][k], iteration)
+                tb_writer.add_scalar(
+                    f'capacity/n_gaussians_{k}',
+                    analysis["n_gaussians"][k], iteration)
+                tb_writer.add_scalar(
+                    f'capacity/hex_n_levels_{k}',
+                    len(student_configs[k]["spatial_resolutions"]), iteration)
+                tb_writer.add_scalar(
+                    f'capacity/mlp_hidden_{k}',
+                    student_configs[k]["mlp_hidden_dim"], iteration)
+        
+        # Use temporal_complexity as a surrogate for cluster_mean_scores in visualization
+        cluster_mean_scores = analysis["temporal_complexity"]
+    else:
+        # ── Legacy: score-based capacity allocation (tiered / linear) ──
+        cluster_mean_scores = compute_cluster_mean_scores(
+            gaussians,
+            cluster_result["labels"],
+            n_clusters,
+        )
+        
+        capacity_tier_boundaries = [float(x) for x in dataset.capacity_tier_boundaries.split(',')]
+        min_spatial_res = tuple(int(x) for x in dataset.min_capacity_spatial.split(','))
+        max_spatial_res = tuple(int(x) for x in dataset.max_capacity_spatial.split(','))
+        min_time_res = tuple(int(x) for x in dataset.min_capacity_time.split(','))
+        max_time_res = tuple(int(x) for x in dataset.max_capacity_time.split(','))
+        min_mlp_hidden = dataset.min_capacity_mlp_hidden
+        max_mlp_hidden = dataset.max_capacity_mlp_hidden
+        min_feat_dim = dataset.min_capacity_feat_dim
+        max_feat_dim = dataset.max_capacity_feat_dim
+        
+        student_configs = allocate_capacity_by_score(
+            cluster_mean_scores=cluster_mean_scores,
+            n_clusters=n_clusters,
+            capacity_tier_configs=capacity_tier_configs,
+            min_spatial_res=min_spatial_res,
+            max_spatial_res=max_spatial_res,
+            min_time_res=min_time_res,
+            max_time_res=max_time_res,
+            min_mlp_hidden=min_mlp_hidden,
+            max_mlp_hidden=max_mlp_hidden,
+            min_feat_dim=min_feat_dim,
+            max_feat_dim=max_feat_dim,
+            strategy=capacity_strategy,
+            tier_boundaries=capacity_tier_boundaries,
+        )
     
-    min_spatial_res = tuple(int(x) for x in dataset.min_capacity_spatial.split(','))
-    max_spatial_res = tuple(int(x) for x in dataset.max_capacity_spatial.split(','))
-    min_time_res = tuple(int(x) for x in dataset.min_capacity_time.split(','))
-    max_time_res = tuple(int(x) for x in dataset.max_capacity_time.split(','))
-    min_mlp_hidden = dataset.min_capacity_mlp_hidden
-    max_mlp_hidden = dataset.max_capacity_mlp_hidden
-    min_feat_dim = dataset.min_capacity_feat_dim
-    max_feat_dim = dataset.max_capacity_feat_dim
-    
-    # Allocate capacity
-    student_configs = allocate_capacity_by_score(
-        cluster_mean_scores=cluster_mean_scores,
-        n_clusters=n_clusters,
-        capacity_tier_configs=capacity_tier_configs,
-        min_spatial_res=min_spatial_res,
-        max_spatial_res=max_spatial_res,
-        min_time_res=min_time_res,
-        max_time_res=max_time_res,
-        min_mlp_hidden=min_mlp_hidden,
-        max_mlp_hidden=max_mlp_hidden,
-        min_feat_dim=min_feat_dim,
-        max_feat_dim=max_feat_dim,
-        strategy=capacity_strategy,
-        tier_boundaries=capacity_tier_boundaries,
-    )
-    
-    # Visualize capacity allocation
+    # Visualize capacity allocation (works for both strategies)
     visualize_capacity_allocation(
         student_configs=student_configs,
         cluster_mean_scores=cluster_mean_scores,
