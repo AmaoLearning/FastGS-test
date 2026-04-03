@@ -354,6 +354,161 @@ def test_infer_configs_single_tier() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Test 8: SNER — known high-frequency residual should yield SNER ≫ 0
+# ---------------------------------------------------------------------------
+
+def test_sner_high_residual() -> None:
+    """When teacher oscillates at 20 Hz and student is static, SNER should be
+    non-trivially positive (most energy above a low Nyquist cutoff)."""
+    from utils.cluster_utils import compute_sner_per_cluster
+
+    N = 200
+    n_clusters = 1
+    labels = torch.zeros(N, dtype=torch.int32)
+    xyz = torch.randn(N, 3)
+    gaussians = _FakeGaussians(xyz)
+
+    # Teacher: 20 Hz oscillation; Student: static (zero displacement)
+    class _HighFreqTeacher:
+        def step_teacher(self, xyz, time_emb):
+            t = time_emb[:, 0]
+            d = 0.01 * torch.sin(2 * math.pi * 20.0 * t).unsqueeze(-1).expand_as(xyz)
+            return d, torch.zeros_like(xyz[:, :4]), torch.zeros_like(xyz)
+
+        def step(self, xyz, time_emb, labels):
+            return torch.zeros_like(xyz), torch.zeros_like(xyz[:, :4]), torch.zeros_like(xyz)
+
+        student_configs = [{"time_resolutions": [8]}]  # Nyquist = 4
+
+    deform = _HighFreqTeacher()
+    result = compute_sner_per_cluster(gaussians, deform, labels, n_clusters, n_time_samples=64)
+
+    sner = result["sner"][0]
+    rmse = result["distill_rmse"][0]
+    print(f"[TEST 8] SNER = {sner:.4f}, RMSE = {rmse:.6f}")
+    assert sner > 0.1, f"Expected SNER > 0.1 for high-freq teacher, got {sner}"
+    assert rmse > 0.0, f"Expected non-zero RMSE, got {rmse}"
+    print("[TEST 8] PASSED: high-frequency residual → high SNER.\n")
+
+
+# ---------------------------------------------------------------------------
+# Test 9: SNER — identical teacher & student → SNER ≈ 0
+# ---------------------------------------------------------------------------
+
+def test_sner_zero_residual() -> None:
+    """When teacher and student produce identical displacements, SNER and
+    RMSE should both be approximately zero."""
+    from utils.cluster_utils import compute_sner_per_cluster
+
+    N = 100
+    n_clusters = 1
+    labels = torch.zeros(N, dtype=torch.int32)
+    xyz = torch.randn(N, 3)
+    gaussians = _FakeGaussians(xyz)
+
+    class _IdenticalDeform:
+        def step_teacher(self, xyz, time_emb):
+            t = time_emb[:, 0]
+            d = 0.01 * torch.sin(2 * math.pi * 3.0 * t).unsqueeze(-1).expand_as(xyz)
+            return d, torch.zeros_like(xyz[:, :4]), torch.zeros_like(xyz)
+
+        def step(self, xyz, time_emb, labels):
+            t = time_emb[:, 0]
+            d = 0.01 * torch.sin(2 * math.pi * 3.0 * t).unsqueeze(-1).expand_as(xyz)
+            return d, torch.zeros_like(xyz[:, :4]), torch.zeros_like(xyz)
+
+        student_configs = [{"time_resolutions": [64]}]
+
+    deform = _IdenticalDeform()
+    result = compute_sner_per_cluster(gaussians, deform, labels, n_clusters, n_time_samples=64)
+
+    sner = result["sner"][0]
+    rmse = result["distill_rmse"][0]
+    print(f"[TEST 9] SNER = {sner:.6f}, RMSE = {rmse:.8f}")
+    assert sner < 1e-6, f"Expected SNER ≈ 0, got {sner}"
+    assert rmse < 1e-6, f"Expected RMSE ≈ 0, got {rmse}"
+    print("[TEST 9] PASSED: identical teacher & student → zero SNER.\n")
+
+
+# ---------------------------------------------------------------------------
+# Test 10: MLP effective rank — full-rank vs low-rank activations
+# ---------------------------------------------------------------------------
+
+def test_mlp_effective_rank() -> None:
+    """A student with diverse activations should have higher effective rank
+    than one producing near-constant outputs."""
+    from utils.cluster_utils import compute_mlp_effective_rank
+
+    N = 300
+    n_clusters = 2
+    labels = torch.cat([
+        torch.zeros(N // 2, dtype=torch.int32),
+        torch.ones(N // 2, dtype=torch.int32),
+    ])
+    xyz = torch.randn(N, 3)
+    gaussians = _FakeGaussians(xyz)
+
+    hidden_dim = 32
+
+    # Build a minimal mock ClusteredDeformModel with two students.
+    # Student 0: identity-like (diverse activations → high rank)
+    # Student 1: near-constant output (low rank)
+    import torch.nn as nn
+
+    class _MockDecoder(nn.Module):
+        def __init__(self, use_identity: bool) -> None:
+            super().__init__()
+            in_dim = 3 + 1  # xyz + time (simplified)
+            self.net = nn.Sequential(
+                nn.Linear(in_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 10),
+            )
+            if not use_identity:
+                # Collapse weights to produce near-constant output
+                with torch.no_grad():
+                    self.net[0].weight.zero_()
+                    self.net[0].bias.fill_(1.0)
+
+    class _MockStudent(nn.Module):
+        def __init__(self, use_identity: bool) -> None:
+            super().__init__()
+            self.decoder = _MockDecoder(use_identity)
+
+        def forward(self, xyz, time_emb):
+            x = torch.cat([xyz, time_emb], dim=-1)
+            return self.decoder.net(x)
+
+    class _MockClusteredDeform:
+        students = nn.ModuleList([
+            _MockStudent(use_identity=True),
+            _MockStudent(use_identity=False),
+        ])
+
+    deform = _MockClusteredDeform()
+    result = compute_mlp_effective_rank(deform, gaussians, labels, n_clusters,
+                                       n_time_samples=8, max_gaussians_per_cluster=200)
+
+    rank_diverse = result["effective_rank"][0]
+    rank_constant = result["effective_rank"][1]
+    util_diverse = result["utilisation"][0]
+    util_constant = result["utilisation"][1]
+
+    print(f"[TEST 10] Diverse student:  eff_rank={rank_diverse:.2f}, utilisation={util_diverse:.3f}")
+    print(f"[TEST 10] Constant student: eff_rank={rank_constant:.2f}, utilisation={util_constant:.3f}")
+
+    assert rank_diverse > rank_constant, (
+        f"Expected diverse ({rank_diverse:.2f}) > constant ({rank_constant:.2f})"
+    )
+    assert util_diverse > util_constant, (
+        f"Expected diverse utilisation ({util_diverse:.3f}) > constant ({util_constant:.3f})"
+    )
+    print("[TEST 10] PASSED: diverse activations → higher effective rank.\n")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -369,7 +524,10 @@ if __name__ == "__main__":
     test_independent_tiers()
     test_infer_configs_dual_tier()
     test_infer_configs_single_tier()
+    test_sner_high_residual()
+    test_sner_zero_residual()
+    test_mlp_effective_rank()
 
     print("=" * 60)
-    print("ALL TESTS PASSED")
+    print("ALL 10 TESTS PASSED")
     print("=" * 60)

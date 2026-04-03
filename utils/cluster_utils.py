@@ -1332,3 +1332,264 @@ def allocate_capacity_by_frequency(
         )
 
     return student_configs
+
+
+# ---------------------------------------------------------------------------
+# Capacity diagnostics: SNER & MLP effective rank
+# ---------------------------------------------------------------------------
+
+def compute_sner_per_cluster(
+    gaussians,
+    deform,
+    cluster_labels: torch.Tensor,
+    n_clusters: int,
+    n_time_samples: int = 64,
+) -> Dict[str, List[float]]:
+    """Compute Supra-Nyquist Energy Ratio (SNER) per cluster.
+
+    For each cluster *k*, the teacher and student displacement signals are
+    sampled along the time axis at ``n_time_samples`` uniform steps.  The
+    residual ``r_k(t) = teacher(t) − student(t)`` is Fourier-transformed
+    and the fraction of spectral energy above the student HexPlane's
+    Nyquist frequency is reported.
+
+    .. math::
+
+        \\text{SNER}_k = \\frac{\\sum_{f > f_{Ny}^{(k)}} |\\hat{r}_k(f)|^2}
+                              {\\sum_f |\\hat{r}_k(f)|^2}
+
+    Interpretation:
+      - **SNER ≈ 0** → HexPlane resolution is sufficient (residual is
+        low-frequency fitting error only).
+      - **SNER ≫ 0** → High-frequency aliasing; the student HexPlane
+        cannot represent fast motion that the teacher can.
+
+    Additionally computes the **per-cluster distillation RMSE** (L2 norm
+    of the residual) as a complementary overall-error metric.
+
+    Args:
+        gaussians: GaussianModel (provides ``get_xyz``).
+        deform: ``ClusteredDeformModel`` (must have ``step_teacher`` and ``step``).
+        cluster_labels: ``(N,)`` int32.
+        n_clusters: K.
+        n_time_samples: Must be ≥ 4.
+
+    Returns:
+        Dict with:
+          - ``"sner"``: List[float] of length K — SNER per cluster.
+          - ``"distill_rmse"``: List[float] of length K — RMSE per cluster.
+          - ``"nyquist_freq"``: List[float] — student Nyquist freq per cluster.
+    """
+    xyz = gaussians.get_xyz.detach()
+    N = xyz.shape[0]
+    T = n_time_samples
+    time_steps = torch.linspace(0, 1, T, device=xyz.device)
+
+    # ── Collect teacher & student displacements ──
+    teacher_disp: List[torch.Tensor] = []
+    student_disp: List[torch.Tensor] = []
+    with torch.no_grad():
+        for t_val in time_steps:
+            t_in = t_val.unsqueeze(0).expand(N, 1)
+            t_d_xyz, _, _ = deform.step_teacher(xyz, t_in)
+            s_d_xyz, _, _ = deform.step(xyz, t_in, cluster_labels)
+            if not torch.is_tensor(t_d_xyz):
+                t_d_xyz = torch.zeros_like(xyz)
+            if not torch.is_tensor(s_d_xyz):
+                s_d_xyz = torch.zeros_like(xyz)
+            teacher_disp.append(t_d_xyz)
+            student_disp.append(s_d_xyz)
+
+    t_disp = torch.stack(teacher_disp, dim=0)  # (T, N, 3)
+    s_disp = torch.stack(student_disp, dim=0)  # (T, N, 3)
+    residual = t_disp - s_disp                  # (T, N, 3)
+
+    # ── Determine per-cluster Nyquist frequency ──
+    student_configs = getattr(deform, "student_configs", None)
+
+    sner_list: List[float] = []
+    rmse_list: List[float] = []
+    nyquist_list: List[float] = []
+
+    for k in range(n_clusters):
+        mask = (cluster_labels == k)
+        count = int(mask.sum().item())
+        if count == 0:
+            sner_list.append(0.0)
+            rmse_list.append(0.0)
+            nyquist_list.append(0.0)
+            continue
+
+        # Cluster residual: (T, M_k, 3)
+        r_k = residual[:, mask, :]
+
+        # RMSE
+        rmse = float(r_k.pow(2).mean().sqrt().item())
+        rmse_list.append(rmse)
+
+        # Mean displacement residual across Gaussians: (T, 3)
+        r_mean = r_k.mean(dim=1)
+
+        # FFT along time axis for each spatial dim
+        r_fft = torch.fft.rfft(r_mean, dim=0)  # (T//2+1, 3)
+        power = r_fft.abs().pow(2)              # (T//2+1, 3)
+        total_power = float(power.sum().item())
+
+        # Nyquist frequency from student config
+        if student_configs is not None and k < len(student_configs):
+            time_res = student_configs[k].get("time_resolutions", [64])
+            f_ny = max(time_res) / 2.0
+        else:
+            f_ny = 64.0
+        nyquist_list.append(f_ny)
+
+        # Map f_ny to FFT bin index
+        ny_bin = int(min(f_ny, T // 2))
+        supra_power = float(power[ny_bin:].sum().item())
+
+        sner = supra_power / max(total_power, 1e-12)
+        sner_list.append(sner)
+
+    logger.info("[SNER] per-cluster SNER = %s", [f"{v:.4f}" for v in sner_list])
+    logger.info("[SNER] per-cluster RMSE = %s", [f"{v:.6f}" for v in rmse_list])
+
+    return {
+        "sner": sner_list,
+        "distill_rmse": rmse_list,
+        "nyquist_freq": nyquist_list,
+    }
+
+
+def compute_mlp_effective_rank(
+    deform,
+    gaussians,
+    cluster_labels: torch.Tensor,
+    n_clusters: int,
+    n_time_samples: int = 16,
+    max_gaussians_per_cluster: int = 5000,
+) -> Dict[str, List[float]]:
+    """Compute MLP effective rank (capacity utilisation) per student.
+
+    For each student MLP, we collect hidden-layer activations by running
+    a batch of cluster Gaussians through the network, then compute the
+    *effective rank* of the activation matrix via the SVD-based Shannon
+    entropy of the normalised singular-value spectrum:
+
+    .. math::
+
+        \\text{EffRank}(A) = \\exp\\!\\left(
+            -\\sum_i \\tilde{\\sigma}_i \\ln \\tilde{\\sigma}_i
+        \\right),
+        \\quad \\tilde{\\sigma}_i = \\frac{\\sigma_i}{\\sum_j \\sigma_j}
+
+    Interpretation:
+      - **utilisation ≈ 1.0** → MLP saturated, capacity likely insufficient.
+      - **utilisation 0.3–0.7** → healthy range.
+      - **utilisation ≈ 0** → severely over-provisioned.
+
+    Uses a forward hook on the first ReLU of ``HexPlaneMLPDecoder.net``
+    to capture activations without modifying model code.
+
+    Args:
+        deform: ``ClusteredDeformModel``.
+        gaussians: GaussianModel.
+        cluster_labels: ``(N,)`` int32.
+        n_clusters: K.
+        n_time_samples: Time steps sampled for activation collection.
+        max_gaussians_per_cluster: Cap per cluster to control SVD cost.
+
+    Returns:
+        Dict with:
+          - ``"effective_rank"``: List[float], K values.
+          - ``"utilisation"``: List[float], EffRank / hidden_dim.
+          - ``"hidden_dim"``: List[int].
+    """
+    import math as _math
+
+    xyz = gaussians.get_xyz.detach()
+    N = xyz.shape[0]
+    time_steps = torch.linspace(0, 1, n_time_samples, device=xyz.device)
+    students = deform.students
+
+    eff_rank_list: List[float] = []
+    util_list: List[float] = []
+    hdim_list: List[int] = []
+
+    for k in range(n_clusters):
+        mask = (cluster_labels == k)
+        count = int(mask.sum().item())
+        if count == 0:
+            eff_rank_list.append(0.0)
+            util_list.append(0.0)
+            hdim_list.append(0)
+            continue
+
+        student = students[k]
+        # Determine hidden dim from first Linear layer
+        first_linear = student.decoder.net[0]
+        hidden_dim = first_linear.out_features
+        hdim_list.append(hidden_dim)
+
+        # Sub-sample Gaussians if too many
+        cluster_indices = torch.where(mask)[0]
+        if count > max_gaussians_per_cluster:
+            perm = torch.randperm(count, device=xyz.device)[:max_gaussians_per_cluster]
+            cluster_indices = cluster_indices[perm]
+
+        cluster_xyz = xyz[cluster_indices]  # (M, 3)
+        M = cluster_xyz.shape[0]
+
+        # Register hook on first ReLU output (index 1 in Sequential)
+        activations: List[torch.Tensor] = []
+
+        def _hook_fn(module, input, output, store=activations):
+            store.append(output.detach())
+
+        hook_handle = student.decoder.net[1].register_forward_hook(_hook_fn)
+
+        try:
+            with torch.no_grad():
+                for t_val in time_steps:
+                    t_in = t_val.unsqueeze(0).expand(M, 1)
+                    student(cluster_xyz, t_in)
+        finally:
+            hook_handle.remove()
+
+        if not activations:
+            eff_rank_list.append(0.0)
+            util_list.append(0.0)
+            continue
+
+        # Stack activations: (n_time_samples * M, hidden_dim)
+        act_matrix = torch.cat(activations, dim=0).float()
+
+        # Compute effective rank via SVD
+        try:
+            singular_values = torch.linalg.svdvals(act_matrix)
+        except RuntimeError:
+            eff_rank_list.append(0.0)
+            util_list.append(0.0)
+            continue
+
+        sv_sum = singular_values.sum()
+        if sv_sum < 1e-12:
+            eff_rank_list.append(0.0)
+            util_list.append(0.0)
+            continue
+
+        p = singular_values / sv_sum
+        log_p = torch.log(p + 1e-12)
+        entropy = -float((p * log_p).sum().item())
+        eff_rank = float(_math.exp(entropy))
+
+        eff_rank_list.append(eff_rank)
+        util_list.append(eff_rank / max(hidden_dim, 1))
+
+    logger.info("[MLP-RANK] effective_rank = %s", [f"{v:.2f}" for v in eff_rank_list])
+    logger.info("[MLP-RANK] utilisation    = %s", [f"{v:.3f}" for v in util_list])
+
+    return {
+        "effective_rank": eff_rank_list,
+        "utilisation": util_list,
+        "hidden_dim": hdim_list,
+    }
