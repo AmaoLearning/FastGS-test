@@ -289,6 +289,71 @@ def test_independent_tiers() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Test 6: infer_student_configs_from_weights with dual-tier entries
+# ---------------------------------------------------------------------------
+
+def test_infer_configs_dual_tier() -> None:
+    """Verify that infer_student_configs_from_weights correctly reconstructs
+    student configs from dual-tier (frequency-based) weight filenames."""
+    from utils.cluster_utils import infer_student_configs_from_weights
+
+    config_path = os.path.join(_PROJECT_ROOT, "arguments", "capacity_tier_configs.json")
+    with open(config_path, "r") as f:
+        tier_configs = json.load(f)
+
+    n_clusters = 3
+    # Simulate cluster_tiers parsed from dual-tier filenames
+    cluster_tiers = {
+        0: {"hex_tier": "high", "mlp_tier": "low"},
+        1: {"hex_tier": "low", "mlp_tier": "high"},
+        2: {"hex_tier": "medium", "mlp_tier": "medium"},
+    }
+
+    configs = infer_student_configs_from_weights(cluster_tiers, n_clusters, tier_configs)
+
+    assert len(configs) == n_clusters
+    # Cluster 0: high hex → 3 spatial levels, low mlp → 64 hidden
+    assert len(configs[0]["spatial_resolutions"]) == 3, configs[0]["spatial_resolutions"]
+    assert configs[0]["mlp_hidden_dim"] == 64, configs[0]["mlp_hidden_dim"]
+    assert configs[0]["hex_tier"] == "high"
+    assert configs[0]["mlp_tier"] == "low"
+
+    # Cluster 1: low hex → 2 spatial levels, high mlp → 128 hidden
+    assert len(configs[1]["spatial_resolutions"]) == 2, configs[1]["spatial_resolutions"]
+    assert configs[1]["mlp_hidden_dim"] == 128, configs[1]["mlp_hidden_dim"]
+
+    print("[TEST 6] configs = ")
+    for k, cfg in enumerate(configs):
+        print(f"  cluster {k}: hex={cfg['hex_tier']}, mlp={cfg['mlp_tier']}, "
+              f"spatial={cfg['spatial_resolutions']}, mlp_hidden={cfg['mlp_hidden_dim']}")
+    print("[TEST 6] PASSED: dual-tier config inference works correctly.\n")
+
+
+# ---------------------------------------------------------------------------
+# Test 7: infer_student_configs_from_weights with single-tier entries (backward compat)
+# ---------------------------------------------------------------------------
+
+def test_infer_configs_single_tier() -> None:
+    """Verify backward compatibility: single-tier string entries still work."""
+    from utils.cluster_utils import infer_student_configs_from_weights
+
+    config_path = os.path.join(_PROJECT_ROOT, "arguments", "capacity_tier_configs.json")
+    with open(config_path, "r") as f:
+        tier_configs = json.load(f)
+
+    n_clusters = 3
+    cluster_tiers = {0: "high", 1: "medium", 2: "low"}
+
+    configs = infer_student_configs_from_weights(cluster_tiers, n_clusters, tier_configs)
+    assert len(configs) == n_clusters
+    assert configs[0]["tier"] == "high"
+    assert configs[1]["tier"] == "medium"
+    assert configs[2]["tier"] == "low"
+
+    print("[TEST 7] PASSED: single-tier config inference backward compatible.\n")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -302,6 +367,8 @@ if __name__ == "__main__":
     test_heterogeneity_ranking()
     test_allocate_capacity_format()
     test_independent_tiers()
+    test_infer_configs_dual_tier()
+    test_infer_configs_single_tier()
 
     print("=" * 60)
     print("ALL TESTS PASSED")

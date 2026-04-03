@@ -532,11 +532,13 @@ class ClusteredDeformModel:
     def save_weights(self, model_path: str, iteration: int) -> None:
         """Save all student model weights with tier labels from student_configs.
         
-        New format: deform/iteration_*/deform_cluster_{tier}_{id}.pth
-        where tier ∈ {high, medium, low}
+        Naming convention:
+        - Single-tier (tiered/linear strategy):
+            ``deform_cluster_{tier}_{id}.pth``
+        - Dual-tier (frequency strategy with independent HexPlane/MLP tiers):
+            ``deform_cluster_hex{hex_tier}_mlp{mlp_tier}_{id}.pth``
         
-        The tier label is read directly from each student's configuration
-        in student_configs["tier"], avoiding the need for inference.
+        The tier labels are read directly from each student's configuration.
         
         Args:
             model_path: Base model path.
@@ -550,29 +552,39 @@ class ClusteredDeformModel:
         for cluster_id, student in enumerate(self.students):
             if cluster_id < len(self.student_configs):
                 config = self.student_configs[cluster_id]
-                tier = config.get("tier", "unknown")  # Default to "unknown" if not specified
+                hex_tier = config.get("hex_tier", None)
+                mlp_tier = config.get("mlp_tier", None)
                 
-                weights_path = os.path.join(iter_dir, f"deform_cluster_{tier}_{cluster_id}.pth")
+                if hex_tier is not None and mlp_tier is not None:
+                    # Dual-tier naming for frequency-based allocation
+                    fname = f"deform_cluster_hex{hex_tier}_mlp{mlp_tier}_{cluster_id}.pth"
+                else:
+                    # Single-tier naming for tiered/linear allocation
+                    tier = config.get("tier", "unknown")
+                    fname = f"deform_cluster_{tier}_{cluster_id}.pth"
+                
+                weights_path = os.path.join(iter_dir, fname)
             else:
                 # Fallback to legacy format if config missing
                 weights_path = os.path.join(iter_dir, f"deform_cluster_{cluster_id}.pth")
-                tier = "unknown"
+                fname = os.path.basename(weights_path)
             
             torch.save(student.state_dict(), weights_path)
-            print(f"[INFO] Saved cluster {cluster_id} ({tier}) to {weights_path}")
+            print(f"[INFO] Saved cluster {cluster_id} → {fname}")
     
     def load_weights(self, model_path: str, iteration: int = -1) -> None:
         """Load all student model weights with tier-based naming.
         
-        Expected format: deform/iteration_*/deform_cluster_{tier}_{id}.pth
-        where tier ∈ {high, medium, low}
+        Supports two naming conventions:
+        - Single-tier: ``deform_cluster_{tier}_{id}.pth``
+        - Dual-tier:   ``deform_cluster_hex{hex_tier}_mlp{mlp_tier}_{id}.pth``
         
         Args:
             model_path: Base model path.
             iteration: Iteration to load (-1 for latest).
         
         Raises:
-            FileNotFoundError: If no tier-based weight files are found.
+            FileNotFoundError: If no weight files are found.
         """
         deform_dir = os.path.join(model_path, "deform")
         
@@ -597,30 +609,48 @@ class ClusteredDeformModel:
         if not os.path.isdir(iter_dir):
             raise FileNotFoundError(f"Cannot find deform weights directory at {iter_dir}")
         
-        # Scan directory for tier-based weight files
+        # Scan directory for weight files (both single-tier and dual-tier)
         import re
-        weight_pattern = re.compile(r"deform_cluster_(?P<tier>high|medium|low)_(?P<cluster_id>\d+)\.pth")
+        # Dual-tier: deform_cluster_hex{H}_mlp{M}_{id}.pth
+        dual_pattern = re.compile(
+            r"deform_cluster_hex(?P<hex_tier>high|medium|low)_mlp(?P<mlp_tier>high|medium|low)_(?P<cluster_id>\d+)\.pth"
+        )
+        # Single-tier: deform_cluster_{tier}_{id}.pth
+        single_pattern = re.compile(
+            r"deform_cluster_(?P<tier>high|medium|low)_(?P<cluster_id>\d+)\.pth"
+        )
         
-        tier_files = {}  # {cluster_id: [(tier, filepath), ...]}
+        tier_files: Dict[int, Dict] = {}  # {cluster_id: {"filepath": ..., ...}}
         
-        print(f"[INFO] Scanning {iter_dir} for tier-based student model weights...")
+        print(f"[INFO] Scanning {iter_dir} for student model weights...")
         
-        for filename in os.listdir(iter_dir):
-            match = weight_pattern.match(filename)
-            if match:
-                cluster_id = int(match.group("cluster_id"))
-                tier = match.group("tier")
-                filepath = os.path.join(iter_dir, filename)
-                
-                if cluster_id not in tier_files:
-                    tier_files[cluster_id] = []
-                tier_files[cluster_id].append((tier, filepath))
-                print(f"[INFO] Found: {filename} (cluster {cluster_id}, tier {tier})")
+        for filename in sorted(os.listdir(iter_dir)):
+            # Try dual-tier first (more specific pattern)
+            m = dual_pattern.match(filename)
+            if m:
+                cid = int(m.group("cluster_id"))
+                tier_files[cid] = {
+                    "filepath": os.path.join(iter_dir, filename),
+                    "hex_tier": m.group("hex_tier"),
+                    "mlp_tier": m.group("mlp_tier"),
+                }
+                print(f"[INFO] Found: {filename} (cluster {cid}, hex={m.group('hex_tier')}, mlp={m.group('mlp_tier')})")
+                continue
+            # Fall back to single-tier
+            m = single_pattern.match(filename)
+            if m:
+                cid = int(m.group("cluster_id"))
+                tier_files[cid] = {
+                    "filepath": os.path.join(iter_dir, filename),
+                    "tier": m.group("tier"),
+                }
+                print(f"[INFO] Found: {filename} (cluster {cid}, tier={m.group('tier')})")
         
         if not tier_files:
             raise FileNotFoundError(
-                f"No tier-based weight files found in {iter_dir}. "
-                f"Expected format: deform_cluster_{{high|medium|low}}_{{id}}.pth"
+                f"No student weight files found in {iter_dir}. "
+                f"Expected: deform_cluster_{{tier}}_{{id}}.pth or "
+                f"deform_cluster_hex{{H}}_mlp{{M}}_{{id}}.pth"
             )
         
         # Load weights into student models
@@ -632,10 +662,15 @@ class ClusteredDeformModel:
                 print(f"[WARNING] Cluster {cluster_id} exceeds student count ({len(self.students)}), skipping")
                 continue
             
-            for tier, filepath in tier_files[cluster_id]:
-                self.students[cluster_id].load_state_dict(torch.load(filepath))
-                print(f"[INFO] Loaded cluster {cluster_id} ({tier}) from {filepath}")
-                loaded_count += 1
+            info = tier_files[cluster_id]
+            filepath = info["filepath"]
+            self.students[cluster_id].load_state_dict(torch.load(filepath))
+            loaded_count += 1
+            
+            if "hex_tier" in info:
+                print(f"[INFO] Loaded cluster {cluster_id} (hex={info['hex_tier']}, mlp={info['mlp_tier']})")
+            else:
+                print(f"[INFO] Loaded cluster {cluster_id} (tier={info['tier']})")
         
         if loaded_count == 0:
             raise FileNotFoundError(f"Failed to load any student models from {iter_dir}")

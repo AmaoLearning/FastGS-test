@@ -423,15 +423,27 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
                     
                     if max_iter >= 0:
                         iter_dir = os.path.join(deform_dir, f"iteration_{max_iter}")
-                        # Parse weight filenames to infer tier for each cluster
-                        weight_pattern = re.compile(r"deform_cluster_(?P<tier>high|medium|low)_(?P<cluster_id>\d+)\.pth")
+                        # Parse weight filenames – support both single-tier and dual-tier naming
+                        dual_pattern = re.compile(
+                            r"deform_cluster_hex(?P<hex_tier>high|medium|low)_mlp(?P<mlp_tier>high|medium|low)_(?P<cluster_id>\d+)\.pth"
+                        )
+                        single_pattern = re.compile(
+                            r"deform_cluster_(?P<tier>high|medium|low)_(?P<cluster_id>\d+)\.pth"
+                        )
                         cluster_tiers = {}
-                        for filename in os.listdir(iter_dir):
-                            match = weight_pattern.match(filename)
-                            if match:
-                                cluster_id = int(match.group("cluster_id"))
-                                tier = match.group("tier")
-                                cluster_tiers[cluster_id] = tier
+                        for filename in sorted(os.listdir(iter_dir)):
+                            m = dual_pattern.match(filename)
+                            if m:
+                                cid = int(m.group("cluster_id"))
+                                cluster_tiers[cid] = {
+                                    "hex_tier": m.group("hex_tier"),
+                                    "mlp_tier": m.group("mlp_tier"),
+                                }
+                                continue
+                            m = single_pattern.match(filename)
+                            if m:
+                                cid = int(m.group("cluster_id"))
+                                cluster_tiers[cid] = m.group("tier")
                         
                         # Build student_configs list based on inferred tiers
                         student_configs = infer_student_configs_from_weights(

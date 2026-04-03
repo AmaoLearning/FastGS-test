@@ -997,38 +997,104 @@ def render_capacity_pseudocolor(
 
 
 def infer_student_configs_from_weights(
-    cluster_tiers: Dict[int, str],
+    cluster_tiers: Dict[int, object],
     n_clusters: int,
     capacity_tier_configs: Optional[Dict] = None,
 ) -> List[Dict]:
     """Infer student configs from weight file tier labels.
     
     This function reconstructs the student configuration list by parsing
-    tier labels (high/medium/low) from weight filenames.
+    tier labels from weight filenames.  It supports two conventions:
+    
+    * **Single-tier** (tiered/linear strategy):
+        ``cluster_tiers[id] = "high"`` – a plain string looked up in
+        ``capacity_tier_configs["tiered"]["tiers"]``.
+    * **Dual-tier** (frequency strategy):
+        ``cluster_tiers[id] = {"hex_tier": "high", "mlp_tier": "low"}`` – a
+        dict whose HexPlane and MLP tiers are looked up independently in
+        ``capacity_tier_configs["frequency_based"]``.
     
     Args:
-        cluster_tiers: Dict mapping cluster_id to tier label (e.g., {0: 'high', 1: 'medium'}).
+        cluster_tiers: Dict mapping cluster_id to *either* a tier string
+            **or** a ``{"hex_tier": ..., "mlp_tier": ...}`` dict.
         n_clusters: Total number of clusters.
-        capacity_tier_configs: Predefined tier configurations from JSON.
+        capacity_tier_configs: Full JSON config (must contain ``"tiered"``
+            and/or ``"frequency_based"`` keys).
     
     Returns:
         List of student configs, one per cluster.
     """
-    # Default tier configs if not provided
-    if capacity_tier_configs is None or "tiered" not in capacity_tier_configs:
-        raise ValueError("[ERROR] capacity tier configs NOT FOUND!")
-    else:
-        # Use tier configs from JSON
-        default_tiers = capacity_tier_configs["tiered"]["tiers"]
-    
-    # Build student configs list
+    if capacity_tier_configs is None:
+        raise ValueError("[ERROR] capacity_tier_configs is None!")
+
+    # Detect whether any entry uses dual-tier (frequency) format
+    has_freq = any(
+        isinstance(v, dict) for v in cluster_tiers.values()
+    )
+
+    if has_freq:
+        # ── Frequency-based dual-tier reconstruction ──
+        if "frequency_based" not in capacity_tier_configs:
+            raise ValueError(
+                "[ERROR] Dual-tier weight filenames detected but "
+                "'frequency_based' section missing from capacity_tier_configs.json"
+            )
+        fb_cfg = capacity_tier_configs["frequency_based"]
+        hex_tiers_cfg = fb_cfg["hex_tiers"]
+        mlp_tiers_cfg = fb_cfg["mlp_tiers"]
+
+        student_configs: List[Dict] = []
+        for cluster_id in range(n_clusters):
+            entry = cluster_tiers.get(cluster_id)
+            if entry is not None and isinstance(entry, dict):
+                h_tier = entry.get("hex_tier", "medium")
+                m_tier = entry.get("mlp_tier", "medium")
+                h_cfg = hex_tiers_cfg.get(h_tier, hex_tiers_cfg["medium"])
+                m_cfg = mlp_tiers_cfg.get(m_tier, mlp_tiers_cfg["medium"])
+
+                config = {
+                    "spatial_resolutions": list(h_cfg["spatial_resolutions"]),
+                    "time_resolutions": list(h_cfg["time_resolutions"]),
+                    "feat_dim": h_cfg["feat_dim"],
+                    "mlp_hidden_dim": m_cfg["mlp_hidden_dim"],
+                    "mlp_layer_num": m_cfg.get("mlp_layer_num", 2),
+                    "hex_tier": h_tier,
+                    "mlp_tier": m_tier,
+                    "tier": h_tier,  # backward-compat label
+                }
+                student_configs.append(config)
+            else:
+                # Fallback: treat as single tier string
+                tier = entry if isinstance(entry, str) else "medium"
+                h_cfg = hex_tiers_cfg.get(tier, hex_tiers_cfg["medium"])
+                m_cfg = mlp_tiers_cfg.get(tier, mlp_tiers_cfg["medium"])
+                config = {
+                    "spatial_resolutions": list(h_cfg["spatial_resolutions"]),
+                    "time_resolutions": list(h_cfg["time_resolutions"]),
+                    "feat_dim": h_cfg["feat_dim"],
+                    "mlp_hidden_dim": m_cfg["mlp_hidden_dim"],
+                    "mlp_layer_num": m_cfg.get("mlp_layer_num", 2),
+                    "hex_tier": tier,
+                    "mlp_tier": tier,
+                    "tier": tier,
+                }
+                student_configs.append(config)
+                print(f"[WARNING] Cluster {cluster_id}: missing dual-tier info, "
+                      f"falling back to '{tier}' for both")
+        return student_configs
+
+    # ── Single-tier reconstruction (original tiered / linear) ──
+    if "tiered" not in capacity_tier_configs:
+        raise ValueError("[ERROR] 'tiered' section not found in capacity_tier_configs!")
+    default_tiers = capacity_tier_configs["tiered"]["tiers"]
+
     student_configs = []
     for cluster_id in range(n_clusters):
         if cluster_id in cluster_tiers:
             tier = cluster_tiers[cluster_id]
             if tier in default_tiers:
                 config = default_tiers[tier].copy()
-                config["tier"] = tier  # Preserve tier label for saving
+                config["tier"] = tier
                 student_configs.append(config)
             else:
                 print(f"[WARNING] Unknown tier '{tier}' for cluster {cluster_id}, using medium config")
