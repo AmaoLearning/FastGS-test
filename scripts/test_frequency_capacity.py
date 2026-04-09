@@ -206,7 +206,8 @@ def test_heterogeneity_ranking() -> None:
 
 def test_allocate_capacity_format() -> None:
     """Verify that allocate_capacity_by_frequency produces configs compatible
-    with ClusteredDeformModel.__init__ (required keys present, correct types)."""
+    with ClusteredDeformModel.__init__ (required keys present, correct types).
+    MLP hidden dim is derived from hex tier (no independent MLP axis)."""
     config_path = os.path.join(_PROJECT_ROOT, "arguments", "capacity_tier_configs.json")
     with open(config_path, "r") as f:
         tier_configs = json.load(f)
@@ -231,11 +232,15 @@ def test_allocate_capacity_format() -> None:
         assert isinstance(cfg["feat_dim"], int)
         assert isinstance(cfg["mlp_hidden_dim"], int)
         assert cfg["hex_tier"] in ("high", "medium", "low")
-        assert cfg["mlp_tier"] in ("high", "medium", "low")
+        # MLP tier mirrors hex tier (derived, not independent)
+        assert cfg["mlp_tier"] == cfg["hex_tier"], (
+            f"Cluster {k}: mlp_tier should mirror hex_tier, "
+            f"got mlp_tier={cfg['mlp_tier']}, hex_tier={cfg['hex_tier']}"
+        )
 
     print(f"[TEST 4] configs = ")
     for k, cfg in enumerate(configs):
-        print(f"  cluster {k}: hex={cfg['hex_tier']}, mlp={cfg['mlp_tier']}, "
+        print(f"  cluster {k}: hex={cfg['hex_tier']}, "
               f"spatial={cfg['spatial_resolutions']}, feat={cfg['feat_dim']}, "
               f"mlp_hidden={cfg['mlp_hidden_dim']}")
 
@@ -245,12 +250,6 @@ def test_allocate_capacity_format() -> None:
         f"Cluster {max_tc_idx} has highest complexity but hex_tier={configs[max_tc_idx]['hex_tier']}"
     )
 
-    # The cluster with highest heterogeneity should get mlp_tier=high
-    max_het_idx = het.index(max(het))
-    assert configs[max_het_idx]["mlp_tier"] == "high", (
-        f"Cluster {max_het_idx} has highest heterogeneity but mlp_tier={configs[max_het_idx]['mlp_tier']}"
-    )
-
     print("[TEST 4] PASSED: output format correct & tier ranking consistent.\n")
 
 
@@ -258,34 +257,47 @@ def test_allocate_capacity_format() -> None:
 # Test 5: Independent tier assignment (high hex + low mlp is possible)
 # ---------------------------------------------------------------------------
 
-def test_independent_tiers() -> None:
-    """Demonstrate that HexPlane and MLP tiers can be assigned independently,
-    producing combinations like High HexPlane + Low MLP."""
+def test_derived_mlp_from_hex() -> None:
+    """MLP hidden dim is derived from hex tier's decoder input dim.
+    Verify: mlp_hidden = ceil(decoder_in × 0.5) for each hex tier."""
 
     config_path = os.path.join(_PROJECT_ROOT, "arguments", "capacity_tier_configs.json")
     with open(config_path, "r") as f:
         tier_configs = json.load(f)
 
     n_clusters = 3
-    # Cluster 0: high freq, low heterogeneity  → High Hex + Low MLP
-    # Cluster 1: low freq, high heterogeneity  → Low Hex + High MLP
-    # Cluster 2: medium both                   → Medium Hex + Medium MLP
+    # Cluster 0: highest complexity → hex=high
+    # Cluster 1: lowest complexity  → hex=low
+    # Cluster 2: medium             → hex=medium
     tc = [0.9, 0.1, 0.5]
-    het = [0.1, 0.9, 0.5]
+    het = [0.1, 0.9, 0.5]  # heterogeneity should NOT affect MLP
 
     configs = allocate_capacity_by_frequency(tc, het, n_clusters, tier_configs)
 
-    print(f"[TEST 5] Independent tier allocation:")
-    for k, cfg in enumerate(configs):
-        print(f"  cluster {k}: hex_tier={cfg['hex_tier']}, mlp_tier={cfg['mlp_tier']}")
+    # Expected derived MLP hidden dims (ratio=0.5):
+    #   high:   ceil((3*6*12 + 76) * 0.5) = ceil(292 * 0.5) = 146
+    #   low:    ceil((2*6*4  + 76) * 0.5) = ceil(124 * 0.5) = 62
+    #   medium: ceil((3*6*8  + 76) * 0.5) = ceil(220 * 0.5) = 110
+    expected = {
+        "high": math.ceil(292 * 0.5),    # 146
+        "medium": math.ceil(220 * 0.5),  # 110
+        "low": math.ceil(124 * 0.5),     # 62
+    }
 
-    assert configs[0]["hex_tier"] == "high" and configs[0]["mlp_tier"] == "low", (
-        f"Cluster 0 expected (high, low), got ({configs[0]['hex_tier']}, {configs[0]['mlp_tier']})"
-    )
-    assert configs[1]["hex_tier"] == "low" and configs[1]["mlp_tier"] == "high", (
-        f"Cluster 1 expected (low, high), got ({configs[1]['hex_tier']}, {configs[1]['mlp_tier']})"
-    )
-    print("[TEST 5] PASSED: independent tier assignment works correctly.\n")
+    print(f"[TEST 5] Derived MLP from hex tier:")
+    for k, cfg in enumerate(configs):
+        h = cfg["hex_tier"]
+        print(f"  cluster {k}: hex_tier={h}, mlp_hidden={cfg['mlp_hidden_dim']} (expected={expected[h]})")
+        assert cfg["mlp_tier"] == h, (
+            f"Cluster {k}: mlp_tier should equal hex_tier, "
+            f"got mlp_tier={cfg['mlp_tier']}, hex_tier={h}"
+        )
+        assert cfg["mlp_hidden_dim"] == expected[h], (
+            f"Cluster {k}: hex={h} → expected mlp_hidden={expected[h]}, "
+            f"got {cfg['mlp_hidden_dim']}"
+        )
+
+    print("[TEST 5] PASSED: MLP hidden dim correctly derived from hex tier.\n")
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +306,9 @@ def test_independent_tiers() -> None:
 
 def test_infer_configs_dual_tier() -> None:
     """Verify that infer_student_configs_from_weights correctly reconstructs
-    student configs from dual-tier (frequency-based) weight filenames."""
+    student configs from dual-tier (frequency-based) weight filenames.
+    MLP hidden dim should be derived from hex tier, ignoring the mlp_tier
+    in the filename."""
     from utils.cluster_utils import infer_student_configs_from_weights
 
     config_path = os.path.join(_PROJECT_ROOT, "arguments", "capacity_tier_configs.json")
@@ -303,6 +317,7 @@ def test_infer_configs_dual_tier() -> None:
 
     n_clusters = 3
     # Simulate cluster_tiers parsed from dual-tier filenames
+    # (old files may have different mlp_tier; inference should derive from hex)
     cluster_tiers = {
         0: {"hex_tier": "high", "mlp_tier": "low"},
         1: {"hex_tier": "low", "mlp_tier": "high"},
@@ -311,22 +326,28 @@ def test_infer_configs_dual_tier() -> None:
 
     configs = infer_student_configs_from_weights(cluster_tiers, n_clusters, tier_configs)
 
+    # Expected derived MLP hidden (ratio=0.5):
+    #   high → ceil(292 * 0.5) = 146,  low → ceil(124 * 0.5) = 62,  medium → ceil(220 * 0.5) = 110
     assert len(configs) == n_clusters
-    # Cluster 0: high hex → 3 spatial levels, low mlp → 64 hidden
+    # Cluster 0: high hex → 3 spatial levels, derived mlp_hidden=146
     assert len(configs[0]["spatial_resolutions"]) == 3, configs[0]["spatial_resolutions"]
-    assert configs[0]["mlp_hidden_dim"] == 64, configs[0]["mlp_hidden_dim"]
+    assert configs[0]["mlp_hidden_dim"] == 146, (
+        f"Cluster 0: hex=high → expected mlp_hidden=146, got {configs[0]['mlp_hidden_dim']}"
+    )
     assert configs[0]["hex_tier"] == "high"
-    assert configs[0]["mlp_tier"] == "low"
+    assert configs[0]["mlp_tier"] == "high"  # mirrors hex tier
 
-    # Cluster 1: low hex → 2 spatial levels, high mlp → 128 hidden
+    # Cluster 1: low hex → 2 spatial levels, derived mlp_hidden=62
     assert len(configs[1]["spatial_resolutions"]) == 2, configs[1]["spatial_resolutions"]
-    assert configs[1]["mlp_hidden_dim"] == 128, configs[1]["mlp_hidden_dim"]
+    assert configs[1]["mlp_hidden_dim"] == 62, (
+        f"Cluster 1: hex=low → expected mlp_hidden=62, got {configs[1]['mlp_hidden_dim']}"
+    )
 
     print("[TEST 6] configs = ")
     for k, cfg in enumerate(configs):
-        print(f"  cluster {k}: hex={cfg['hex_tier']}, mlp={cfg['mlp_tier']}, "
+        print(f"  cluster {k}: hex={cfg['hex_tier']}, mlp_tier={cfg['mlp_tier']}, "
               f"spatial={cfg['spatial_resolutions']}, mlp_hidden={cfg['mlp_hidden_dim']}")
-    print("[TEST 6] PASSED: dual-tier config inference works correctly.\n")
+    print("[TEST 6] PASSED: dual-tier config inference with derived MLP works correctly.\n")
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +530,47 @@ def test_mlp_effective_rank() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Test 11: MLP hidden dim floor — high hex + low mlp must be bumped
+# ---------------------------------------------------------------------------
+
+def test_mlp_derived_custom_ratio() -> None:
+    """Verify that mlp_ratio parameter correctly scales the derived MLP hidden dim.
+    With ratio=0.75, mlp_hidden should be ceil(decoder_in × 0.75)."""
+    config_path = os.path.join(_PROJECT_ROOT, "arguments", "capacity_tier_configs.json")
+    with open(config_path, "r") as f:
+        tier_configs = json.load(f)
+
+    n_clusters = 3
+    tc = [0.9, 0.1, 0.5]
+    het = [0.1, 0.9, 0.5]
+
+    configs = allocate_capacity_by_frequency(
+        tc, het, n_clusters, tier_configs, mlp_ratio=0.75,
+    )
+
+    # Expected with ratio=0.75:
+    #   high:   ceil(292 * 0.75) = ceil(219.0) = 219
+    #   low:    ceil(124 * 0.75) = ceil(93.0) = 93
+    #   medium: ceil(220 * 0.75) = ceil(165.0) = 165
+    expected = {
+        "high": math.ceil(292 * 0.75),    # 219
+        "medium": math.ceil(220 * 0.75),  # 165
+        "low": math.ceil(124 * 0.75),     # 93
+    }
+
+    print(f"[TEST 11] Derived MLP with ratio=0.75:")
+    for k, cfg in enumerate(configs):
+        h = cfg["hex_tier"]
+        print(f"  cluster {k}: hex_tier={h}, mlp_hidden={cfg['mlp_hidden_dim']} (expected={expected[h]})")
+        assert cfg["mlp_hidden_dim"] == expected[h], (
+            f"Cluster {k}: hex={h}, ratio=0.75 → expected {expected[h]}, "
+            f"got {cfg['mlp_hidden_dim']}"
+        )
+
+    print("[TEST 11] PASSED: custom mlp_ratio correctly applied.\n")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -521,13 +583,14 @@ if __name__ == "__main__":
     test_constant_velocity_zero_complexity()
     test_heterogeneity_ranking()
     test_allocate_capacity_format()
-    test_independent_tiers()
+    test_derived_mlp_from_hex()
     test_infer_configs_dual_tier()
     test_infer_configs_single_tier()
     test_sner_high_residual()
     test_sner_zero_residual()
     test_mlp_effective_rank()
+    test_mlp_derived_custom_ratio()
 
     print("=" * 60)
-    print("ALL 10 TESTS PASSED")
+    print("ALL 11 TESTS PASSED")
     print("=" * 60)

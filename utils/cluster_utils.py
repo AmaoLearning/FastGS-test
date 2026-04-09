@@ -1033,7 +1033,7 @@ def infer_student_configs_from_weights(
     )
 
     if has_freq:
-        # ── Frequency-based dual-tier reconstruction ──
+        # ── Frequency-based reconstruction (MLP derived from hex tier) ──
         if "frequency_based" not in capacity_tier_configs:
             raise ValueError(
                 "[ERROR] Dual-tier weight filenames detected but "
@@ -1041,46 +1041,45 @@ def infer_student_configs_from_weights(
             )
         fb_cfg = capacity_tier_configs["frequency_based"]
         hex_tiers_cfg = fb_cfg["hex_tiers"]
-        mlp_tiers_cfg = fb_cfg["mlp_tiers"]
+        mlp_ratio = fb_cfg.get("mlp_ratio", 0.5)
+
+        # PE output dimensions (must match allocate_capacity_by_frequency)
+        _xyz_pe_dim = (1 + 2 * 10) * 3   # 63
+        _t_pe_dim = (1 + 2 * 6) * 1      # 13
+        _pe_dim = _xyz_pe_dim + _t_pe_dim  # 76
+
+        def _derive_mlp_hidden(h_cfg: Dict) -> int:
+            n_levels = len(h_cfg["spatial_resolutions"])
+            hex_out = n_levels * 6 * h_cfg["feat_dim"]
+            decoder_in = hex_out + _pe_dim
+            return -(-int(decoder_in * mlp_ratio) // 1)  # ceil
 
         student_configs: List[Dict] = []
         for cluster_id in range(n_clusters):
             entry = cluster_tiers.get(cluster_id)
             if entry is not None and isinstance(entry, dict):
                 h_tier = entry.get("hex_tier", "medium")
-                m_tier = entry.get("mlp_tier", "medium")
-                h_cfg = hex_tiers_cfg.get(h_tier, hex_tiers_cfg["medium"])
-                m_cfg = mlp_tiers_cfg.get(m_tier, mlp_tiers_cfg["medium"])
-
-                config = {
-                    "spatial_resolutions": list(h_cfg["spatial_resolutions"]),
-                    "time_resolutions": list(h_cfg["time_resolutions"]),
-                    "feat_dim": h_cfg["feat_dim"],
-                    "mlp_hidden_dim": m_cfg["mlp_hidden_dim"],
-                    "mlp_layer_num": m_cfg.get("mlp_layer_num", 2),
-                    "hex_tier": h_tier,
-                    "mlp_tier": m_tier,
-                    "tier": h_tier,  # backward-compat label
-                }
-                student_configs.append(config)
+            elif entry is not None and isinstance(entry, str):
+                h_tier = entry
             else:
-                # Fallback: treat as single tier string
-                tier = entry if isinstance(entry, str) else "medium"
-                h_cfg = hex_tiers_cfg.get(tier, hex_tiers_cfg["medium"])
-                m_cfg = mlp_tiers_cfg.get(tier, mlp_tiers_cfg["medium"])
-                config = {
-                    "spatial_resolutions": list(h_cfg["spatial_resolutions"]),
-                    "time_resolutions": list(h_cfg["time_resolutions"]),
-                    "feat_dim": h_cfg["feat_dim"],
-                    "mlp_hidden_dim": m_cfg["mlp_hidden_dim"],
-                    "mlp_layer_num": m_cfg.get("mlp_layer_num", 2),
-                    "hex_tier": tier,
-                    "mlp_tier": tier,
-                    "tier": tier,
-                }
-                student_configs.append(config)
-                print(f"[WARNING] Cluster {cluster_id}: missing dual-tier info, "
-                      f"falling back to '{tier}' for both")
+                h_tier = "medium"
+                print(f"[WARNING] Cluster {cluster_id}: missing tier info, "
+                      f"falling back to 'medium'")
+
+            h_cfg = hex_tiers_cfg.get(h_tier, hex_tiers_cfg["medium"])
+            mlp_hidden_dim = _derive_mlp_hidden(h_cfg)
+
+            config = {
+                "spatial_resolutions": list(h_cfg["spatial_resolutions"]),
+                "time_resolutions": list(h_cfg["time_resolutions"]),
+                "feat_dim": h_cfg["feat_dim"],
+                "mlp_hidden_dim": mlp_hidden_dim,
+                "mlp_layer_num": 2,
+                "hex_tier": h_tier,
+                "mlp_tier": h_tier,  # mirrors hex tier (derived)
+                "tier": h_tier,
+            }
+            student_configs.append(config)
         return student_configs
 
     # ── Single-tier reconstruction (original tiered / linear) ──
@@ -1232,29 +1231,37 @@ def allocate_capacity_by_frequency(
     n_clusters: int,
     capacity_tier_configs: Dict,
     strategy: str = "independent_tiered",
+    mlp_ratio: float = 0.5,
 ) -> List[Dict]:
-    """Frequency-driven capacity allocation (independent HexPlane / MLP tiers).
+    """Frequency-driven capacity allocation (HexPlane tier → derived MLP).
 
-    Unlike :func:`allocate_capacity_by_score` which uses a single dynamic-score
-    ranking for all parameters, this function ranks clusters independently:
+    HexPlane resolution tier is determined by ``temporal_complexity`` ranking.
+    MLP hidden dim is **derived** from the HexPlane tier's decoder input
+    dimensionality:
 
-    * **HexPlane resolution tier** ← ``temporal_complexity`` ranking
-      (high-frequency motion needs higher Nyquist bandwidth)
-    * **MLP hidden width tier** ← ``heterogeneity`` ranking
-      (diverse intra-cluster motion needs more expressive decoder)
+        ``mlp_hidden = ceil(decoder_in_dim × mlp_ratio)``
 
-    This decoupling allows combinations such as *High HexPlane + Low MLP*
-    (fast but uniform motion) or *Low HexPlane + High MLP* (slow but diverse
-    motion) that were impossible with the old single-score scheme.
+    where ``decoder_in_dim = num_levels × 6 × feat_dim + PE_dim``.
+
+    This single-axis design reflects the empirical finding that the decoder
+    input dimensionality (driven by HexPlane output width) dominates MLP
+    capacity requirements, making an independent heterogeneity-based MLP
+    tier redundant.
+
+    .. note::
+
+        ``heterogeneity`` is still accepted for diagnostic logging but no
+        longer affects allocation.
 
     Args:
         temporal_complexity: Per-cluster Metric A values.
-        heterogeneity: Per-cluster Metric B values.
+        heterogeneity: Per-cluster Metric B values (logged only).
         n_clusters: Number of clusters K.
         capacity_tier_configs: Full JSON config dict (must contain
             ``"frequency_based"`` key).
-        strategy: ``"independent_tiered"`` (recommended) — HexPlane and MLP
-            tiers assigned independently.
+        strategy: ``"independent_tiered"`` (only supported value).
+        mlp_ratio: Ratio of ``decoder_in_dim`` used as MLP hidden width.
+            Default ``0.5`` (2:1 compression).
 
     Returns:
         ``student_configs``: list of K dicts, each compatible with
@@ -1268,7 +1275,6 @@ def allocate_capacity_by_frequency(
 
     fb_cfg = capacity_tier_configs["frequency_based"]
     hex_tiers_cfg = fb_cfg["hex_tiers"]
-    mlp_tiers_cfg = fb_cfg["mlp_tiers"]
 
     n_high = max(1, n_clusters // 3)
 
@@ -1287,48 +1293,46 @@ def allocate_capacity_by_frequency(
         else:
             hex_tier[cid] = "low"
 
-    # ── MLP tier by heterogeneity (descending) ──
-    mlp_sorted = sorted(
-        range(n_clusters),
-        key=lambda i: heterogeneity[i],
-        reverse=True,
-    )
-    mlp_tier: Dict[int, str] = {}
-    for rank, cid in enumerate(mlp_sorted):
-        if rank < n_high:
-            mlp_tier[cid] = "high"
-        elif rank < 2 * n_high:
-            mlp_tier[cid] = "medium"
-        else:
-            mlp_tier[cid] = "low"
-
     # ── Compose student configs ──
+    # PE output dimensions (fixed across all students, matching HexPlaneDeformNetwork defaults)
+    _xyz_pe_dim = (1 + 2 * 10) * 3   # 63  (multires=10, include_input)
+    _t_pe_dim = (1 + 2 * 6) * 1      # 13  (multires=6 for blender default)
+    _pe_dim = _xyz_pe_dim + _t_pe_dim  # 76
+
     student_configs: List[Dict] = []
     for k in range(n_clusters):
         h_tier = hex_tier[k]
-        m_tier = mlp_tier[k]
         h_cfg = hex_tiers_cfg[h_tier]
-        m_cfg = mlp_tiers_cfg[m_tier]
+
+        # Derive MLP hidden dim from decoder input dimensionality:
+        #   hex_out = num_levels × 6 × feat_dim  (concat fusion)
+        #   decoder_in = hex_out + xyz_PE + t_PE
+        #   mlp_hidden = ceil(decoder_in × mlp_ratio)
+        n_levels = len(h_cfg["spatial_resolutions"])
+        feat_dim = h_cfg["feat_dim"]
+        hex_out_dim = n_levels * 6 * feat_dim
+        decoder_in_dim = hex_out_dim + _pe_dim
+        mlp_hidden_dim = -(-int(decoder_in_dim * mlp_ratio) // 1)  # ceil
 
         config = {
             "spatial_resolutions": list(h_cfg["spatial_resolutions"]),
             "time_resolutions": list(h_cfg["time_resolutions"]),
-            "feat_dim": h_cfg["feat_dim"],
-            "mlp_hidden_dim": m_cfg["mlp_hidden_dim"],
-            "mlp_layer_num": m_cfg.get("mlp_layer_num", 2),
+            "feat_dim": feat_dim,
+            "mlp_hidden_dim": mlp_hidden_dim,
+            "mlp_layer_num": 2,
             "hex_tier": h_tier,
-            "mlp_tier": m_tier,
-            "tier": h_tier,  # backward-compat: use HexPlane tier as overall label
+            "mlp_tier": h_tier,  # MLP tier mirrors hex tier (derived)
+            "tier": h_tier,      # backward-compat label
         }
         student_configs.append(config)
 
         logger.info(
-            "[FREQ-CAPACITY] Cluster %d: hex_tier=%s (complexity=%.6f), "
-            "mlp_tier=%s (heterogeneity=%.6f) → spatial=%s, feat=%d, mlp_hidden=%d",
-            k, h_tier, temporal_complexity[k],
-            m_tier, heterogeneity[k],
+            "[FREQ-CAPACITY] Cluster %d: hex_tier=%s (complexity=%.6f, "
+            "heterogeneity=%.6f) → spatial=%s, feat=%d, "
+            "decoder_in=%d, mlp_hidden=%d (ratio=%.2f)",
+            k, h_tier, temporal_complexity[k], heterogeneity[k],
             config["spatial_resolutions"], config["feat_dim"],
-            config["mlp_hidden_dim"],
+            decoder_in_dim, mlp_hidden_dim, mlp_ratio,
         )
 
     return student_configs
