@@ -69,7 +69,7 @@ class ModelParams(ParamGroup):
         self.hex_spatial_res = "64,128,256"
         self.hex_time_res = "64,128,256"
         self.hex_feat_dim = 16
-        self.hex_mlp_hidden = 128
+        self.hex_mlp_hidden = 162
         self.hex_mlp_layers = 2
         self.hex_fusion = "concat"
 
@@ -94,7 +94,7 @@ class ModelParams(ParamGroup):
         
         # Clustered multi-deform model (teacher-student distillation)
         self.clustered_deform_start_iter = 15000  # 多形变场训练起始轮次
-        self.teacher_checkpoint_path = ""  # 预训练教师模型权重路径（必须手动设置）
+        self.teacher_checkpoint_path = ""  # 外部预训练教师模型权重路径（可选；为空则使用当前训练中的形变场作为教师）
         
         # Student model architecture parameters (for clustered deform model)
         self.student_feat_dim = 8  # Student HexPlane feature dimension (default: 8)

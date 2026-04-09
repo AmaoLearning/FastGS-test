@@ -384,8 +384,19 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         _deform_type = dataset.deform_type
         
-        # Detect if using clustered deform model
-        _use_clustered = bool(dataset.teacher_checkpoint_path)
+        # Detect if using clustered deform model by scanning saved weight files.
+        # This is more robust than relying on CLI args which may not be passed at render time.
+        _use_clustered = False
+        if _deform_type == "4dgs":
+            import re as _re, glob as _glob
+            _deform_dir = os.path.join(dataset.model_path, "deform")
+            if os.path.isdir(_deform_dir):
+                # Check any iteration directory for deform_cluster_*.pth files
+                for _dname in os.listdir(_deform_dir):
+                    _iter_dir = os.path.join(_deform_dir, _dname)
+                    if os.path.isdir(_iter_dir) and _glob.glob(os.path.join(_iter_dir, "deform_cluster_*.pth")):
+                        _use_clustered = True
+                        break
         
         if _deform_type == "4dgs":
             _s_res = tuple(int(x) for x in dataset.hex_spatial_res.split(","))

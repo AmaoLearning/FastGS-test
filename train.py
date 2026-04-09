@@ -274,26 +274,25 @@ def run_clustering_at_iteration(
         fusion=dataset.hex_fusion,
     )
     
-    # Load pre-trained teacher weights (REQUIRED - must be manually set)
+    # Load teacher weights — prefer external checkpoint if provided,
+    # otherwise copy from the in-training deform model.
     teacher_checkpoint = dataset.teacher_checkpoint_path
-    if not teacher_checkpoint:
-        raise ValueError(
-            "[ERROR] teacher_checkpoint_path is required for clustered deform model. "
-            "Please set --teacher_checkpoint_path /path/to/deform.pth"
-        )
-    
-    if not os.path.exists(teacher_checkpoint):
+    if teacher_checkpoint and os.path.exists(teacher_checkpoint):
+        # External pre-trained checkpoint (backward compatible)
+        clustered_deform.teacher.load_state_dict(torch.load(teacher_checkpoint))
+        logger.info("[ITER %d] Loaded teacher weights from checkpoint: %s", iteration, teacher_checkpoint)
+        print(f"[INFO] Loaded teacher weights from checkpoint: {teacher_checkpoint}")
+    elif teacher_checkpoint and not os.path.exists(teacher_checkpoint):
         raise FileNotFoundError(
             f"[ERROR] Teacher checkpoint not found: {teacher_checkpoint}\n"
             "Please check the path and ensure the pre-trained weights exist."
         )
-    
-    # Load teacher weights
-    clustered_deform.teacher.load_state_dict(torch.load(teacher_checkpoint))
-    clustered_deform.teacher.eval()  # Ensure teacher is in eval mode (frozen)
-    
-    logger.info("[ITER %d] Loaded teacher weights from %s", iteration, teacher_checkpoint)
-    print(f"[INFO] Loaded teacher weights from: {teacher_checkpoint}")
+    else:
+        # No external checkpoint — use the in-training deform model
+        clustered_deform.teacher.load_state_dict(deform.deform.state_dict())
+        logger.info("[ITER %d] Loaded teacher weights from in-training deform model", iteration)
+        print("[INFO] Loaded teacher weights from in-training deform model (iteration {})".format(iteration))
+    clustered_deform.teacher.eval()  # Ensure teacher is frozen
     
     # Set AABB
     clustered_deform.set_aabb(gaussians.get_xyz.detach(), padding=0.1)
@@ -344,8 +343,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
     # ── Select deformation network ──
     _deform_type = dataset.deform_type
     
-    # Check if we will use clustered deform model (auto-detected from teacher_checkpoint_path)
-    _use_clustered = bool(dataset.teacher_checkpoint_path)
+    # Check if we will use clustered deform model (dynamic separation implies clustering)
+    _use_clustered = dataset.use_dynamic_sep
     _cluster_start_iter = dataset.clustered_deform_start_iter
     
     if _deform_type == "4dgs":
