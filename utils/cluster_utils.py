@@ -1343,7 +1343,7 @@ def compute_sner_per_cluster(
     deform,
     cluster_labels: torch.Tensor,
     n_clusters: int,
-    n_time_samples: int = 64,
+    n_time_samples: int = 256,
 ) -> Dict[str, List[float]]:
     """Compute Supra-Nyquist Energy Ratio (SNER) per cluster.
 
@@ -1363,6 +1363,15 @@ def compute_sner_per_cluster(
         low-frequency fitting error only).
       - **SNER ≫ 0** → High-frequency aliasing; the student HexPlane
         cannot represent fast motion that the teacher can.
+
+    .. note::
+
+        ``n_time_samples`` must be at least ``2 × max(time_resolutions)``
+        for the student's Nyquist frequency to fall *within* the FFT range.
+        With the default student configs (``time_res`` up to 192), this
+        means ``n_time_samples ≥ 385``.  The default of **256** is a
+        pragmatic trade-off; a warning is logged when the sampling rate is
+        insufficient for a particular cluster.
 
     Additionally computes the **per-cluster distillation RMSE** (L2 norm
     of the residual) as a complementary overall-error metric.
@@ -1435,18 +1444,37 @@ def compute_sner_per_cluster(
         power = r_fft.abs().pow(2)              # (T//2+1, 3)
         total_power = float(power.sum().item())
 
-        # Nyquist frequency from student config
+        # Nyquist frequency from student config.
+        # The student HexPlane samples the [0, 1] time interval on a grid
+        # of R_t points → its Nyquist frequency is R_t / 2 cycles per unit
+        # time.  We sampled T points in [0, 1], so the FFT bin spacing is
+        # 1 cycle/unit.  The Nyquist bin index is therefore:
+        #     ny_bin = min(R_t / 2, T / 2)
+        # However if T < R_t the FFT cannot resolve frequencies above T/2,
+        # clamping SNER to 0 regardless of student capacity.  We warn when
+        # this happens and report the *effective* Nyquist used.
         if student_configs is not None and k < len(student_configs):
             time_res = student_configs[k].get("time_resolutions", [64])
-            f_ny = max(time_res) / 2.0
+            f_ny_grid = max(time_res) / 2.0  # student Nyquist (cycles/unit)
         else:
-            f_ny = 64.0
-        nyquist_list.append(f_ny)
+            f_ny_grid = 64.0
 
-        # Map f_ny to FFT bin index
-        ny_bin = int(min(f_ny, T // 2))
+        # FFT bin *i* corresponds to frequency *i* cycles/unit (bin spacing = 1).
+        # Maximum resolvable bin is T//2.
+        f_ny_sample = T / 2.0  # sampling Nyquist
+        f_ny_eff = min(f_ny_grid, f_ny_sample)
+        ny_bin = int(f_ny_eff)
+        nyquist_list.append(f_ny_eff)
+
+        if f_ny_grid >= f_ny_sample:
+            logger.debug(
+                "[SNER] Cluster %d: student Nyquist (%.0f) >= sampling "
+                "Nyquist (%.0f) — SNER is unreliable; increase "
+                "n_time_samples to at least %d",
+                k, f_ny_grid, f_ny_sample, int(2 * f_ny_grid) + 1,
+            )
+
         supra_power = float(power[ny_bin:].sum().item())
-
         sner = supra_power / max(total_power, 1e-12)
         sner_list.append(sner)
 

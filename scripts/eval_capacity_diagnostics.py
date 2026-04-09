@@ -19,7 +19,7 @@ Usage
         --model_path  output/my_scene \\
         --teacher_checkpoint_path output/my_scene/deform/iteration_15000/deform.pth \\
         [--iteration -1] \\
-        [--n_time_samples 64] \\
+        [--n_time_samples 256] \\
         [--output_dir  output/my_scene/diagnostics] \\
         [--write_tensorboard]
 """
@@ -141,7 +141,7 @@ def run_diagnostics(
     model_path: str,
     teacher_checkpoint_path: str,
     iteration: int = -1,
-    n_time_samples: int = 64,
+    n_time_samples: int = 256,
     output_dir: Optional[str] = None,
     write_tensorboard: bool = False,
     capacity_tier_config_path: str = "arguments/capacity_tier_configs.json",
@@ -387,8 +387,8 @@ def main() -> None:
         help="Student weight iteration to evaluate (-1 = latest).",
     )
     parser.add_argument(
-        "--n_time_samples", type=int, default=64,
-        help="Uniform time steps for SNER analysis.",
+        "--n_time_samples", type=int, default=256,
+        help="Uniform time steps for SNER analysis (must be >= 2 * max student time_resolution for reliable SNER).",
     )
     parser.add_argument(
         "--output_dir", type=str, default=None,
