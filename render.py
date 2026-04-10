@@ -406,7 +406,6 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
                 # Load ClusteredDeformModel
                 from scene import ClusteredDeformModel
                 from utils.cluster_utils import infer_student_configs_from_weights
-                import os
                 
                 n_clusters = dataset.cluster_n_clusters
                 

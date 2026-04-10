@@ -21,7 +21,7 @@
         "description": "Low dynamic clusters (bottom 33%)",
         "spatial_resolutions": [64, 128],
         "time_resolutions": [64, 128],
-        "mlp_hidden_dim": 62,
+        "mlp_hidden_dim": 86,
         "mlp_layer_num": 2,
         "feat_dim": 8
       }
@@ -64,7 +64,7 @@
       },
       "low": {
         "description": "Low heterogeneity: near-rigid cluster motion",
-        "mlp_hidden_dim": 62,
+        "mlp_hidden_dim": 86,
         "mlp_layer_num": 2
       }
     }

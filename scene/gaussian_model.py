@@ -695,8 +695,23 @@ class GaussianModel:
         grads_abs = self.xyz_gradient_accum_abs / self.denom
         grads_abs[grads_abs.isnan()] = 0.0
 
-        grad_qualifiers = torch.where(torch.norm(grad_vars, dim=-1) >= args.grad_thresh, True, False)
-        grad_qualifiers_abs = torch.where(torch.norm(grads_abs, dim=-1) >= args.grad_abs_thresh, True, False)
+        grad_norm = torch.norm(grad_vars, dim=-1)
+        grads_abs_norm = torch.norm(grads_abs, dim=-1)
+
+        grad_qualifiers = grad_norm >= args.grad_thresh
+        grad_qualifiers_abs = grads_abs_norm >= args.grad_abs_thresh
+
+        # Ablation: lower densification thresholds for dynamic Gaussians
+        _has_dynamic_thresh = self._cluster_labels is not None and (
+            args.dynamic_grad_thresh >= 0 or args.dynamic_grad_abs_thresh >= 0
+        )
+        if _has_dynamic_thresh:
+            _dyn = self._cluster_labels >= 0
+            if args.dynamic_grad_thresh >= 0:
+                grad_qualifiers[_dyn] = grad_norm[_dyn] >= args.dynamic_grad_thresh
+            if args.dynamic_grad_abs_thresh >= 0:
+                grad_qualifiers_abs[_dyn] = grads_abs_norm[_dyn] >= args.dynamic_grad_abs_thresh
+
         clone_qualifiers = torch.max(self.get_scaling, dim=1).values <= args.dense*extent
         split_qualifiers = torch.max(self.get_scaling, dim=1).values > args.dense*extent
 
@@ -715,7 +730,15 @@ class GaussianModel:
 
         # This is our multi-view consisent metric for densification
         # We use this metric to further filter the candidates for densification, which is similar to taming 3dgs.
-        metric_mask = importance_score > 5
+        _imp_thresh = 5.0
+        if self._cluster_labels is not None and args.dynamic_importance_thresh >= 0:
+            # Per-group importance threshold: lower for dynamic, default for static
+            metric_mask = torch.zeros_like(grad_qualifiers)
+            _dyn_imp = self._cluster_labels >= 0
+            metric_mask[_dyn_imp] = importance_score[_dyn_imp] > args.dynamic_importance_thresh
+            metric_mask[~_dyn_imp] = importance_score[~_dyn_imp] > _imp_thresh
+        else:
+            metric_mask = importance_score > _imp_thresh
 
         _all_clones = torch.logical_and(metric_mask, all_clones)
         _all_splits = torch.logical_and(metric_mask, all_splits)

@@ -200,6 +200,14 @@ class OptimizationParams(ParamGroup):
         
         # Knowledge distillation
         self.kl_distill_weight = 1.0  # Weight for distillation loss
+
+        # Ablation: differentiated densification thresholds for dynamic Gaussians
+        # When >= 0, override the default threshold for dynamic Gaussians (cluster_label >= 0).
+        # When < 0 (default), fall back to the global grad_thresh / grad_abs_thresh / importance=5.
+        self.dynamic_grad_thresh = -1.0        # clone gradient threshold for dynamic Gaussians
+        self.dynamic_grad_abs_thresh = -1.0    # split gradient threshold for dynamic Gaussians
+        self.dynamic_importance_thresh = -1.0  # multi-view importance threshold for dynamic Gaussians
+
         super().__init__(parser, "Optimization Parameters", sentinel)
 
 
