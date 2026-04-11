@@ -15,7 +15,8 @@ import logging
 import traceback
 import torch
 from random import randint
-from utils.loss_utils import (l1_loss, ssim, kl_divergence, l2_loss)
+from utils.loss_utils import (l1_loss, ssim, kl_divergence, l2_loss,
+                              dynamic_opacity_reg_loss)
 from gaussian_renderer import render_fastgs, network_gui
 import sys
 from scene import Scene, GaussianModel, DeformModel, DeformModel_4DGS, ClusteredDeformModel
@@ -614,6 +615,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             
             if tb_writer and iteration % 100 == 0:
                 tb_writer.add_scalar('train_loss_patches/distillation_loss', distill_loss.item(), iteration)
+
+        # ── Dynamic opacity regularisation (ablation) ──
+        # Penalise low opacity on dynamic Gaussians to preserve fine details.
+        if (opt.dynamic_opacity_reg_weight > 0
+                and iteration >= opt.dynamic_opacity_reg_start_iter
+                and gaussians._cluster_labels is not None):
+            _opacity_reg = dynamic_opacity_reg_loss(
+                gaussians.get_opacity.squeeze(-1),
+                gaussians._cluster_labels,
+            )
+            loss = loss + opt.dynamic_opacity_reg_weight * _opacity_reg
+            if tb_writer and iteration % 100 == 0:
+                tb_writer.add_scalar('train_loss_patches/dynamic_opacity_reg',
+                                     _opacity_reg.item(), iteration)
 
         # ── Dynamic score-based separation (replaces dynamic probability losses) ──
         # Dynamic score is computed at iteration 15000 using displacement statistics

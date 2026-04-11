@@ -214,6 +214,13 @@ class OptimizationParams(ParamGroup):
         # When < 0 (default), all Gaussians share the same densify_until_iter.
         self.densify_dynamic_until_iter = -1
 
+        # Ablation: dynamic opacity regularisation.
+        # Penalises low opacity on dynamic Gaussians (cluster_label >= 0) after
+        # clustering to encourage them to stay opaque and preserve fine details.
+        # Loss = weight * mean((1 - opacity_dynamic)^2).  0.0 = disabled.
+        self.dynamic_opacity_reg_weight = 0.0
+        self.dynamic_opacity_reg_start_iter = 15000
+
         super().__init__(parser, "Optimization Parameters", sentinel)
 
 

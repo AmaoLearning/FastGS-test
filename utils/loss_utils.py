@@ -269,6 +269,24 @@ def binary_entropy_polarization_loss(prob: torch.Tensor, eps: float = 1e-6) -> t
     return -(p * p.log() + (1.0 - p) * (1.0 - p).log()).mean()
 
 
+def dynamic_opacity_reg_loss(
+    opacity: torch.Tensor, cluster_labels: torch.Tensor,
+) -> torch.Tensor:
+    """Squared penalty pushing dynamic-Gaussian opacity toward 1.
+
+    Args:
+        opacity: (N,) sigmoid-activated opacity values in (0, 1).
+        cluster_labels: (N,) int32; -1 = static, >= 0 = dynamic cluster id.
+
+    Returns:
+        Scalar mean((1 - opacity[dynamic])^2), or 0 if no dynamic Gaussians.
+    """
+    mask = cluster_labels >= 0
+    if not mask.any():
+        return opacity.new_tensor(0.0)
+    return ((1.0 - opacity[mask]) ** 2).mean()
+
+
 def kl_divergence(rho, rho_hat):
     rho_hat = torch.mean(torch.sigmoid(rho_hat), 0)
     rho = torch.tensor([rho] * len(rho_hat)).cuda()
