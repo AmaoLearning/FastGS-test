@@ -218,10 +218,26 @@ class GaussianModel:
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
 
-    def reset_opacity(self):
-        opacities_new = inverse_sigmoid(torch.min(self.get_opacity, torch.ones_like(self.get_opacity) * 0.01))
-        optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
-        self._opacity = optimizable_tensors["opacity"]
+    def reset_opacity(self, dynamic_only: bool = False):
+        if dynamic_only and self._cluster_labels is not None:
+            # Only reset opacity for dynamic Gaussians, preserving static ones
+            dynamic_mask = self._cluster_labels >= 0
+            opacities_capped = inverse_sigmoid(
+                torch.min(self.get_opacity, torch.ones_like(self.get_opacity) * 0.01)
+            )
+            with torch.no_grad():
+                self._opacity.data[dynamic_mask] = opacities_capped[dynamic_mask]
+            # Selectively reset Adam state for dynamic Gaussians only
+            for group in self.optimizer.param_groups:
+                if group["name"] == "opacity":
+                    state = self.optimizer.state.get(group['params'][0], None)
+                    if state is not None:
+                        state["exp_avg"][dynamic_mask] = 0.0
+                        state["exp_avg_sq"][dynamic_mask] = 0.0
+        else:
+            opacities_new = inverse_sigmoid(torch.min(self.get_opacity, torch.ones_like(self.get_opacity) * 0.01))
+            optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
+            self._opacity = optimizable_tensors["opacity"]
 
     def load_ply(self, path, og_number_points=-1):
         self.og_number_points = og_number_points
@@ -678,7 +694,7 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_cluster_labels)
 
-    def densify_and_prune_fastgs(self, max_screen_size, min_opacity, extent, radii, args, importance_score = None, pruning_score = None, flow_mask = None):
+    def densify_and_prune_fastgs(self, max_screen_size, min_opacity, extent, radii, args, importance_score = None, pruning_score = None, flow_mask = None, dynamic_only: bool = False):
         
         ''' 
             Densification and Pruning based on FastGS criteria:
@@ -687,6 +703,8 @@ class GaussianModel:
                 This is our main contribution compared to the vanilla 3DGS.
             3.  Finally, gaussians with low opacity or very large size are pruned.
             4.  (New) If flow_mask is provided, only gaussians with accurate flow prediction are densified.
+            5.  (New) If dynamic_only is True and cluster labels exist, static Gaussians
+                (cluster_label == -1) are excluded from densification and opacity cap.
         '''
         grad_vars = self.xyz_gradient_accum / self.denom
         grad_vars[grad_vars.isnan()] = 0.0
@@ -702,15 +720,18 @@ class GaussianModel:
         grad_qualifiers_abs = grads_abs_norm >= args.grad_abs_thresh
 
         # Ablation: lower densification thresholds for dynamic Gaussians
-        _has_dynamic_thresh = self._cluster_labels is not None and (
-            args.dynamic_grad_thresh >= 0 or args.dynamic_grad_abs_thresh >= 0
-        )
-        if _has_dynamic_thresh:
+        if self._cluster_labels is not None:
             _dyn = self._cluster_labels >= 0
             if args.dynamic_grad_thresh >= 0:
                 grad_qualifiers[_dyn] = grad_norm[_dyn] >= args.dynamic_grad_thresh
             if args.dynamic_grad_abs_thresh >= 0:
                 grad_qualifiers_abs[_dyn] = grads_abs_norm[_dyn] >= args.dynamic_grad_abs_thresh
+
+        # Exclude static Gaussians from densification when dynamic_only is set
+        if dynamic_only and self._cluster_labels is not None:
+            static_mask = self._cluster_labels < 0
+            grad_qualifiers[static_mask] = False
+            grad_qualifiers_abs[static_mask] = False
 
         clone_qualifiers = torch.max(self.get_scaling, dim=1).values <= args.dense*extent
         split_qualifiers = torch.max(self.get_scaling, dim=1).values > args.dense*extent
@@ -779,9 +800,26 @@ class GaussianModel:
             final_prune = torch.logical_and(prune_mask, selected_pts_mask)
             self.prune_points(final_prune)
         
-        opacities_new = inverse_sigmoid(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.8))
-        optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
-        self._opacity = optimizable_tensors["opacity"]
+        # Cap opacity: only for dynamic Gaussians when dynamic_only is set,
+        # preserving static Gaussians' opacity and Adam state.
+        if dynamic_only and self._cluster_labels is not None:
+            dynamic_mask = self._cluster_labels >= 0
+            opacities_capped = inverse_sigmoid(
+                torch.min(self.get_opacity, torch.ones_like(self.get_opacity) * 0.8)
+            )
+            with torch.no_grad():
+                self._opacity.data[dynamic_mask] = opacities_capped[dynamic_mask]
+            # Selectively reset Adam state for dynamic Gaussians only
+            for group in self.optimizer.param_groups:
+                if group["name"] == "opacity":
+                    state = self.optimizer.state.get(group['params'][0], None)
+                    if state is not None:
+                        state["exp_avg"][dynamic_mask] = 0.0
+                        state["exp_avg_sq"][dynamic_mask] = 0.0
+        else:
+            opacities_new = inverse_sigmoid(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.8))
+            optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
+            self._opacity = optimizable_tensors["opacity"]
         tmp_radii = self.tmp_radii
         self.tmp_radii = None
 

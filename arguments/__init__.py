@@ -208,6 +208,12 @@ class OptimizationParams(ParamGroup):
         self.dynamic_grad_abs_thresh = -1.0    # split gradient threshold for dynamic Gaussians
         self.dynamic_importance_thresh = -1.0  # multi-view importance threshold for dynamic Gaussians
 
+        # Ablation: extend densification window for dynamic Gaussians only.
+        # When >= 0, dynamic Gaussians (cluster_label >= 0) continue densifying
+        # until this iteration, while static Gaussians stop at densify_until_iter.
+        # When < 0 (default), all Gaussians share the same densify_until_iter.
+        self.densify_dynamic_until_iter = -1
+
         super().__init__(parser, "Optimization Parameters", sentinel)
 
 
