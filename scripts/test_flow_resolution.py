@@ -420,8 +420,10 @@ def stack_sequence(
 
 
 def masked_temporal_fill(flows: torch.Tensor, masks: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    data = flows.permute(1, 2, 0, 3).reshape(-1, flows.shape[0], flows.shape[1])
-    mask = masks.permute(1, 2, 0, 3).reshape(-1, masks.shape[0], 1)
+    # flows: [T, 2, H, W] -> [H*W, T, 2]
+    data = flows.permute(2, 3, 0, 1).contiguous().reshape(-1, flows.shape[0], flows.shape[1])
+    # masks: [T, 1, H, W] -> [H*W, T, 1]
+    mask = masks.permute(2, 3, 0, 1).contiguous().reshape(-1, masks.shape[0], 1)
 
     valid_ratio = mask.squeeze(-1).mean(dim=1)
     keep = valid_ratio >= 0.5
@@ -474,6 +476,7 @@ def analyze_temporal_cutoff(
 
 
 def analyze_spatial_variance(flows: torch.Tensor, masks: torch.Tensor) -> float:
+    """Legacy value-variance method (kept for backward compat logging only)."""
     variances: List[float] = []
     for frame_idx in range(flows.shape[0]):
         flow = flows[frame_idx]
@@ -483,6 +486,68 @@ def analyze_spatial_variance(flows: torch.Tensor, masks: torch.Tensor) -> float:
         valid = flow[:, mask]
         variances.append(float(valid.var(dim=1, unbiased=False).mean().item()))
     return float(np.mean(variances)) if variances else 0.0
+
+
+def analyze_gradient_ratio(
+    flows: torch.Tensor,
+    masks: torch.Tensor,
+    scene_stats: "SceneStats",
+    num_frames: int,
+) -> Dict[str, float]:
+    """Gradient-based spatial/temporal complexity ratio in canonical space.
+
+    Spatial complexity  = RMS |nabla_{u,v} F|  (image spatial gradient of flow)
+    Temporal complexity = RMS |F(t+1) - F(t)|  (frame-to-frame flow difference)
+
+    Both are converted to canonical-space derivatives before taking the ratio:
+        dD/dx_canon = dF/du * (aabb_extent / 2)
+        dD/dt_canon = (z / f) * (dF/dt_frame) * (Nf - 1) / 2
+    """
+    spatial_grad_energies: List[float] = []
+    temporal_diff_energies: List[float] = []
+
+    # --- spatial gradient per frame ---
+    for t in range(flows.shape[0]):
+        flow = flows[t]              # [2, H, W]
+        m = masks[t, 0] > 0.5       # [H, W]
+        dx = flow[:, :, 1:] - flow[:, :, :-1]   # [2, H, W-1]
+        dy = flow[:, 1:, :] - flow[:, :-1, :]   # [2, H-1, W]
+        mx = m[:, 1:] & m[:, :-1]
+        my = m[1:, :] & m[:-1, :]
+        n_valid = float((mx.sum() + my.sum()).clamp_min(1).item())
+        grad_sq = float((dx[:, mx] ** 2).sum().item() + (dy[:, my] ** 2).sum().item())
+        spatial_grad_energies.append(grad_sq / n_valid)
+
+    # --- temporal difference ---
+    for t in range(flows.shape[0] - 1):
+        m_both = (masks[t, 0] > 0.5) & (masks[t + 1, 0] > 0.5)
+        n = float(m_both.sum().clamp_min(1).item())
+        diff = flows[t + 1] - flows[t]
+        temporal_diff_energies.append(float((diff[:, m_both] ** 2).sum().item() / n))
+
+    E_s = float(np.mean(spatial_grad_energies)) if spatial_grad_energies else 1e-20
+    E_t = float(np.mean(temporal_diff_energies)) if temporal_diff_energies else 1e-20
+    rms_s = math.sqrt(max(E_s, 1e-20))
+    rms_t = math.sqrt(max(E_t, 1e-20))
+
+    # Convert to canonical space (see research.md Section 18.3 / 18.7):
+    #   rho = (rms_s * L/2) / (rms_t * z*(Nf-1)/(2*f))
+    #       = rms_s * L * f / (rms_t * z * (Nf-1))
+    avg_extent = float(np.mean(scene_stats.extent))
+    z = max(scene_stats.median_depth, 1e-6)
+    f = scene_stats.median_focal
+    Nf = max(num_frames, 2)
+    canon_scale = (avg_extent * f) / (z * (Nf - 1))
+    rho = (rms_s / max(rms_t, 1e-20)) * canon_scale
+
+    return {
+        "E_s": E_s,
+        "E_t": E_t,
+        "rms_spatial_grad": rms_s,
+        "rms_temporal_diff": rms_t,
+        "canon_scale": canon_scale,
+        "rho": rho,
+    }
 
 
 def build_radial_bins(height: int, width: int, subsample_factor: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, int]:
@@ -565,18 +630,19 @@ def summarize_table(result: Dict) -> str:
         f"  Rt (raw):             {result['analysis']['temporal']['Rt_raw']:.4f}",
         f"  Rt (snapped):         {result['analysis']['temporal']['Rt_snapped']}",
         "-" * 72,
-        "SPATIAL ANALYSIS (ratio method)",
-        f"  Spatial variance:     {result['analysis']['spatial_ratio']['spatial_var']:.6f}",
-        f"  Temporal variance:    {result['analysis']['spatial_ratio']['temporal_var']:.6f}",
-        f"  rho = Var_s / Var_t:  {result['analysis']['spatial_ratio']['rho']:.6f}",
-        f"  Rs (raw):             {result['analysis']['spatial_ratio']['Rs_raw']:.4f}",
-        f"  Rs (snapped):         {result['analysis']['spatial_ratio']['Rs_snapped']}",
-        "-" * 72,
-        "SPATIAL ANALYSIS (DFT reference)",
+        "SPATIAL ANALYSIS (DFT, primary)",
         f"  95% cutoff pixel:     {result['analysis']['spatial_dft']['f_s_pixel']:.6f} cycles/pixel",
         f"  95% cutoff canon:     {result['analysis']['spatial_dft']['f_s_canon']:.6f} cycles/canonical",
         f"  Rs_DFT (raw):         {result['analysis']['spatial_dft']['Rs_raw']:.4f}",
         f"  Rs_DFT (snapped):     {result['analysis']['spatial_dft']['Rs_snapped']}",
+        "-" * 72,
+        "SPATIAL ANALYSIS (gradient ratio, diagnostic)",
+        f"  RMS spatial grad:     {result['analysis']['gradient_ratio']['rms_spatial_grad']:.6f} px/px",
+        f"  RMS temporal diff:    {result['analysis']['gradient_ratio']['rms_temporal_diff']:.6f} px/frame",
+        f"  Canon scale factor:   {result['analysis']['gradient_ratio']['canon_scale']:.6f}",
+        f"  rho (canonical):      {result['analysis']['gradient_ratio']['rho']:.6f}",
+        f"  Rs_grad (raw):        {result['analysis']['gradient_ratio']['Rs_raw']:.4f}",
+        f"  Rs_grad (snapped):    {result['analysis']['gradient_ratio']['Rs_snapped']}",
         "=" * 72,
         "RECOMMENDED 4-LAYER HEXPLANE CONFIG",
         f"  hex_spatial_res = \"{result['hex_spatial_res']}\"",
@@ -603,7 +669,7 @@ def run_analysis(args: argparse.Namespace) -> Dict:
 
     temporal_cutoffs: List[float] = []
     temporal_vars: List[float] = []
-    spatial_vars: List[float] = []
+    gradient_ratios: List[Dict[str, float]] = []
     spectrum_sum_total: Optional[torch.Tensor] = None
     spectrum_count_total: Optional[torch.Tensor] = None
 
@@ -623,7 +689,9 @@ def run_analysis(args: argparse.Namespace) -> Dict:
             masks,
             energy_cutoff=args.energy_cutoff,
         )
-        spatial_var = analyze_spatial_variance(flows, masks)
+        grad_info = analyze_gradient_ratio(
+            flows, masks, scene_stats, num_frames=args.num_frames,
+        )
         spectrum_sum, spectrum_count = accumulate_spatial_spectrum(
             flows,
             masks,
@@ -632,7 +700,7 @@ def run_analysis(args: argparse.Namespace) -> Dict:
 
         temporal_cutoffs.append(t_cutoff)
         temporal_vars.append(temporal_var)
-        spatial_vars.append(spatial_var)
+        gradient_ratios.append(grad_info)
 
         if spectrum_sum_total is None:
             spectrum_sum_total = spectrum_sum
@@ -645,14 +713,14 @@ def run_analysis(args: argparse.Namespace) -> Dict:
     Rt_raw = args.nyquist_margin * f_t_max + 1.0
     Rt_snapped = snap_to_candidate(Rt_raw, candidates)
 
-    spatial_var_global = float(np.mean(spatial_vars)) if spatial_vars else 0.0
-    temporal_var_global = float(np.mean(temporal_vars)) if temporal_vars else 0.0
-    if temporal_var_global <= 1e-8:
-        logger.warning("Temporal variance is near zero; forcing rho=1.0 to avoid instability.")
-        rho = 1.0
-    else:
-        rho = spatial_var_global / temporal_var_global
-
+    # Gradient-based ratio (diagnostic, secondary)
+    rho_vals = [g["rho"] for g in gradient_ratios]
+    rho = float(np.median(rho_vals)) if rho_vals else 1.0
+    rms_s_global = float(np.mean([g["rms_spatial_grad"] for g in gradient_ratios])) if gradient_ratios else 0.0
+    rms_t_global = float(np.mean([g["rms_temporal_diff"] for g in gradient_ratios])) if gradient_ratios else 0.0
+    canon_scale = gradient_ratios[0]["canon_scale"] if gradient_ratios else 1.0
+    if rho > 10.0 or rho < 0.1:
+        logger.warning("Gradient ratio rho=%.4f is extreme; treat with caution.", rho)
     Rs_ratio_raw = max(1.0, rho * Rt_raw)
     Rs_ratio_snapped = snap_to_candidate(Rs_ratio_raw, candidates)
 
@@ -674,8 +742,16 @@ def run_analysis(args: argparse.Namespace) -> Dict:
     Rs_dft_raw = args.nyquist_margin * f_s_canon + 1.0
     Rs_dft_snapped = snap_to_candidate(Rs_dft_raw, candidates)
 
+    # ══ Primary recommendation: DFT spatial + DFT temporal ══
+    # The DFT method directly measures bandwidth (frequency content),
+    # while the gradient-ratio method conflates energy with bandwidth.
+    # Apply a floor of 2*fixed_res so that the finest level is meaningfully
+    # finer than the base levels.
+    Rs_primary = max(Rs_dft_snapped, 2 * args.fixed_res)
+    Rs_primary = snap_to_candidate(float(Rs_primary), candidates)
+
     fixed_levels = [args.fixed_res, args.fixed_res, args.fixed_res]
-    spatial_levels = fixed_levels + [Rs_ratio_snapped]
+    spatial_levels = fixed_levels + [Rs_primary]
     time_levels = fixed_levels + [Rt_snapped]
 
     result = {
@@ -702,9 +778,10 @@ def run_analysis(args: argparse.Namespace) -> Dict:
                 "Rt_raw": Rt_raw,
                 "Rt_snapped": Rt_snapped,
             },
-            "spatial_ratio": {
-                "spatial_var": spatial_var_global,
-                "temporal_var": temporal_var_global,
+            "gradient_ratio": {
+                "rms_spatial_grad": rms_s_global,
+                "rms_temporal_diff": rms_t_global,
+                "canon_scale": canon_scale,
                 "rho": rho,
                 "Rs_raw": Rs_ratio_raw,
                 "Rs_snapped": Rs_ratio_snapped,
