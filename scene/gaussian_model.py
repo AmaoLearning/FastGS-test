@@ -129,8 +129,7 @@ class GaussianModel:
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self._deform_accum = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
         self._deform_sq_accum = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
-        self._deform_denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        # Initialize max/min deformation tracking
+        self._deform_denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")        self.tracked_for_fft = torch.zeros((self.get_xyz.shape[0],), dtype=torch.bool, device="cuda")        # Initialize max/min deformation tracking
         self._deform_max = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
         self._deform_min = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
         self._deform_tracking_started = False
@@ -368,6 +367,7 @@ class GaussianModel:
         self._deform_accum = self._deform_accum[valid_points_mask]
         self._deform_sq_accum = self._deform_sq_accum[valid_points_mask]
         self._deform_denom = self._deform_denom[valid_points_mask]
+        self.tracked_for_fft = self.tracked_for_fft[valid_points_mask]
         self._deform_max = self._deform_max[valid_points_mask] if self._deform_max.numel() > 0 else self._deform_max
         self._deform_min = self._deform_min[valid_points_mask] if self._deform_min.numel() > 0 else self._deform_min
         
@@ -427,6 +427,8 @@ class GaussianModel:
                             torch.zeros(_n_new, 3, device="cuda")], dim=0)
         self._deform_denom = torch.cat([self._deform_denom,
                                          torch.zeros(_n_new, 1, device="cuda")], dim=0)
+        self.tracked_for_fft = torch.cat([self.tracked_for_fft,
+                                         torch.zeros(_n_new, dtype=torch.bool, device="cuda")], dim=0)
         self._deform_max = torch.cat([self._deform_max,
                                        torch.zeros(_n_new, 3, device="cuda")], dim=0) if self._deform_max.numel() > 0 else self._deform_max
         self._deform_min = torch.cat([self._deform_min,
@@ -644,6 +646,8 @@ class GaussianModel:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+        
+        prune_mask = torch.logical_and(prune_mask, ~self.tracked_for_fft.squeeze())
         self.prune_points(prune_mask)
 
         torch.cuda.empty_cache()
@@ -798,6 +802,7 @@ class GaussianModel:
             sampled_indices = torch.multinomial(padded_importance, remove_budget, replacement=False)
             selected_pts_mask[sampled_indices] = True
             final_prune = torch.logical_and(prune_mask, selected_pts_mask)
+            final_prune = torch.logical_and(final_prune, ~self.tracked_for_fft.squeeze())
             self.prune_points(final_prune)
         
         # Cap opacity: only for dynamic Gaussians when dynamic_only is set,
@@ -834,6 +839,8 @@ class GaussianModel:
         prune_mask = (self.get_opacity < min_opacity).squeeze() 
         scores_mask = pruning_score > 0.9
         final_prune = torch.logical_or(prune_mask, scores_mask)
+        
+        final_prune = torch.logical_and(final_prune, ~self.tracked_for_fft.squeeze())
         self.prune_points(final_prune)
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):

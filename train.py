@@ -48,6 +48,66 @@ from utils.cluster_utils import (
     allocate_capacity_by_frequency,
 )
 
+import matplotlib.pyplot as plt
+
+def plot_deformation_fft(gaussians, deform_model, save_path, use_teacher=False):
+    import torch.fft
+    tracked_indices = torch.nonzero(gaussians.tracked_for_fft.squeeze()).view(-1)
+    if tracked_indices.numel() == 0:
+        print("No tracked points for FFT.")
+        return
+    
+    n_tracked = tracked_indices.shape[0]
+    xyz_base = gaussians.get_xyz[tracked_indices].detach()
+    cluster_labels = gaussians._cluster_labels[tracked_indices]
+    
+    n_steps = 100
+    t_vals = torch.linspace(0, 1, n_steps, device="cuda")
+    
+    d_xyz_seq = torch.zeros((n_steps, n_tracked, 3), device="cuda")
+    
+    with torch.no_grad():
+        for i, t in enumerate(t_vals):
+            time_input = t.view(1).expand(n_tracked, 1)
+            
+            if use_teacher:
+                d_xyz, _, _ = deform_model.step_teacher(xyz_base, time_input)
+            else:
+                d_xyz, _, _ = deform_model.step(xyz_base, time_input, cluster_ids=cluster_labels)
+            
+            d_xyz_seq[i] = d_xyz.detach()
+
+    # d_xyz_seq is [n_steps, n_tracked, 3]
+    # FFT over time (dim=0)
+    d_xyz_seq_np = d_xyz_seq.cpu()
+    mag_spectra = torch.abs(torch.fft.rfft(d_xyz_seq_np, dim=0)) # [n_steps//2 + 1, n_tracked, 3]
+    
+    # We will plot the L2 norm of the displacement magnitude
+    mag_spectra_mean = mag_spectra.mean(dim=2).numpy()
+    
+    plt.figure(figsize=(10, 6))
+    freqs = torch.fft.rfftfreq(n_steps).numpy()
+    
+    # plot the average spectrum per cluster
+    valid_clusters = torch.unique(cluster_labels)
+    valid_clusters = valid_clusters[valid_clusters >= 0].cpu().numpy()
+    cluster_labels_np = cluster_labels.cpu().numpy()
+    
+    for c in valid_clusters:
+        mask = (cluster_labels_np == c)
+        if mask.any():
+            cluster_avg = mag_spectra_mean[:, mask].mean(axis=1)
+            plt.plot(freqs, cluster_avg, label=f'Cluster {c}')
+
+    plt.xlabel('Frequency Bin')
+    plt.ylabel('FFT Magnitude (Mean per channel displacement)')
+    title = 'Teacher Field' if use_teacher else 'Student Field'
+    plt.title(f'Deformation FFT ({title})')
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+
 
 def run_clustering_at_iteration(
     gaussians,
@@ -323,6 +383,24 @@ def run_clustering_at_iteration(
     
     logger.info("[ITER %d] Switched to clustered deform model with %d students", iteration, n_clusters)
     print(f"[INFO] Switched to clustered deform model with {n_clusters} student models")
+
+    # Handle FFT plotting logic
+    if 'args' in globals() and args.plot_fft:
+        print("[INFO] Setting up tracked points for FFT...")
+        import torch
+        import os
+        labels = gaussians._cluster_labels
+        for c in range(n_clusters):
+            indices = torch.nonzero(labels == c).squeeze(1)
+            if len(indices) >= 5:
+                sampled = indices[torch.randperm(len(indices))[:5]]
+                gaussians.tracked_for_fft[sampled] = True
+
+        out_path_teacher = os.path.join(dataset.model_path, "fft_teacher_15k.png")
+        plot_deformation_fft(gaussians, clustered_deform, out_path_teacher, use_teacher=True)
+
+        out_path_student = os.path.join(dataset.model_path, "fft_student_15k.png")
+        plot_deformation_fft(gaussians, clustered_deform, out_path_student, use_teacher=False)
     
     # Replace deform object
     deform = clustered_deform
@@ -709,6 +787,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 scene.save(iteration)
                 deform.save_weights(args.model_path, iteration)
 
+                if 'args' in globals() and getattr(args, 'plot_fft', False) and iteration >= 30000:
+                    import os
+                    out_student = os.path.join(dataset.model_path, f"fft_student_{iteration//1000}k.png")
+                    plot_deformation_fft(gaussians, deform, out_student, use_teacher=False)
+
             # Densification — dual-window: global window for all Gaussians,
             # extended window for dynamic Gaussians only.
             _dynamic_densify_until = (
@@ -990,6 +1073,7 @@ if __name__ == "__main__":
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[30000,40000])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[30000,40000])
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--plot_fft", action="store_true", help="Plot FFT analysis of deformations")
     parser.add_argument("--profile", action="store_true", help="Enable torch.profiler for 50 iterations (outputs Chrome trace)")
     parser.add_argument("--profile_start", type=int, default=500, help="Iteration to start profiling")
     parser.add_argument("--profile_steps", type=int, default=50, help="Number of iterations to profile")
