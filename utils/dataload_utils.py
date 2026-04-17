@@ -97,15 +97,27 @@ def _load_flow_tensor(path: Optional[str]) -> torch.Tensor:
     return torch.from_numpy(arr).permute(2, 0, 1).to(dtype=torch.float16).contiguous()
 
 
-# ── Dataset (lightweight & pickle-safe for multi-process workers) ─────
+# ── Depth loading (runs inside DataLoader worker processes) ──────────
+
+_EMPTY_DEPTH = torch.empty(0, dtype=torch.float32)
+
+
+def _load_depth_tensor(path: Optional[str]) -> torch.Tensor:
+    """Load a single depth ``.npy`` file.  Returns float32 [1, H, W] or _EMPTY_DEPTH."""
+    if path is None or not os.path.exists(path):
+        return _EMPTY_DEPTH
+    arr = np.load(path)  # expected [H, W], float32
+    return torch.from_numpy(arr).unsqueeze(0).contiguous()
+
 
 class CameraDataset(Dataset):
     """Stores only file paths + resolutions — no torch tensors or nn.Modules.
 
-    ``__getitem__`` returns ``(cam_index, image_tensor, flow_fwd, flow_bwd)``
+    ``__getitem__`` returns ``(cam_index, image_tensor, flow_fwd, flow_bwd, depth, depth_conf)``
     where *image_tensor* is a float32 [3, H, W] tensor normalised to [0, 1],
-    and *flow_fwd* / *flow_bwd* are fp16 [2, H, W] tensors (or empty [0]
-    tensors when unavailable).
+    *flow_fwd* / *flow_bwd* are fp16 [2, H, W] tensors (or empty [0]
+    tensors when unavailable), and *depth* / *depth_conf* are float32 [1, H, W]
+    tensors (or empty [0] tensors when unavailable).
     """
 
     def __init__(
@@ -115,11 +127,15 @@ class CameraDataset(Dataset):
         flow_fwd_paths: Optional[Sequence[Optional[str]]] = None,
         flow_bwd_paths: Optional[Sequence[Optional[str]]] = None,
         load_flow: bool = False,
+        depth_paths: Optional[Sequence[Optional[str]]] = None,
+        depth_conf_paths: Optional[Sequence[Optional[str]]] = None,
+        load_depth: bool = False,
     ) -> None:
         assert len(image_paths) == len(target_resolutions)
         self.image_paths: List[str] = list(image_paths)
         self.target_resolutions: List[Tuple[int, int]] = list(target_resolutions)
         self.load_flow: bool = load_flow
+        self.load_depth: bool = load_depth
 
         n = len(image_paths)
         self.flow_fwd_paths: List[Optional[str]] = (
@@ -128,11 +144,17 @@ class CameraDataset(Dataset):
         self.flow_bwd_paths: List[Optional[str]] = (
             list(flow_bwd_paths) if flow_bwd_paths is not None else [None] * n
         )
+        self.depth_paths: List[Optional[str]] = (
+            list(depth_paths) if depth_paths is not None else [None] * n
+        )
+        self.depth_conf_paths: List[Optional[str]] = (
+            list(depth_conf_paths) if depth_conf_paths is not None else [None] * n
+        )
 
     def __len__(self) -> int:
         return len(self.image_paths)
 
-    def __getitem__(self, idx: int) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         w, h = self.target_resolutions[idx]
         img = _load_image_tensor(self.image_paths[idx], w, h)
 
@@ -143,18 +165,25 @@ class CameraDataset(Dataset):
             flow_fwd = _EMPTY_FLOW
             flow_bwd = _EMPTY_FLOW
 
-        return idx, img, flow_fwd, flow_bwd
+        if self.load_depth:
+            depth = _load_depth_tensor(self.depth_paths[idx])
+            depth_conf = _load_depth_tensor(self.depth_conf_paths[idx])
+        else:
+            depth = _EMPTY_DEPTH
+            depth_conf = _EMPTY_DEPTH
+
+        return idx, img, flow_fwd, flow_bwd, depth, depth_conf
 
 
 # ── Custom collate (handles variable-shape flow tensors) ──────────────
 
 def _collate_camera_batch(
-    batch: List[Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]],
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Collate for batch_size=1.  Stacks idx & image; passes flow through."""
+    batch: List[Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Collate for batch_size=1.  Stacks idx & image; passes flow/depth through."""
     assert len(batch) == 1, "CameraDataset is designed for batch_size=1"
-    idx, img, flow_fwd, flow_bwd = batch[0]
-    return torch.tensor(idx, dtype=torch.long), img.unsqueeze(0), flow_fwd, flow_bwd
+    idx, img, flow_fwd, flow_bwd, depth, depth_conf = batch[0]
+    return torch.tensor(idx, dtype=torch.long), img.unsqueeze(0), flow_fwd, flow_bwd, depth, depth_conf
 
 
 # ── DataLoader factory ────────────────────────────────────────────────
@@ -168,6 +197,7 @@ def create_camera_dataloader(
     persistent_workers: bool = True,
     shuffle: bool = True,
     load_flow: bool = False,
+    load_depth: bool = False,
 ) -> DataLoader:
     """Build an optimised :class:`DataLoader` from a list of *LazyCamera* objects.
 
@@ -176,6 +206,8 @@ def create_camera_dataloader(
     Args:
         cameras: list of ``LazyCamera``.
         load_flow: if True, workers also read ``flow_fwd_path`` / ``flow_bwd_path``
+            numpy arrays in parallel with image loading.
+        load_depth: if True, workers also read ``depth_path`` / ``depth_conf_path``
             numpy arrays in parallel with image loading.
     """
     image_paths = [c.image_path for c in cameras]
@@ -187,11 +219,20 @@ def create_camera_dataloader(
         flow_fwd_paths = [c.flow_fwd_path for c in cameras]
         flow_bwd_paths = [c.flow_bwd_path for c in cameras]
 
+    depth_paths: Optional[List[Optional[str]]] = None
+    depth_conf_paths: Optional[List[Optional[str]]] = None
+    if load_depth:
+        depth_paths = [c.depth_path for c in cameras]
+        depth_conf_paths = [c.depth_conf_path for c in cameras]
+
     dataset = CameraDataset(
         image_paths, target_resolutions,
         flow_fwd_paths=flow_fwd_paths,
         flow_bwd_paths=flow_bwd_paths,
         load_flow=load_flow,
+        depth_paths=depth_paths,
+        depth_conf_paths=depth_conf_paths,
+        load_depth=load_depth,
     )
 
     actual_workers = min(num_workers, max(1, len(cameras)))

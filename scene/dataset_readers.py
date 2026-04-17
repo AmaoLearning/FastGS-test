@@ -45,6 +45,8 @@ class CameraInfo(NamedTuple):
     depth: Optional[np.array] = None
     flow_fwd_path: Optional[str] = None   # 前向光流文件路径（延迟加载）
     flow_bwd_path: Optional[str] = None   # 后向光流文件路径（延迟加载）
+    depth_path: Optional[str] = None      # DA3 深度图路径（延迟加载）
+    depth_conf_path: Optional[str] = None # DA3 置信度图路径（延迟加载）
 
 
 class SceneInfo(NamedTuple):
@@ -572,6 +574,13 @@ def readCamerasFromNpy(path, npy_file, split, hold_id, num_images, load_flow: bo
         if has_flow:
             print(f"[INFO] Found optical flow at {flow_root}")
 
+    # 检测 DA3 深度图目录（无条件检测，只要 depth/ 目录存在就记录路径）
+    has_depth = False
+    depth_root = os.path.join(path, 'depth')
+    if os.path.isdir(depth_root):
+        has_depth = True
+        print(f"[INFO] Found DA3 depth maps at {depth_root}")
+
     for i in video_list:
         video_path = video_paths[i]
         cam_name = os.path.basename(os.path.dirname(video_path))  # e.g. "cam00"
@@ -604,11 +613,25 @@ def readCamerasFromNpy(path, npy_file, split, hold_id, num_images, load_flow: bo
                 if os.path.exists(bwd_path):
                     flow_bwd_path = bwd_path
 
+            # 记录 DA3 深度图路径（延迟加载）
+            depth_path = None
+            depth_conf_path = None
+            if has_depth:
+                id_stem_d = Path(image_name).stem
+                depth_cam_dir = os.path.join(depth_root, cam_name)
+                dp = os.path.join(depth_cam_dir, f"depth_{id_stem_d}.npy")
+                cp = os.path.join(depth_cam_dir, f"conf_{id_stem_d}.npy")
+                if os.path.exists(dp):
+                    depth_path = dp
+                if os.path.exists(cp):
+                    depth_conf_path = cp
+
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovX=FovX, FovY=FovY,
                                         image=image,
                                         image_path=image_path, image_name=image_name,
                                         width=image.size[0], height=image.size[1], fid=frame_time,
-                                        flow_fwd_path=flow_fwd_path, flow_bwd_path=flow_bwd_path))
+                                        flow_fwd_path=flow_fwd_path, flow_bwd_path=flow_bwd_path,
+                                        depth_path=depth_path, depth_conf_path=depth_conf_path))
 
             idx += 1
     return cam_infos
@@ -793,6 +816,13 @@ def readCamerasFromDynerfLazy(
         if has_flow:
             print(f"[INFO] Found optical flow at {flow_root}")
 
+    # DA3 depth directory detection (unconditional)
+    has_depth = False
+    depth_root = os.path.join(path, "depth")
+    if os.path.isdir(depth_root):
+        has_depth = True
+        print(f"[INFO] Found DA3 depth maps at {depth_root}")
+
     cam_infos = []
     global_idx = 0
 
@@ -831,6 +861,18 @@ def readCamerasFromDynerfLazy(
                 if os.path.exists(bwd):
                     flow_bwd_path = bwd
 
+            # DA3 depth paths
+            depth_path = None
+            depth_conf_path = None
+            if has_depth:
+                depth_cam_dir = os.path.join(depth_root, cam_name)
+                dp = os.path.join(depth_cam_dir, f"depth_{Path(img_name).stem}.npy")
+                cp = os.path.join(depth_cam_dir, f"conf_{Path(img_name).stem}.npy")
+                if os.path.exists(dp):
+                    depth_path = dp
+                if os.path.exists(cp):
+                    depth_conf_path = cp
+
             cam_infos.append(CameraInfo(
                 uid=global_idx,
                 R=R, T=T,
@@ -842,6 +884,8 @@ def readCamerasFromDynerfLazy(
                 fid=fid,
                 flow_fwd_path=flow_fwd_path,
                 flow_bwd_path=flow_bwd_path,
+                depth_path=depth_path,
+                depth_conf_path=depth_conf_path,
             ))
             global_idx += 1
 

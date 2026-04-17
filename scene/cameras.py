@@ -83,7 +83,8 @@ def preload_flow_cache_from_tensors(
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask, image_name, uid,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device="cuda", fid=None, depth=None,
-                 flow_fwd_path=None, flow_bwd_path=None):
+                 flow_fwd_path=None, flow_bwd_path=None,
+                 depth_path=None, depth_conf_path=None):
         super(Camera, self).__init__()
 
         self.uid = uid
@@ -113,6 +114,12 @@ class Camera(nn.Module):
         self.flow_fwd: Optional[torch.Tensor] = None   # [2, H, W] loaded on demand
         self.flow_bwd: Optional[torch.Tensor] = None   # [2, H, W] loaded on demand
         self.flow_mask: Optional[torch.Tensor] = None   # [1, H, W] computed on demand
+
+        # DA3 depth: 延迟加载 —— 仅存储路径，训练时按需 load_depth()
+        self.depth_path: Optional[str] = depth_path
+        self.depth_conf_path: Optional[str] = depth_conf_path
+        self.da3_depth: Optional[torch.Tensor] = None   # [1, H, W] loaded on demand
+        self.da3_conf: Optional[torch.Tensor] = None    # [1, H, W] loaded on demand
 
         if gt_alpha_mask is not None:
             self.original_image *= gt_alpha_mask.to(self.data_device)
@@ -227,6 +234,33 @@ class Camera(nn.Module):
         self.flow_bwd = None
         self.flow_mask = None
 
+    # ── DA3 Depth lifecycle ──────────────────────────────────────────
+
+    @property
+    def has_depth_map(self) -> bool:
+        """该相机是否有 DA3 深度图可供加载。"""
+        return self.depth_path is not None
+
+    def load_depth(self, device: str = 'cuda') -> None:
+        """按需从磁盘加载 DA3 深度图。幂等操作。"""
+        if self.da3_depth is not None:
+            return
+        if self.depth_path is not None and os.path.exists(self.depth_path):
+            arr = np.load(self.depth_path)  # [H, W]
+            self.da3_depth = torch.from_numpy(arr).unsqueeze(0).to(
+                dtype=torch.float32, device=device
+            )  # [1, H, W]
+        if self.depth_conf_path is not None and os.path.exists(self.depth_conf_path):
+            arr = np.load(self.depth_conf_path)  # [H, W]
+            self.da3_conf = torch.from_numpy(arr).unsqueeze(0).to(
+                dtype=torch.float32, device=device
+            )  # [1, H, W]
+
+    def unload_depth(self) -> None:
+        """释放深度张量以回收显存。"""
+        self.da3_depth = None
+        self.da3_conf = None
+
 
 class LazyCamera(nn.Module):
     """Memory-efficient camera: stores all geometric metadata, defers image IO.
@@ -256,6 +290,8 @@ class LazyCamera(nn.Module):
         depth: np.ndarray = None,
         flow_fwd_path: Optional[str] = None,
         flow_bwd_path: Optional[str] = None,
+        depth_path: Optional[str] = None,
+        depth_conf_path: Optional[str] = None,
     ):
         super().__init__()
 
@@ -293,6 +329,12 @@ class LazyCamera(nn.Module):
         self.flow_fwd: Optional[torch.Tensor] = None
         self.flow_bwd: Optional[torch.Tensor] = None
         self.flow_mask: Optional[torch.Tensor] = None
+
+        # DA3 depth: lazy loading (identical to Camera)
+        self.depth_path: Optional[str] = depth_path
+        self.depth_conf_path: Optional[str] = depth_conf_path
+        self.da3_depth: Optional[torch.Tensor] = None
+        self.da3_conf: Optional[torch.Tensor] = None
 
         self.zfar = 100.0
         self.znear = 0.01
@@ -419,7 +461,41 @@ class LazyCamera(nn.Module):
         self.flow_fwd = None
         self.flow_bwd = None
         self.flow_mask = None
+    # ── DA3 Depth lifecycle (same as Camera) ─────────────────────────
 
+    @property
+    def has_depth_map(self) -> bool:
+        return self.depth_path is not None
+
+    def load_depth(self, device: str = 'cuda') -> None:
+        """按需从磁盘加载 DA3 深度图。幂等操作。优先使用 DataLoader 预取的张量。"""
+        if self.da3_depth is not None:
+            return
+
+        # Use prefetched tensors from DataLoader if available
+        _pre_d = getattr(self, '_prefetched_depth', None)
+        _pre_c = getattr(self, '_prefetched_depth_conf', None)
+        if _pre_d is not None and _pre_d.numel() > 0:
+            self.da3_depth = _pre_d.to(device=device, non_blocking=True)
+            self._prefetched_depth = None
+        elif self.depth_path is not None and os.path.exists(self.depth_path):
+            arr = np.load(self.depth_path)  # [H, W]
+            self.da3_depth = torch.from_numpy(arr).unsqueeze(0).to(
+                dtype=torch.float32, device=device
+            )  # [1, H, W]
+
+        if _pre_c is not None and _pre_c.numel() > 0:
+            self.da3_conf = _pre_c.to(device=device, non_blocking=True)
+            self._prefetched_depth_conf = None
+        elif self.depth_conf_path is not None and os.path.exists(self.depth_conf_path):
+            arr = np.load(self.depth_conf_path)  # [H, W]
+            self.da3_conf = torch.from_numpy(arr).unsqueeze(0).to(
+                dtype=torch.float32, device=device
+            )  # [1, H, W]
+
+    def unload_depth(self) -> None:
+        self.da3_depth = None
+        self.da3_conf = None
     # ── Utility ──────────────────────────────────────────────────────
 
     def reset_extrinsic(self, R, T):

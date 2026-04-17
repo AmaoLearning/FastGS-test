@@ -67,6 +67,7 @@ class Scene:
 
         load_flow = args.use_flow_loss or args.use_flow_mask or args.use_dynamic_sep
         self._load_flow: bool = load_flow
+        self._load_depth: bool = False
 
         # Number of *temporal* frames (used for time_interval in velocity
         # loss).  For multi-camera datasets the total camera count is
@@ -219,6 +220,7 @@ class Scene:
             persistent_workers=True,
             shuffle=True,
             load_flow=_prefetch_flow,
+            load_depth=self._load_depth,
         )
         self._lazy_data_iter = InfiniteDataLoader(_dl)
 
@@ -266,7 +268,7 @@ class Scene:
                 event (captures previous compute on the target buffer)
                 to avoid a WAR hazard.
         """
-        _batch_idx, _batch_img, _batch_flow_fwd, _batch_flow_bwd = next(self._lazy_data_iter)
+        _batch_idx, _batch_img, _batch_flow_fwd, _batch_flow_bwd, _batch_depth, _batch_depth_conf = next(self._lazy_data_iter)
         cam_idx = _batch_idx.item()
         pinned_img = _batch_img.squeeze(0)          # [3,H,W] pinned CPU
 
@@ -285,6 +287,16 @@ class Scene:
                 cache_device=self._flow_preload_cache_device,
                 cache_size=self._flow_preload_cache_size,
             )
+
+        # Pre-assign depth tensors from DataLoader to the camera so that
+        # load_depth() in train.py can move them to GPU without re-reading
+        # from disk.
+        if (self._load_depth
+                and self._lazy_cameras is not None
+                and (_batch_depth.numel() > 0 or _batch_depth_conf.numel() > 0)):
+            _cam = self._lazy_cameras[cam_idx]
+            _cam._prefetched_depth = _batch_depth
+            _cam._prefetched_depth_conf = _batch_depth_conf
 
         next_buf = (self._active_buf_idx + 1) % len(self._gpu_image_buffers)
         with torch.cuda.stream(self._dma_stream):
@@ -343,7 +355,7 @@ class Scene:
                 return cam, self._num_temporal_frames
             else:
                 # Fallback (mixed resolutions): no double buffer
-                _batch_idx, _batch_img, _, _ = next(self._lazy_data_iter)
+                _batch_idx, _batch_img, _, _, _, _ = next(self._lazy_data_iter)
                 cam = cameras[_batch_idx.item()]
                 cam.original_image = _batch_img.squeeze(0).to(
                     "cuda", non_blocking=True)
