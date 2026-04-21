@@ -291,7 +291,6 @@ def run_clustering_at_iteration(
     teacher_checkpoint = dataset.teacher_checkpoint_path
 
     # ── Capacity allocation visualization (pseudo-color render) ──
-    from utils.cluster_utils import render_capacity_pseudocolor
     # Render capacity tier pseudo-color image (separate from cluster ID visualization)
     _capacity_vis_path = os.path.join(
         dataset.model_path, "cluster",
@@ -313,8 +312,6 @@ def run_clustering_at_iteration(
     _msg = f"[CAPACITY-VIS] Capacity allocation render saved to {_capacity_vis_path}"
     print(_msg)
 
-    from scene.deform_model import ClusteredDeformModel
-    
     n_clusters = dataset.cluster_n_clusters
 
     _s_res = tuple(int(x) for x in dataset.hex_spatial_res.split(","))
@@ -388,7 +385,6 @@ def run_clustering_at_iteration(
     if 'args' in globals() and args.plot_fft:
         print("[INFO] Setting up tracked points for FFT...")
         import torch
-        import os
         labels = gaussians._cluster_labels
         for c in range(n_clusters):
             indices = torch.nonzero(labels == c).squeeze(1)
