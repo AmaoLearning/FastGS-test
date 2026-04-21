@@ -112,6 +112,39 @@ def get_linear_noise_func(
     return helper
 
 
+def get_linear_weight_anneal_func(
+        weight_init, weight_final, anneal_start, anneal_end
+):
+    """Linear annealing schedule for a scalar loss weight.
+
+    Returns a callable ``f(iteration) -> float`` that:
+    - Returns ``weight_init`` for ``iteration <= anneal_start``
+    - Linearly interpolates from ``weight_init`` to ``weight_final``
+      over ``(anneal_start, anneal_end)``
+    - Returns ``weight_final`` for ``iteration >= anneal_end``
+
+    Parameters
+    ----------
+    weight_init : float
+        Weight at the beginning of annealing.
+    weight_final : float
+        Weight at the end of annealing.
+    anneal_start : int
+        Iteration at which annealing begins.
+    anneal_end : int
+        Iteration at which annealing completes.
+    """
+    def helper(iteration):
+        if iteration <= anneal_start:
+            return weight_init
+        if iteration >= anneal_end:
+            return weight_final
+        ratio = (iteration - anneal_start) / (anneal_end - anneal_start)
+        return weight_init * (1.0 - ratio) + weight_final * ratio
+
+    return helper
+
+
 def strip_lowerdiag(L):
     uncertainty = torch.zeros((L.shape[0], 6), dtype=torch.float, device="cuda")
 

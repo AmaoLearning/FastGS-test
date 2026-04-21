@@ -221,6 +221,17 @@ class OptimizationParams(ParamGroup):
         self.dynamic_opacity_reg_weight = 0.0
         self.dynamic_opacity_reg_start_iter = 15000
 
+        # HexPlane temporal TV annealing (only effective when deform_type="4dgs")
+        # When enabled, the TV loss on the temporal axis of XT/YT/ZT planes is
+        # annealed from weight_init down to weight_final over [anneal_start, anneal_end].
+        # This allows the deformation field to model large/sudden displacements in the
+        # later training phase while remaining stable during warm-up.
+        self.hex_tv_temporal_anneal = False           # master switch
+        self.hex_tv_temporal_weight_init = 1e-3      # initial temporal TV weight (same as default)
+        self.hex_tv_temporal_weight_final = 1e-5     # final temporal TV weight after annealing
+        self.hex_tv_temporal_anneal_start = 15000    # iteration to begin annealing
+        self.hex_tv_temporal_anneal_end = 30000      # iteration when annealing completes
+
         super().__init__(parser, "Optimization Parameters", sentinel)
 
 

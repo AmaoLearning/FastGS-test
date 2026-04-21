@@ -20,7 +20,7 @@ from utils.loss_utils import (l1_loss, ssim, kl_divergence, l2_loss,
 from gaussian_renderer import render_fastgs, network_gui
 import sys
 from scene import Scene, GaussianModel, DeformModel, DeformModel_4DGS, ClusteredDeformModel
-from utils.general_utils import safe_state, get_linear_noise_func
+from utils.general_utils import safe_state, get_linear_noise_func, get_linear_weight_anneal_func
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
@@ -483,6 +483,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
     progress_bar = tqdm(range(opt.iterations), desc="Training progress")
     smooth_term = get_linear_noise_func(lr_init=0.1, lr_final=1e-15, lr_delay_mult=0.01, max_steps=20000)
 
+    # ── Temporal TV annealing schedule (4DGS only) ─────────────────────────────
+    # When opt.hex_tv_temporal_anneal=True, the TV weight on the time axis of
+    # XT/YT/ZT planes is linearly decayed from weight_init to weight_final over
+    # [anneal_start, anneal_end], unlocking large/sudden displacements.
+    _tv_temporal_anneal_func = None
+    if _deform_type == "4dgs" and opt.hex_tv_temporal_anneal:
+        _tv_temporal_anneal_func = get_linear_weight_anneal_func(
+            weight_init=opt.hex_tv_temporal_weight_init,
+            weight_final=opt.hex_tv_temporal_weight_final,
+            anneal_start=opt.hex_tv_temporal_anneal_start,
+            anneal_end=opt.hex_tv_temporal_anneal_end,
+        )
+        logger.info(
+            "Temporal TV annealing: %.2e → %.2e over iters [%d, %d]",
+            opt.hex_tv_temporal_weight_init, opt.hex_tv_temporal_weight_final,
+            opt.hex_tv_temporal_anneal_start, opt.hex_tv_temporal_anneal_end,
+        )
+        print(
+            f"[INFO] Temporal TV annealing: {opt.hex_tv_temporal_weight_init:.2e} → "
+            f"{opt.hex_tv_temporal_weight_final:.2e} "
+            f"over iters [{opt.hex_tv_temporal_anneal_start}, {opt.hex_tv_temporal_anneal_end}]"
+        )
+
     # ── Phase-level timer for diagnosing GPU utilization ──
     # Records wall-clock time (with CUDA sync) per phase:
     #   data / deform / render / loss / backward / optim / other
@@ -653,20 +676,30 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
         _reg_loss_scalar = None  # for TensorBoard logging
         _per_student_reg_losses = None  # list of per-student reg losses (ClusteredDeformModel only)
         if _deform_type == "4dgs" and iteration >= opt.warm_up:
+            # Temporal TV annealing weight: None when feature is disabled.
+            _tv_temporal_weight = (
+                _tv_temporal_anneal_func(iteration)
+                if _tv_temporal_anneal_func is not None else None
+            )
             if isinstance(deform, ClusteredDeformModel):
                 # Defer backward — collect individual losses now, backward later in parallel
-                _per_student_reg_losses = deform.get_per_student_regularization_losses()
+                _per_student_reg_losses = deform.get_per_student_regularization_losses(
+                    tv_temporal_weight=_tv_temporal_weight
+                )
                 # Compute scalar for logging (detached, no graph)
                 with torch.no_grad():
                     _reg_loss_scalar = sum(r.detach() for r in _per_student_reg_losses)
             else:
-                _reg_loss = deform.get_regularization_loss()
+                _reg_loss = deform.get_regularization_loss(tv_temporal_weight=_tv_temporal_weight)
                 loss = loss + _reg_loss
                 _reg_loss_scalar = _reg_loss.detach()
             if tb_writer and iteration % 100 == 0:
                 tb_writer.add_scalar('train_loss_patches/hexplane_reg',
                                      _reg_loss_scalar.item() if _reg_loss_scalar is not None else 0.0,
                                      iteration)
+                if _tv_temporal_weight is not None:
+                    tb_writer.add_scalar('train_loss_patches/tv_temporal_weight',
+                                         _tv_temporal_weight, iteration)
         
         # ── Knowledge distillation loss for clustered deform model ──
         # Compute distillation loss sparsely (every 5 iterations) to reduce overhead

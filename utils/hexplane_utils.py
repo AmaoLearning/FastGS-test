@@ -102,6 +102,10 @@ _PLANE_PAIRS: List[Tuple[int, int]] = [
     (2, 3),  # ZT
 ]
 
+# Indices into _PLANE_PAIRS whose W-axis (dim=-1) is the temporal axis.
+# XY(0), XZ(1), YZ(3) are pure-spatial; XT(2), YT(4), ZT(5) are space-time.
+_TEMPORAL_PLANE_INDICES: frozenset = frozenset({2, 4, 5})
+
 
 class HexPlaneField(nn.Module):
     """Multi-resolution HexPlane feature grids.
@@ -241,6 +245,36 @@ class HexPlaneField(nn.Module):
             for p in lvl_planes:
                 l1 = l1 + p.abs().mean()
         return l1
+
+    def compute_plane_tv_split(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """TV loss split by axis type: (spatial_tv, temporal_tv).
+
+        For pure-spatial planes (XY, XZ, YZ) both H and W differencing
+        goes into *spatial_tv*.  For space-time planes (XT, YT, ZT) the
+        H-direction (spatial axis) goes into *spatial_tv* and the
+        W-direction (temporal axis) goes into *temporal_tv*.
+
+        Returns
+        -------
+        spatial_tv : torch.Tensor  — scalar
+        temporal_tv : torch.Tensor — scalar
+        """
+        dev = next(self.parameters()).device
+        spatial_tv = torch.tensor(0.0, device=dev)
+        temporal_tv = torch.tensor(0.0, device=dev)
+        for lvl_planes in self.planes:
+            for pidx, p in enumerate(lvl_planes):
+                # p: (1, C, H, W)
+                h_tv = (p[:, :, 1:, :] - p[:, :, :-1, :]).abs().mean()
+                w_tv = (p[:, :, :, 1:] - p[:, :, :, :-1]).abs().mean()
+                if pidx in _TEMPORAL_PLANE_INDICES:
+                    # H = spatial axis, W = temporal axis
+                    spatial_tv = spatial_tv + h_tv
+                    temporal_tv = temporal_tv + w_tv
+                else:
+                    # Both axes are spatial
+                    spatial_tv = spatial_tv + h_tv + w_tv
+        return spatial_tv, temporal_tv
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -431,3 +465,7 @@ class HexPlaneDeformNetwork(nn.Module):
 
     def get_plane_l1_loss(self) -> torch.Tensor:
         return self.hexplane.compute_plane_l1()
+
+    def get_plane_tv_loss_split(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return (spatial_tv, temporal_tv) from underlying HexPlaneField."""
+        return self.hexplane.compute_plane_tv_split()

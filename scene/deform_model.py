@@ -201,8 +201,21 @@ class DeformModel_4DGS:
 
     # ── Regularisation losses ─────────────────────────────────────────
 
-    def get_regularization_loss(self) -> torch.Tensor:
-        """Get TV and L1 regularization"""
+    def get_regularization_loss(
+        self, tv_temporal_weight: Optional[float] = None
+    ) -> torch.Tensor:
+        """Get TV and L1 regularization.
+
+        Parameters
+        ----------
+        tv_temporal_weight : float or None
+            When not None, the temporal axis of XT/YT/ZT planes uses this
+            weight instead of the default 1e-3, enabling temporal TV annealing.
+        """
+        if tv_temporal_weight is not None:
+            spatial_tv, temporal_tv = self.deform.get_plane_tv_loss_split()
+            l1 = self.deform.get_plane_l1_loss()
+            return 1e-3 * spatial_tv + tv_temporal_weight * temporal_tv + 1e-4 * l1
         return 1e-3 * self.deform.get_plane_tv_loss() + 1e-4 * self.deform.get_plane_l1_loss()
 
 
@@ -723,21 +736,46 @@ class ClusteredDeformModel:
         
         logger.info(f"所有 {n} 个学生网络热启动初始化完成。")
     
-    def get_regularization_loss(self) -> torch.Tensor:
-        """Get TV and L1 regularization from all student models."""
+    def get_regularization_loss(
+        self, tv_temporal_weight: Optional[float] = None
+    ) -> torch.Tensor:
+        """Get TV and L1 regularization from all student models.
+
+        Parameters
+        ----------
+        tv_temporal_weight : float or None
+            When not None, temporal axes of XT/YT/ZT planes use this weight.
+        """
+        if tv_temporal_weight is not None:
+            spatial_tv = sum(s.get_plane_tv_loss_split()[0] for s in self.students)
+            temporal_tv = sum(s.get_plane_tv_loss_split()[1] for s in self.students)
+            l1 = sum(s.get_plane_l1_loss() for s in self.students)
+            return 1e-3 * spatial_tv + tv_temporal_weight * temporal_tv + 1e-4 * l1
         tv_loss = sum(student.get_plane_tv_loss() for student in self.students)
         l1_loss = sum(student.get_plane_l1_loss() for student in self.students)
         return 1e-3 * tv_loss + 1e-4 * l1_loss
 
-    def get_per_student_regularization_losses(self) -> List[torch.Tensor]:
+    def get_per_student_regularization_losses(
+        self, tv_temporal_weight: Optional[float] = None
+    ) -> List[torch.Tensor]:
         """Return per-student regularization losses for parallel backward.
 
-        Each element is ``1e-3 * TV_k + 1e-4 * L1_k`` for student *k*.
+        Each element is the regularization loss for student *k*.
         The losses are **not** summed so callers can backward them on
         independent CUDA streams.
+
+        Parameters
+        ----------
+        tv_temporal_weight : float or None
+            When not None, temporal axes of XT/YT/ZT planes use this weight.
         """
         losses: List[torch.Tensor] = []
         for student in self.students:
-            reg_k = 1e-3 * student.get_plane_tv_loss() + 1e-4 * student.get_plane_l1_loss()
+            if tv_temporal_weight is not None:
+                s_tv, t_tv = student.get_plane_tv_loss_split()
+                l1 = student.get_plane_l1_loss()
+                reg_k = 1e-3 * s_tv + tv_temporal_weight * t_tv + 1e-4 * l1
+            else:
+                reg_k = 1e-3 * student.get_plane_tv_loss() + 1e-4 * student.get_plane_l1_loss()
             losses.append(reg_k)
         return losses
