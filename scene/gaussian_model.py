@@ -129,7 +129,8 @@ class GaussianModel:
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self._deform_accum = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
         self._deform_sq_accum = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
-        self._deform_denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")        self.tracked_for_fft = torch.zeros((self.get_xyz.shape[0],), dtype=torch.bool, device="cuda")        # Initialize max/min deformation tracking
+        self._deform_denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")        
+        self.tracked_for_fft = torch.zeros((self.get_xyz.shape[0],), dtype=torch.bool, device="cuda")        # Initialize max/min deformation tracking
         self._deform_max = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
         self._deform_min = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
         self._deform_tracking_started = False
