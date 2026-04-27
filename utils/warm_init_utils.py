@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import List, Optional, Literal, TYPE_CHECKING
+from typing import List, Optional, Literal, Tuple, TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -65,6 +65,15 @@ class WarmInitConfig:
     normalize_scale: bool = True
     """迁移后是否对平面幅值做归一化，保持 L2 范数一致。"""
 
+    # ── AABB 坐标重映射 ──
+    use_aabb_remap: bool = True
+    """
+    若为 True，在将教师平面迁移给学生时，以世界坐标为桥梁进行双线性重采样：
+    每个学生网格单元 → 学生 AABB 反归一化 → 世界坐标 → 教师 AABB 归一化 → 采样教师平面。
+    这比简单插值更准确地传递教师表示，尤其是当学生 AABB 是全局 AABB 的一个子集时。
+    若为 False，回退到 F.interpolate（原有行为）。
+    """
+
     # ── 按簇裁剪 ──
     cluster_aware: bool = False
     """
@@ -78,6 +87,108 @@ class WarmInitConfig:
     迁移后添加高斯噪声，用于打破多个学生之间的对称性。
     默认 1e-4，0.0 表示不添加噪声。
     """
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 平面坐标轴对 (与 hexplane_utils._PLANE_PAIRS 保持一致)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# (di, dj): H 轴对应 dim di，W 轴对应 dim dj；dim 0=X,1=Y,2=Z,3=T
+_PLANE_PAIRS_STATIC: List[Tuple[int, int]] = [
+    (0, 1),  # 0: XY
+    (0, 2),  # 1: XZ
+    (0, 3),  # 2: XT
+    (1, 2),  # 3: YZ
+    (1, 3),  # 4: YT
+    (2, 3),  # 5: ZT
+]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# AABB 感知的平面坐标重映射
+# ──────────────────────────────────────────────────────────────────────────────
+
+def remap_teacher_plane_to_student_aabb(
+    teacher_plane: torch.Tensor,
+    teacher_aabb_min: torch.Tensor,
+    teacher_aabb_max: torch.Tensor,
+    student_aabb_min: torch.Tensor,
+    student_aabb_max: torch.Tensor,
+    plane_idx: int,
+    target_H: int,
+    target_W: int,
+) -> torch.Tensor:
+    """以世界坐标为桥，将教师平面重采样到学生目标网格尺寸。
+
+    原理
+    ----
+    对学生目标网格中每个单元格 ``(h, w)``，执行：
+
+    1. 学生归一化坐标 ``norm ∈ [-1, 1]``
+    2. 反归一化至世界坐标（使用学生 AABB）：
+       ``world = s_min + (norm + 1) / 2 * (s_max - s_min)``
+    3. 重归一化至教师坐标（使用教师 AABB）：
+       ``teacher_norm = 2 * (world - t_min) / (t_max - t_min) - 1``
+    4. 在教师平面上以 ``grid_sample`` 采样。
+
+    时间轴 (dim=3) 不属于空间 AABB，直接做恒等映射。
+
+    超出教师 AABB 的坐标（若学生簇局部偏移超出全局范围）使用 ``border`` 填充。
+
+    Parameters
+    ----------
+    teacher_plane : ``(1, C, H_t, W_t)``
+    teacher_aabb_min / teacher_aabb_max : ``(3,)`` 教师全局 AABB（xyz）
+    student_aabb_min / student_aabb_max : ``(3,)`` 学生局部 AABB（xyz）
+    plane_idx : 0..5，对应 _PLANE_PAIRS_STATIC 的平面类型
+    target_H, target_W : 学生目标分辨率
+
+    Returns
+    -------
+    ``(1, C, target_H, target_W)``
+    """
+    device = teacher_plane.device
+    dtype = teacher_plane.dtype
+    di, dj = _PLANE_PAIRS_STATIC[plane_idx]
+
+    # 构建学生网格归一化坐标 [-1, 1]（align_corners=True）
+    h_coords = (
+        torch.linspace(-1.0, 1.0, target_H, device=device, dtype=dtype)
+        if target_H > 1
+        else torch.zeros(1, device=device, dtype=dtype)
+    )
+    w_coords = (
+        torch.linspace(-1.0, 1.0, target_W, device=device, dtype=dtype)
+        if target_W > 1
+        else torch.zeros(1, device=device, dtype=dtype)
+    )
+    grid_h, grid_w = torch.meshgrid(h_coords, w_coords, indexing="ij")  # (H, W)
+
+    def _remap_axis(norm_coords: torch.Tensor, dim: int) -> torch.Tensor:
+        """学生归一化坐标 → 教师归一化坐标（单轴）。"""
+        if dim >= 3:  # 时间轴：恒等
+            return norm_coords
+        s_min = student_aabb_min[dim].to(dtype=dtype)
+        s_max = student_aabb_max[dim].to(dtype=dtype)
+        t_min = teacher_aabb_min[dim].to(dtype=dtype)
+        t_max = teacher_aabb_max[dim].to(dtype=dtype)
+        world = s_min + (norm_coords + 1.0) * 0.5 * (s_max - s_min)
+        return 2.0 * (world - t_min) / (t_max - t_min + 1e-8) - 1.0
+
+    teacher_h = _remap_axis(grid_h, di)  # (H, W)
+    teacher_w = _remap_axis(grid_w, dj)  # (H, W)
+
+    # grid_sample 期望 (x=W方向, y=H方向)
+    sample_grid = torch.stack([teacher_w, teacher_h], dim=-1).unsqueeze(0)  # (1, H, W, 2)
+
+    result = F.grid_sample(
+        teacher_plane,
+        sample_grid,
+        mode="bilinear",
+        align_corners=True,
+        padding_mode="border",
+    )  # (1, C, target_H, target_W)
+    return result.detach()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -184,13 +295,19 @@ def _transfer_single_plane(
     target_w: int,
     target_feat_dim: int,
     cfg: WarmInitConfig,
+    plane_idx: int = 0,
+    teacher_aabb_min: Optional[torch.Tensor] = None,
+    teacher_aabb_max: Optional[torch.Tensor] = None,
+    student_aabb_min: Optional[torch.Tensor] = None,
+    student_aabb_max: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     将单个教师平面迁移并转换为学生目标形状。
 
     处理顺序:
       1. 特征维度压缩 (先做，减少后续插值计算量)
-      2. 空间分辨率插值
+      2a. 若 cfg.use_aabb_remap 且 AABB 已提供：AABB 感知重映射
+      2b. 否则：F.interpolate（原有行为）
       3. 幅值归一化
 
     Args:
@@ -198,6 +315,9 @@ def _transfer_single_plane(
         target_h, target_w: 学生目标分辨率
         target_feat_dim: 学生目标特征维度
         cfg: 热启动配置
+        plane_idx: 平面类型 0..5（对应 _PLANE_PAIRS_STATIC）
+        teacher_aabb_min/max: 教师全局 AABB，``(3,)``
+        student_aabb_min/max: 学生局部 AABB，``(3,)``
 
     Returns:
         [1, target_feat_dim, target_h, target_w]
@@ -208,22 +328,40 @@ def _transfer_single_plane(
     if plane.shape[1] != target_feat_dim:
         method = cfg.feat_compression_method
         if method != "none" and plane.shape[1] > target_feat_dim:
-            # 使用指定的压缩方法 (truncate / pca / random_proj)
             plane = _compress_feat_dim(plane, target_feat_dim, method=method)
         elif plane.shape[1] > target_feat_dim:
-            # method == "none": 仅截断，不做花式压缩
             plane = plane[:, :target_feat_dim, :, :]
         else:
-            # 目标维度更大：用零填充 (不应出现，但防御性处理)
             pad_c = target_feat_dim - plane.shape[1]
             padding = torch.zeros(1, pad_c, plane.shape[2], plane.shape[3],
                                   device=plane.device, dtype=plane.dtype)
             plane = torch.cat([plane, padding], dim=1)
 
-    # ── 步骤 2: 空间/时间分辨率插值 ──
+    # ── 步骤 2: 空间/时间分辨率 + 坐标系对齐 ──
+    _have_aabb = (
+        cfg.use_aabb_remap
+        and teacher_aabb_min is not None
+        and teacher_aabb_max is not None
+        and student_aabb_min is not None
+        and student_aabb_max is not None
+    )
     if cfg.downsample_planes:
         curr_h, curr_w = plane.shape[2], plane.shape[3]
-        if (curr_h, curr_w) != (target_h, target_w):
+        need_resize = (curr_h, curr_w) != (target_h, target_w)
+        if _have_aabb:
+            # AABB 感知重映射（同时完成世界坐标对齐和分辨率变换）
+            plane = remap_teacher_plane_to_student_aabb(
+                plane,
+                teacher_aabb_min=teacher_aabb_min,
+                teacher_aabb_max=teacher_aabb_max,
+                student_aabb_min=student_aabb_min,
+                student_aabb_max=student_aabb_max,
+                plane_idx=plane_idx,
+                target_H=target_h,
+                target_W=target_w,
+            )
+        elif need_resize:
+            # 无 AABB 信息时回退到普通插值
             plane = F.interpolate(
                 plane,
                 size=(target_h, target_w),
@@ -251,6 +389,10 @@ def transfer_hexplane_level(
     student_time_res: int,
     student_feat_dim: int,
     cfg: WarmInitConfig,
+    teacher_aabb_min: Optional[torch.Tensor] = None,
+    teacher_aabb_max: Optional[torch.Tensor] = None,
+    student_aabb_min: Optional[torch.Tensor] = None,
+    student_aabb_max: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     """
     将教师某个分辨率级别的六个平面迁移到学生对应级别。
@@ -263,12 +405,17 @@ def transfer_hexplane_level(
       4: YT  [1, C, T,    S_y ]
       5: ZT  [1, C, T,    S_z ]
 
+    当提供 AABB 参数且 cfg.use_aabb_remap=True 时，空间坐标轴做世界坐标
+    对齐重采样（时间轴保持恒等映射）。
+
     Args:
         teacher_planes_at_level: 长度为 6 的列表，每项形状见上。
         student_spatial_res: 学生空间分辨率 (S_x = S_y = S_z)。
         student_time_res: 学生时间分辨率 (T)。
         student_feat_dim: 学生特征维度 C。
         cfg: 热启动配置。
+        teacher_aabb_min/max: 教师 AABB ``(3,)``，可选。
+        student_aabb_min/max: 学生 AABB ``(3,)``，可选。
 
     Returns:
         长度为 6 的列表，每项已转换为学生目标形状。
@@ -277,18 +424,27 @@ def transfer_hexplane_level(
     T = student_time_res
 
     # 目标尺寸：每个平面的 (H, W)
+    # 注意：_PLANE_PAIRS_STATIC 的 H=di, W=dj
+    # di/dj < 3 → 空间轴 (S), di/dj == 3 → 时间轴 (T)
     target_hw = [
-        (S, S),  # XY
-        (S, S),  # XZ
-        (S, S),  # YZ
-        (T, S),  # XT
-        (T, S),  # YT
-        (T, S),  # ZT
+        (S, S),  # 0: XY
+        (S, S),  # 1: XZ
+        (S, T),  # 2: XT  H=X(spatial), W=T(temporal)
+        (S, S),  # 3: YZ
+        (S, T),  # 4: YT  H=Y(spatial), W=T(temporal)
+        (S, T),  # 5: ZT  H=Z(spatial), W=T(temporal)
     ]
 
     result = []
     for i, (t_plane, (th, tw)) in enumerate(zip(teacher_planes_at_level, target_hw)):
-        transferred = _transfer_single_plane(t_plane, th, tw, student_feat_dim, cfg)
+        transferred = _transfer_single_plane(
+            t_plane, th, tw, student_feat_dim, cfg,
+            plane_idx=i,
+            teacher_aabb_min=teacher_aabb_min,
+            teacher_aabb_max=teacher_aabb_max,
+            student_aabb_min=student_aabb_min,
+            student_aabb_max=student_aabb_max,
+        )
         result.append(transferred)
         logger.debug(
             f"  平面 {i}: 教师 {tuple(t_plane.shape)} → 学生 {tuple(transferred.shape)}"
@@ -365,6 +521,9 @@ def warm_init_student_from_teacher(
     """
     将教师 HexPlaneDeformNetwork 的参数降采样迁移到学生网络 (原地修改)。
 
+    当 cfg.use_aabb_remap=True 时，自动从网络的 aabb_min/aabb_max 缓冲区
+    读取 AABB，以世界坐标为桥进行 AABB 感知重采样，避免特征坐标系错位。
+
     此函数假设 teacher_network 和 student_network 都遵循 FastGS 的
     HexPlaneDeformNetwork 接口，即:
       - network.grids: nn.ParameterList，按
@@ -396,6 +555,26 @@ def warm_init_student_from_teacher(
         f"  教师级别数：{teacher_n_levels}, 学生级别数：{student_n_levels}"
     )
 
+    # ── 提取 AABB（用于坐标重映射）──
+    teacher_aabb_min = teacher_aabb_max = None
+    student_aabb_min = student_aabb_max = None
+    if cfg.use_aabb_remap:
+        if hasattr(teacher_network, "aabb_min") and hasattr(teacher_network, "aabb_max"):
+            teacher_aabb_min = teacher_network.aabb_min.detach()
+            teacher_aabb_max = teacher_network.aabb_max.detach()
+        if hasattr(student_network, "aabb_min") and hasattr(student_network, "aabb_max"):
+            student_aabb_min = student_network.aabb_min.detach()
+            student_aabb_max = student_network.aabb_max.detach()
+        if teacher_aabb_min is not None and student_aabb_min is not None:
+            logger.info(
+                "  AABB 重映射：教师 [%.3f,%.3f,%.3f]~[%.3f,%.3f,%.3f]  "
+                "学生 [%.3f,%.3f,%.3f]~[%.3f,%.3f,%.3f]",
+                *teacher_aabb_min.tolist(), *teacher_aabb_max.tolist(),
+                *student_aabb_min.tolist(), *student_aabb_max.tolist(),
+            )
+        else:
+            logger.warning("  AABB 重映射已请求但网络中找不到 aabb_min/max，回退到 F.interpolate。")
+
     # ── 建立级别映射 ──
     level_mapping = _build_level_mapping(teacher_n_levels, student_n_levels)
 
@@ -409,6 +588,10 @@ def warm_init_student_from_teacher(
             student_time_res=student_time_resolutions[s_lvl],
             student_feat_dim=student_feat_dim,
             cfg=cfg,
+            teacher_aabb_min=teacher_aabb_min,
+            teacher_aabb_max=teacher_aabb_max,
+            student_aabb_min=student_aabb_min,
+            student_aabb_max=student_aabb_max,
         )
         new_planes.extend(s_planes)
         logger.info(

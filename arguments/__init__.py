@@ -88,6 +88,7 @@ class ModelParams(ParamGroup):
         self.cluster_w_xyz = 1.0           # 聚类特征权重：3D 位置
         self.cluster_w_color = 0.1         # 聚类特征权重：SH 0阶 (RGB)
         self.cluster_w_motion = 0.5        # 聚类特征权重：历史平均形变
+        self.cluster_aabb_padding = 0.15   # 逐簇 AABB 安全边距（相对于簇的位移感知范围）
 
         # mapo
         self.dynamic_score_percentile = 80  # 动态分数百分位阈值：选取动态分数位于前 (100-percentile)% 的高斯参与聚类，默认为 80 表示前 20%
@@ -231,6 +232,15 @@ class OptimizationParams(ParamGroup):
         self.hex_tv_temporal_weight_final = 1e-5     # final temporal TV weight after annealing
         self.hex_tv_temporal_anneal_start = 15000    # iteration to begin annealing
         self.hex_tv_temporal_anneal_end = 30000      # iteration when annealing completes
+
+        # Boundary regularization (Module C)
+        # Penalises deformation magnitude for Gaussians near or beyond the edge of
+        # their cluster AABB, preventing grid_sample border-clamping artefacts.
+        # Only active when use_dynamic_sep=True and after clustered_deform_start_iter.
+        self.boundary_reg_weight = 0.0         # 0.0 = disabled; try 1e-3 ~ 1e-2
+        self.boundary_reg_margin = 0.05        # |norm_coord| > (1-margin) → penalised
+        self.boundary_reg_start_iter = 15000   # start after clustering
+        self.boundary_reg_interval = 10        # compute every N iterations (cost reduction)
 
         super().__init__(parser, "Optimization Parameters", sentinel)
 

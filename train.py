@@ -351,13 +351,38 @@ def run_clustering_at_iteration(
         logger.info("[ITER %d] Loaded teacher weights from in-training deform model", iteration)
         print("[INFO] Loaded teacher weights from in-training deform model (iteration {})".format(iteration))
     clustered_deform.teacher.eval()  # Ensure teacher is frozen
-    
-    # Set AABB
-    clustered_deform.set_aabb(gaussians.get_xyz.detach(), padding=0.1)
-    
-    # Set cluster labels
+
+    # Set cluster labels FIRST — required before per-cluster AABB computation.
     clustered_deform.set_cluster_labels(gaussians._cluster_labels)
-    
+
+    # ── Displacement-aware per-cluster AABB ──────────────────────────────────
+    # Each student's AABB is built from the worst-case reachable positions of
+    # its cluster's Gaussians:
+    #   pos_max_k = (xyz + deform_max)[cluster_k].max(axis=0)
+    #   pos_min_k = (xyz + deform_min)[cluster_k].min(axis=0)
+    # This keeps every deformed position inside [-1, 1] after normalisation,
+    # while still providing cluster-tight spatial coverage.
+    # deform_max / deform_min are tracked from iter 10000; numel()==0 when not yet started.
+    _pts = gaussians.get_xyz.detach()
+    _deform_max = gaussians._deform_max if gaussians._deform_max.numel() > 0 else None
+    _deform_min = gaussians._deform_min if gaussians._deform_min.numel() > 0 else None
+    clustered_deform.set_per_cluster_aabb(
+        _pts,
+        cluster_labels=gaussians._cluster_labels,
+        padding=dataset.cluster_aabb_padding,
+        deform_max=_deform_max,
+        deform_min=_deform_min,
+    )
+    if _deform_max is not None:
+        logger.info("[ITER %d] Per-cluster AABB set with displacement-aware expansion (padding=%.2f)",
+                    iteration, dataset.cluster_aabb_padding)
+    else:
+        logger.info("[ITER %d] Per-cluster AABB set with static padding=%.2f (no displacement stats)",
+                    iteration, dataset.cluster_aabb_padding)
+
+    # ── Module D: log per-cluster AABB stats to TensorBoard ──────────────────
+    clustered_deform.log_cluster_aabb_stats(tb_writer, iteration)
+
     # ── Warm initialization: teacher → student knowledge transfer ──
     # Import warm init utilities
     from utils.warm_init_utils import WarmInitConfig
@@ -369,8 +394,9 @@ def run_clustering_at_iteration(
         transfer_mlp=dataset.warm_init_transfer_mlp,
         normalize_scale=dataset.warm_init_normalize_scale,
         noise_std=dataset.warm_init_noise_std,
+        use_aabb_remap=True,  # AABB-aware remapping (Module B)
     )
-    
+
     # Initialize students with warm start from teacher
     clustered_deform.initialize_students_with_warm_init(warm_init_cfg)
     
@@ -722,6 +748,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             
             if tb_writer and iteration % 100 == 0:
                 tb_writer.add_scalar('train_loss_patches/distillation_loss', distill_loss.item(), iteration)
+
+        # ── Module C: Boundary regularization for clustered deform model ──
+        # Penalises deformation magnitude near/beyond cluster AABB edges.
+        # Run every `boundary_reg_interval` iterations to amortise the extra forward pass.
+        if (opt.boundary_reg_weight > 0
+                and isinstance(deform, ClusteredDeformModel)
+                and iteration >= opt.boundary_reg_start_iter
+                and gaussians._cluster_labels is not None
+                and iteration % opt.boundary_reg_interval == 0):
+            N = gaussians.get_xyz.shape[0]
+            time_input = fid.unsqueeze(0).expand(N, -1)
+            _boundary_reg = deform.get_boundary_reg_loss(
+                gaussians.get_xyz.detach(),
+                gaussians._cluster_labels,
+                time_input + ast_noise if iteration >= opt.warm_up else time_input,
+                margin=opt.boundary_reg_margin,
+            )
+            loss = loss + opt.boundary_reg_weight * _boundary_reg
+            if tb_writer and iteration % 100 == 0:
+                tb_writer.add_scalar('train_loss_patches/boundary_reg',
+                                     _boundary_reg.item(), iteration)
 
         # ── Dynamic opacity regularisation (ablation) ──
         # Penalise low opacity on dynamic Gaussians to preserve fine details.

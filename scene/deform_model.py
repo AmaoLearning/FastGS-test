@@ -322,10 +322,125 @@ class ClusteredDeformModel:
         self._cluster_labels: Optional[torch.Tensor] = None  # (N,) int32
     
     def set_aabb(self, points: torch.Tensor, padding: float = 0.1) -> None:
-        """Set AABB for all deform models."""
+        """Set global AABB for all deform models (teacher + all students).
+
+        .. note::
+            This method assigns the **same global AABB** to every student.
+            Prefer :meth:`set_per_cluster_aabb` when cluster labels and
+            displacement statistics are available — it gives each student a
+            tight, displacement-aware bounding box that maximises effective
+            grid resolution.
+        """
         self.teacher.set_aabb(points, padding=padding)
         for student in self.students:
             student.set_aabb(points, padding=padding)
+
+    def set_per_cluster_aabb(
+        self,
+        points: torch.Tensor,
+        cluster_labels: torch.Tensor,
+        padding: float = 0.15,
+        deform_max: Optional[torch.Tensor] = None,
+        deform_min: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Set a displacement-aware per-cluster AABB for each student network.
+
+        For cluster *k* the AABB is built from the *worst-case reachable
+        positions* of every Gaussian in that cluster:
+
+        .. code-block:: text
+
+            pos_max_k = (xyz + deform_max)[mask_k].max(axis=0)
+            pos_min_k = (xyz + deform_min)[mask_k].min(axis=0)
+            aabb = [pos_min_k − padding × extent_k,
+                    pos_max_k + padding × extent_k]
+
+        This guarantees that any valid deformed position remains inside
+        ``[-1, 1]`` after normalisation, preventing ``grid_sample`` border
+        clamping artefacts at the cost of only a small amount of extra
+        AABB volume compared to a displacement-unaware tight box.
+
+        When ``deform_max`` / ``deform_min`` are unavailable (e.g. tracking
+        not yet started), the method falls back to the static position AABB
+        plus proportional padding.
+
+        The teacher always receives the **global** AABB (it handles all
+        clusters uniformly).
+
+        Parameters
+        ----------
+        points : Tensor ``(N, 3)``
+            Current Gaussian positions (detached from the compute graph).
+        cluster_labels : Tensor ``(N,)`` int
+            Per-Gaussian cluster index; −1 marks static Gaussians (ignored).
+        padding : float
+            Fraction of cluster extent added as a safety margin on each side.
+        deform_max : Tensor ``(N, 3)`` or None
+            Per-Gaussian maximum d_xyz displacement observed during tracking
+            (``gaussians._deform_max``).
+        deform_min : Tensor ``(N, 3)`` or None
+            Per-Gaussian minimum d_xyz displacement (``gaussians._deform_min``).
+        """
+        # Teacher always uses the full-scene AABB.
+        self.teacher.set_aabb(points, padding=padding)
+
+        have_disp = (
+            deform_max is not None
+            and deform_min is not None
+            and deform_max.numel() > 0
+            and deform_min.numel() > 0
+            and deform_max.shape[0] == points.shape[0]
+        )
+
+        for k, student in enumerate(self.students):
+            mask = (cluster_labels == k)
+            n_pts = int(mask.sum().item())
+
+            if n_pts < 4:
+                # Degenerate cluster — fall back to global AABB so the
+                # student can still learn from teacher supervision.
+                student.set_aabb(points, padding=padding)
+                logger.warning(
+                    "[ClusteredDeform] Cluster %d has only %d Gaussians — "
+                    "using global AABB as fallback.", k, n_pts
+                )
+                continue
+
+            pts_k = points[mask]  # (M, 3)
+
+            # Static cluster extent — used ONLY to scale the padding margin.
+            # Using the displacement-expanded extent would inflate the safety
+            # margin in high-motion scenes, wasting grid resolution.
+            static_min_k = pts_k.min(dim=0).values
+            static_max_k = pts_k.max(dim=0).values
+            static_extent_k = (static_max_k - static_min_k).clamp(min=1e-6)
+
+            if have_disp:
+                # Worst-case reachable positions per axis:
+                #   upper bound = xyz + deform_max  (deform_max ≥ 0)
+                #   lower bound = xyz + deform_min  (deform_min ≤ 0)
+                pos_max_k = (pts_k + deform_max[mask]).max(dim=0).values  # (3,)
+                pos_min_k = (pts_k + deform_min[mask]).min(dim=0).values  # (3,)
+            else:
+                pos_max_k = static_max_k
+                pos_min_k = static_min_k
+
+            # Padding is relative to the cluster's own static footprint so
+            # that tight, high-motion clusters don't get an inflated margin.
+            aabb_min = pos_min_k - padding * static_extent_k
+            aabb_max = pos_max_k + padding * static_extent_k
+
+            student.aabb_min.copy_(aabb_min)
+            student.aabb_max.copy_(aabb_max)
+
+            logger.debug(
+                "[ClusteredDeform] Student %d AABB: min=[%.3f,%.3f,%.3f] "
+                "max=[%.3f,%.3f,%.3f] (n_pts=%d, disp_aware=%s)",
+                k,
+                aabb_min[0].item(), aabb_min[1].item(), aabb_min[2].item(),
+                aabb_max[0].item(), aabb_max[1].item(), aabb_max[2].item(),
+                n_pts, have_disp,
+            )
     
     def set_cluster_labels(self, cluster_labels: torch.Tensor) -> None:
         """Set cluster labels for Gaussian assignment."""
@@ -779,3 +894,117 @@ class ClusteredDeformModel:
                 reg_k = 1e-3 * student.get_plane_tv_loss() + 1e-4 * student.get_plane_l1_loss()
             losses.append(reg_k)
         return losses
+
+    # ── Module C: Boundary regularization ────────────────────────────
+
+    def get_boundary_reg_loss(
+        self,
+        xyz: torch.Tensor,
+        cluster_ids: torch.Tensor,
+        time_emb: torch.Tensor,
+        margin: float = 0.05,
+    ) -> torch.Tensor:
+        """Penalise deformation magnitude for Gaussians near cluster AABB boundaries.
+
+        For each student *k*, points whose normalised coordinate in any axis
+        exceeds ``(1 − margin)`` are considered "near-boundary".  We penalise
+        the L2 norm of their predicted ``d_xyz`` to encourage the deformation
+        field to smoothly decay toward the AABB edge, preventing grid-sample
+        border-clamping artefacts.
+
+        The forward pass is only performed for near-boundary points, keeping
+        overhead low when ``margin`` is small.
+
+        Parameters
+        ----------
+        xyz : Tensor ``(N, 3)``
+            Current Gaussian positions (detached).
+        cluster_ids : Tensor ``(N,)``
+            Per-Gaussian cluster index (−1 = static, skipped).
+        time_emb : Tensor ``(N, 1)`` or ``(1, 1)``
+            Normalised time stamp.
+        margin : float
+            Fraction of the normalised range ``[−1, 1]`` considered as the
+            boundary zone.  E.g. 0.05 → penalises coords with |x| > 0.95.
+
+        Returns
+        -------
+        Scalar tensor (zero when no boundary points found).
+        """
+        device = xyz.device
+        total = torch.zeros(1, device=device, dtype=xyz.dtype)
+
+        use_per_point_time = time_emb.shape[0] == xyz.shape[0]
+
+        for k, student in enumerate(self.students):
+            mask = (cluster_ids == k)
+            if mask.sum() == 0:
+                continue
+
+            pts_k = xyz[mask]  # (M, 3)
+
+            # Normalised coords in student AABB
+            xyz_norm = (
+                2.0 * (pts_k - student.aabb_min) /
+                (student.aabb_max - student.aabb_min + 1e-8) - 1.0
+            )  # (M, 3)
+
+            near_boundary = (xyz_norm.abs() > (1.0 - margin)).any(dim=-1)  # (M,)
+            n_border = int(near_boundary.sum().item())
+            if n_border == 0:
+                continue
+
+            pts_border = pts_k[near_boundary]  # (B, 3)
+            if use_per_point_time:
+                t_border = time_emb[mask][near_boundary]
+            else:
+                t_border = time_emb.expand(n_border, -1)
+
+            d_xyz_b, _, _ = student(pts_border, t_border)
+            total = total + d_xyz_b.pow(2).mean()
+
+        return total.squeeze(0)
+
+    # ── Module D: AABB statistics / TensorBoard visualisation ────────
+
+    def log_cluster_aabb_stats(
+        self,
+        tb_writer,
+        iteration: int,
+    ) -> None:
+        """Log per-student AABB coverage statistics to TensorBoard.
+
+        For each student *k*, records:
+
+        * ``cluster_aabb/volume_ratio_k{k}`` — teacher AABB volume / student
+          AABB volume, i.e. how many times the student's spatial resolution is
+          effectively boosted vs. using the global AABB.
+        * ``cluster_aabb/extent_x/y/z_k{k}`` — absolute side lengths of the
+          student AABB in world units.
+
+        Parameters
+        ----------
+        tb_writer : SummaryWriter or None
+        iteration : int
+        """
+        if tb_writer is None:
+            return
+
+        teacher_vol = (
+            (self.teacher.aabb_max - self.teacher.aabb_min).clamp(min=1e-6).prod()
+        )
+
+        for k, student in enumerate(self.students):
+            extent_k = (student.aabb_max - student.aabb_min).clamp(min=1e-6)
+            vol_k = extent_k.prod()
+            ratio = (teacher_vol / vol_k).item()
+
+            tb_writer.add_scalar(f"cluster_aabb/volume_ratio_k{k}", ratio, iteration)
+            tb_writer.add_scalar(f"cluster_aabb/extent_x_k{k}", extent_k[0].item(), iteration)
+            tb_writer.add_scalar(f"cluster_aabb/extent_y_k{k}", extent_k[1].item(), iteration)
+            tb_writer.add_scalar(f"cluster_aabb/extent_z_k{k}", extent_k[2].item(), iteration)
+
+        logger.info(
+            "[ClusteredDeform] AABB stats logged at iter %d "
+            "(teacher vol=%.4f)", iteration, teacher_vol.item()
+        )

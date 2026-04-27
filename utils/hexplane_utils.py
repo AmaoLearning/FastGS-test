@@ -419,8 +419,20 @@ class HexPlaneDeformNetwork(nn.Module):
 
     def _normalise_xyzt(self, xyz: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """Normalise xyz to [-1, 1] using AABB; t is assumed already in [0, 1]
-        and mapped to [-1, 1]."""
+        and mapped to [-1, 1].
+
+        Out-of-range spatial coordinates are wrapped back into [-1, 1) using
+        modulo arithmetic rather than being clamped at the border.  This
+        prevents ``grid_sample`` border-clamping artefacts when a Gaussian
+        temporarily leaves its cluster AABB due to deformation:
+
+        .. code-block:: text
+
+            norm ∈ [-1, 3]  →  wrap = ((norm + 1) % 2) - 1  ∈ [-1, 1)
+        """
         xyz_norm = 2.0 * (xyz - self.aabb_min) / (self.aabb_max - self.aabb_min + 1e-8) - 1.0
+        # Cyclic wrap: maps any value back into [-1, 1) with period 2.
+        xyz_norm = ((xyz_norm + 1.0) % 2.0) - 1.0
         t_norm = 2.0 * t - 1.0
         return torch.cat([xyz_norm, t_norm], dim=-1)  # (N, 4)
 
