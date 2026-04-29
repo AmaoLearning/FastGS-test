@@ -609,13 +609,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
         if iteration < opt.warm_up:
             d_xyz, d_rotation, d_scaling = 0.0, 0.0, 0.0
             _d_xyz_raw = 0.0
+            _parallel_handle = None
         else:
             N = gaussians.get_xyz.shape[0]
             time_input = fid.unsqueeze(0).expand(N, -1)
 
             ast_noise = 0 if dataset.is_blender else torch.randn(1, 1, device='cuda').expand(N, -1) * time_interval * smooth_term(iteration)
 
-            d_xyz, d_rotation, d_scaling = deform.step(gaussians.get_xyz.detach(), time_input + ast_noise)
+            if isinstance(deform, ClusteredDeformModel):
+                d_xyz, d_rotation, d_scaling, _parallel_handle = deform.step(
+                    gaussians.get_xyz.detach(), time_input + ast_noise,
+                    return_handoffs=True,
+                )
+            else:
+                d_xyz, d_rotation, d_scaling = deform.step(gaussians.get_xyz.detach(), time_input + ast_noise)
+                _parallel_handle = None
 
             # ── Accumulate deformation for dynamic score computation ──
             # Record deformation from iteration 10000-15000 for dynamic score at iteration 15000
@@ -864,7 +872,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 deform.save_weights(args.model_path, iteration)
 
                 if 'args' in globals() and getattr(args, 'plot_fft', False) and iteration >= 30000:
-                    import os
                     out_student = os.path.join(dataset.model_path, f"fft_student_{iteration//1000}k.png")
                     plot_deformation_fft(gaussians, deform, out_student, use_teacher=False)
 

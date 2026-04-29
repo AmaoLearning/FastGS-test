@@ -1,3 +1,4 @@
+import threading
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -217,6 +218,101 @@ class DeformModel_4DGS:
             l1 = self.deform.get_plane_l1_loss()
             return 1e-3 * spatial_tv + tv_temporal_weight * temporal_tv + 1e-4 * l1
         return 1e-3 * self.deform.get_plane_tv_loss() + 1e-4 * self.deform.get_plane_l1_loss()
+
+
+class ParallelBackwardHandle:
+    """Gradient handoff handle for ClusteredDeformModel parallel backward.
+
+    ``ClusteredDeformModel.step(return_handoffs=True)`` returns this object
+    alongside the assembled deformation tensors.  The assembled d_xyz /
+    d_rotation / d_scaling are built from *leaf* tensors (detached student
+    outputs re-wrapped with ``requires_grad=True``), so ``loss.backward()``
+    propagates only through the shallow render graph and stops at these
+    leaves — never entering the student networks.
+
+    After ``loss.backward()``, call :meth:`backward_parallel` to propagate
+    the leaf gradients into the student network parameters concurrently,
+    using one CUDA stream per student and Python threading so that GPU
+    kernels from independent networks execute in parallel on the same device.
+    """
+
+    def __init__(
+        self,
+        raw_outputs: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        leaf_tensors: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        device: torch.device,
+    ) -> None:
+        # raw_outputs[k] = (xyz_raw, rot_raw, scale_raw) — student outputs with grad_fn
+        # leaf_tensors[k] = (xyz_leaf, rot_leaf, scale_leaf) — detached leaves,
+        #   require_grad=True, used in the assembled render inputs
+        self._raw = raw_outputs
+        self._leaves = leaf_tensors
+        self._device = device
+
+    def backward_parallel(self) -> None:
+        """Propagate gradients from handoff leaves into student network parameters.
+
+        Must be called **after** ``loss.backward()`` has populated
+        ``leaf.grad`` for every handoff leaf.
+
+        Each student's backward runs on its own CUDA stream inside a Python
+        thread.  Because the student computation graphs share no parameters,
+        the autograd engine can execute their CUDA kernels concurrently.
+
+        Synchronisation guarantee
+        -------------------------
+        A CUDA event is recorded on the default stream immediately before
+        the threads are started.  Each worker stream waits on this event so
+        that ``leaf.grad`` data written by ``loss.backward()`` is visible
+        before the student backward kernels read it.
+        """
+        n = len(self._raw)
+        if n == 0:
+            return
+
+        streams = [torch.cuda.Stream(device=self._device) for _ in range(n)]
+
+        # Mark the point at which loss.backward() finished on the default stream.
+        # Worker streams will wait for this before reading leaf.grad data.
+        backward_done = torch.cuda.Event()
+        backward_done.record()  # recorded on the current (default) stream
+
+        def _backward_one(idx: int) -> None:
+            xyz_raw, rot_raw, scale_raw = self._raw[idx]
+            xyz_leaf, rot_leaf, scale_leaf = self._leaves[idx]
+            stream = streams[idx]
+
+            # Collect tensors/grads for a single torch.autograd.backward call
+            # so the student's activations are traversed only once.
+            tensors: List[torch.Tensor] = []
+            grads: List[torch.Tensor] = []
+            for raw, leaf in (
+                (xyz_raw, xyz_leaf),
+                (rot_raw, rot_leaf),
+                (scale_raw, scale_leaf),
+            ):
+                if leaf.grad is not None:
+                    tensors.append(raw)
+                    grads.append(leaf.grad)
+
+            if not tensors:
+                return
+
+            with torch.cuda.stream(stream):
+                # GPU-level barrier: wait until loss.backward() grads are ready.
+                stream.wait_event(backward_done)
+                torch.autograd.backward(tensors, grads)
+
+        threads = [threading.Thread(target=_backward_one, args=(i,)) for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # Bring all worker streams back in sync with the default stream so that
+        # optimizer.step() observes all accumulated parameter gradients.
+        for s in streams:
+            torch.cuda.current_stream().wait_stream(s)
 
 
 class ClusteredDeformModel:
@@ -446,12 +542,13 @@ class ClusteredDeformModel:
         """Set cluster labels for Gaussian assignment."""
         self._cluster_labels = cluster_labels  # (N,) int32, -1 for static
     
-    def step(
+    def _step_impl(
         self,
         xyz: torch.Tensor,
         time_emb: torch.Tensor,
         cluster_ids: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return_handoffs: bool = False,
+    ) -> Tuple:
         """Forward pass for clustered deformation (parallel inference).
         
         Uses batched parallel inference: all student models receive their
@@ -462,9 +559,15 @@ class ClusteredDeformModel:
             xyz: Gaussian positions (N, 3)
             time_emb: Time embeddings (N, 1) or (1, 1)
             cluster_ids: Cluster assignments for each Gaussian (N,) or None to use self._cluster_labels
+            return_handoffs: If True, returns a ParallelBackwardHandle as a 4th element.
+                The assembled d_xyz/d_rotation/d_scaling will be built from *leaf* tensors
+                so that loss.backward() stops at the handoff boundary (shallow/fast).
+                Call handle.backward_parallel() after loss.backward() to propagate
+                gradients into student parameters concurrently on separate CUDA streams.
         
         Returns:
-            d_xyz, d_rotation, d_scaling: Deformation outputs (N, 3), (N, 4), (N, 3)
+            (d_xyz, d_rotation, d_scaling) when return_handoffs=False (default).
+            (d_xyz, d_rotation, d_scaling, handle) when return_handoffs=True.
         """
         if cluster_ids is None:
             cluster_ids = self._cluster_labels
@@ -476,16 +579,10 @@ class ClusteredDeformModel:
         device = xyz.device
         dtype = xyz.dtype
         
-        # Pre-allocate output tensors
-        d_xyz = torch.zeros(N, 3, device=device, dtype=dtype)
-        d_rotation = torch.zeros(N, 4, device=device, dtype=dtype)
-        d_scaling = torch.zeros(N, 3, device=device, dtype=dtype)
-        
         # Determine if time_emb needs per-point indexing
         use_per_point_time = time_emb.shape[0] == N
         
         # Gather inputs for all clusters in a single pass
-        # Store as list of tuples for parallel application
         cluster_inputs = []
         cluster_masks = []
         
@@ -503,41 +600,103 @@ class ClusteredDeformModel:
         
         # Parallel forward pass using CUDA streams for true async execution
         if len(cluster_inputs) == 0:
+            d_xyz = torch.zeros(N, 3, device=device, dtype=dtype)
+            d_rotation = torch.zeros(N, 4, device=device, dtype=dtype)
+            d_scaling = torch.zeros(N, 3, device=device, dtype=dtype)
+            if return_handoffs:
+                return d_xyz, d_rotation, d_scaling, ParallelBackwardHandle([], [], device)
             return d_xyz, d_rotation, d_scaling
         
         # Use multiple CUDA streams to submit all student forward passes asynchronously
-        # This enables kernel overlap and better GPU utilization
-        n_streams = min(len(cluster_inputs), 4)  # Limit streams to avoid overhead
-        streams = [torch.cuda.Stream(device=device) for _ in range(n_streams)]
+        n_fwd_streams = min(len(cluster_inputs), 4)
+        fwd_streams = [torch.cuda.Stream(device=device) for _ in range(n_fwd_streams)]
         
-        # Record CUDA events for synchronization
-        events = []
-        cluster_outputs = []
+        fwd_events = []
+        cluster_outputs = []  # [(xyz_raw, rot_raw, scale_raw), ...]
         
-        # Submit all student forward passes on different streams
         for i, (student, (xyz_c, time_c)) in enumerate(zip(self.students, cluster_inputs)):
-            stream_id = i % n_streams
-            with torch.cuda.stream(streams[stream_id]):
+            stream_id = i % n_fwd_streams
+            with torch.cuda.stream(fwd_streams[stream_id]):
                 d_xyz_c, d_rotation_c, d_scaling_c = student(xyz_c, time_c)
                 cluster_outputs.append((d_xyz_c, d_rotation_c, d_scaling_c))
-                # Record event for this stream
                 event = torch.cuda.Event()
-                event.record(streams[stream_id])
-                events.append(event)
+                event.record(fwd_streams[stream_id])
+                fwd_events.append(event)
         
-        # Wait for all streams to complete
-        for event in events:
+        # Wait for all forward passes to complete
+        for event in fwd_events:
             event.synchronize()
         
-        # Scatter results back to output tensors
+        if not return_handoffs:
+            # ── Original path: assemble directly from student outputs ──────────
+            d_xyz = torch.zeros(N, 3, device=device, dtype=dtype)
+            d_rotation = torch.zeros(N, 4, device=device, dtype=dtype)
+            d_scaling = torch.zeros(N, 3, device=device, dtype=dtype)
+            for i, (d_xyz_c, d_rotation_c, d_scaling_c) in enumerate(cluster_outputs):
+                mask = cluster_masks[i]
+                d_xyz[mask] = d_xyz_c
+                d_rotation[mask] = d_rotation_c
+                d_scaling[mask] = d_scaling_c
+            return d_xyz, d_rotation, d_scaling
+
+        # ── Handoff path: assemble from *leaf* tensors ─────────────────────────
+        # Each leaf is a detached copy of the student output re-wrapped with
+        # requires_grad=True.  The assembled render inputs depend on these leaves,
+        # NOT on the student computation graphs.  Therefore loss.backward() only
+        # traverses the render graph (shallow/fast) and populates leaf.grad.
+        # handle.backward_parallel() then fans out the student network backward
+        # passes concurrently using CUDA streams + Python threads.
+
+        leaf_tensors: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        xyz_leaf_list: List[torch.Tensor] = []
+        rot_leaf_list: List[torch.Tensor] = []
+        scale_leaf_list: List[torch.Tensor] = []
+        index_list: List[torch.Tensor] = []
+
         for i, (d_xyz_c, d_rotation_c, d_scaling_c) in enumerate(cluster_outputs):
-            mask = cluster_masks[i]
-            d_xyz[mask] = d_xyz_c
-            d_rotation[mask] = d_rotation_c
-            d_scaling[mask] = d_scaling_c
-        
-        return d_xyz, d_rotation, d_scaling
-    
+            # Detach and re-attach as leaf so autograd stops here during loss.backward()
+            xyz_leaf = d_xyz_c.detach().requires_grad_(True)
+            rot_leaf = d_rotation_c.detach().requires_grad_(True)
+            scale_leaf = d_scaling_c.detach().requires_grad_(True)
+            leaf_tensors.append((xyz_leaf, rot_leaf, scale_leaf))
+            xyz_leaf_list.append(xyz_leaf)
+            rot_leaf_list.append(rot_leaf)
+            scale_leaf_list.append(scale_leaf)
+            index_list.append(cluster_masks[i].nonzero(as_tuple=True)[0])
+
+        # Assemble via a single index_put each — efficient and correctly tracked.
+        # torch.cat backward distributes leaf gradients back to each piece.
+        all_indices = torch.cat(index_list)
+        d_xyz = torch.zeros(N, 3, device=device, dtype=dtype).index_put(
+            (all_indices,), torch.cat(xyz_leaf_list)
+        )
+        d_rotation = torch.zeros(N, 4, device=device, dtype=dtype).index_put(
+            (all_indices,), torch.cat(rot_leaf_list)
+        )
+        d_scaling = torch.zeros(N, 3, device=device, dtype=dtype).index_put(
+            (all_indices,), torch.cat(scale_leaf_list)
+        )
+
+        handle = ParallelBackwardHandle(
+            raw_outputs=cluster_outputs,
+            leaf_tensors=leaf_tensors,
+            device=device,
+        )
+        return d_xyz, d_rotation, d_scaling, handle
+
+    def step(
+        self,
+        xyz: torch.Tensor,
+        time_emb: torch.Tensor,
+        cluster_ids: Optional[torch.Tensor] = None,
+        return_handoffs: bool = False,
+    ) -> Tuple:
+        """Forward pass for clustered deformation.
+
+        Delegates to :meth:`_step_impl`.  See that method for full docs.
+        """
+        return self._step_impl(xyz, time_emb, cluster_ids=cluster_ids, return_handoffs=return_handoffs)
+
     def step_teacher(
         self,
         xyz: torch.Tensor,
