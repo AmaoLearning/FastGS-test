@@ -455,11 +455,17 @@ class HexPlaneDeformNetwork(nn.Module):
         """
         # 1. Normalise → grid query
         xyzt = self._normalise_xyzt(xyz, t)         # (N, 4)
+        xyz_norm = xyzt[:, :3]                       # cluster-local coords in [-1, 1)
+        t_norm   = xyzt[:, 3:4]                      # time in [-1, 1]
         grid_feats = self.hexplane(xyzt)             # (N, grid_dim)
 
-        # 2. Positional encoding of raw inputs
-        xyz_pe = self.pe_xyz(xyz)                    # (N, 63) for multires=10
-        t_pe = self.pe_t(t)                          # (N, 13) for multires=6
+        # 2. Positional encoding of *normalised* inputs so that PE frequencies
+        #    are consistent across all students regardless of cluster AABB size.
+        #    Using raw world coords here would mis-align PE scales between students
+        #    that cover different sub-regions of the scene, negating the resolution
+        #    gain from per-cluster AABB normalisation.
+        xyz_pe = self.pe_xyz(xyz_norm)               # (N, 63) for multires=10
+        t_pe   = self.pe_t(t_norm)                   # (N, 13) for multires=6
 
         # 3. Concatenate and decode
         decoder_input = torch.cat([grid_feats, xyz_pe, t_pe], dim=-1)
