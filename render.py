@@ -387,15 +387,21 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
         # Detect if using clustered deform model by scanning saved weight files.
         # This is more robust than relying on CLI args which may not be passed at render time.
         _use_clustered = False
+        _use_batched = False
         if _deform_type == "4dgs":
             import re as _re, glob as _glob
             _deform_dir = os.path.join(dataset.model_path, "deform")
             if os.path.isdir(_deform_dir):
-                # Check any iteration directory for deform_cluster_*.pth files
                 for _dname in os.listdir(_deform_dir):
                     _iter_dir = os.path.join(_deform_dir, _dname)
-                    if os.path.isdir(_iter_dir) and _glob.glob(os.path.join(_iter_dir, "deform_cluster_*.pth")):
+                    if not os.path.isdir(_iter_dir):
+                        continue
+                    if _glob.glob(os.path.join(_iter_dir, "deform_cluster_*.pth")):
                         _use_clustered = True
+                        break
+                    if os.path.isfile(os.path.join(_iter_dir, "batched_students.pth")):
+                        _use_clustered = True
+                        _use_batched = True
                         break
         
         if _deform_type == "4dgs":
@@ -417,11 +423,54 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
                     with open(capacity_tier_config_path, 'r') as f:
                         capacity_tier_configs = json.load(f)
                 
-                # Infer student configs from weight files (by parsing tier labels from filenames)
+                # Infer student configs from weight files
                 deform_dir = os.path.join(dataset.model_path, "deform")
-                if os.path.isdir(deform_dir):
-                    # Find iteration directory
-                    import re
+                import re
+
+                if _use_batched:
+                    # Batched mode: infer uniform architecture from the saved state dict shapes.
+                    # No per-cluster tier files exist — all config is encoded in tensor shapes.
+                    _max_iter = -1
+                    if os.path.isdir(deform_dir):
+                        for _dn in os.listdir(deform_dir):
+                            _m = re.match(r"iteration_(\d+)", _dn)
+                            if _m:
+                                _max_iter = max(_max_iter, int(_m.group(1)))
+                    _batched_pth = os.path.join(
+                        deform_dir, f"iteration_{_max_iter}", "batched_students.pth"
+                    )
+                    _sd = torch.load(_batched_pth, map_location="cpu")
+                    # hexplane.planes.{lvl}.2 is the XT plane: (K, feat_dim, spatial_res, time_res)
+                    _num_levels = len(set(
+                        k.split(".")[2]
+                        for k in _sd if k.startswith("hexplane.planes.") and k.endswith(".0")
+                    ))
+                    _spatial_res, _time_res = [], []
+                    for _lvl in range(_num_levels):
+                        _pXT = _sd[f"hexplane.planes.{_lvl}.2"]  # (K, C, s_res, t_res)
+                        _spatial_res.append(_pXT.shape[2])
+                        _time_res.append(_pXT.shape[3])
+                    _K = _sd["hexplane.planes.0.0"].shape[0]
+                    _feat_dim = _sd["hexplane.planes.0.0"].shape[1]
+                    _mlp_hidden = _sd["decoder.W0"].shape[1]
+                    _mlp_layers = 1 + sum(1 for k in _sd if k.startswith("decoder.W_mid.") and k.count(".") == 2)
+                    n_clusters = _K
+                    _uniform_cfg = {
+                        "spatial_resolutions": _spatial_res,
+                        "time_resolutions": _time_res,
+                        "feat_dim": _feat_dim,
+                        "mlp_hidden_dim": _mlp_hidden,
+                        "mlp_layer_num": _mlp_layers,
+                        "tier": "high",
+                    }
+                    student_configs = [_uniform_cfg] * n_clusters
+                    print(
+                        f"[INFO] Batched mode: K={_K}, spatial={_spatial_res}, "
+                        f"feat_dim={_feat_dim}, mlp_hidden={_mlp_hidden}, mlp_layers={_mlp_layers}"
+                    )
+
+                elif os.path.isdir(deform_dir):
+                    # Sequential mode: infer per-cluster configs from tier labels in filenames
                     iter_pattern = re.compile(r"iteration_(\d+)")
                     max_iter = -1
                     for dirname in os.listdir(deform_dir):
@@ -430,10 +479,9 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
                             iter_num = int(match.group(1))
                             if iter_num > max_iter:
                                 max_iter = iter_num
-                    
+
                     if max_iter >= 0:
                         iter_dir = os.path.join(deform_dir, f"iteration_{max_iter}")
-                        # Parse weight filenames – support both single-tier and dual-tier naming
                         dual_pattern = re.compile(
                             r"deform_cluster_hex(?P<hex_tier>high|medium|low)_mlp(?P<mlp_tier>high|medium|low)_(?P<cluster_id>\d+)\.pth"
                         )
@@ -454,8 +502,7 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
                             if m:
                                 cid = int(m.group("cluster_id"))
                                 cluster_tiers[cid] = m.group("tier")
-                        
-                        # Build student_configs list based on inferred tiers
+
                         student_configs = infer_student_configs_from_weights(
                             cluster_tiers=cluster_tiers,
                             n_clusters=n_clusters,
@@ -468,16 +515,17 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
                 else:
                     print("[WARNING] No deform directory found, using default student configs")
                     student_configs = None
-                
+
                 # Create ClusteredDeformModel with inferred configs
                 deform = ClusteredDeformModel(
                     n_clusters=n_clusters,
                     is_blender=dataset.is_blender,
                     is_6dof=dataset.is_6dof,
                     student_configs=student_configs,
+                    use_batched_students=_use_batched,
                 )
                 deform.load_weights(dataset.model_path, iteration if iteration >= 0 else -1)
-                print(f"[INFO] Loaded clustered deform model with {n_clusters} student models")
+                print(f"[INFO] Loaded clustered deform model with {n_clusters} student models (batched={_use_batched})")
                 
                 # Set cluster labels from loaded Gaussians (saved in PLY)
                 if hasattr(gaussians, '_cluster_labels') and gaussians._cluster_labels is not None:
