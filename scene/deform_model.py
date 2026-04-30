@@ -434,7 +434,7 @@ class ClusteredDeformModel:
                 fusion=fusion,
                 is_blender=is_blender,
                 is_6dof=is_6dof,
-            )
+            ).cuda()  # move all parameters AND registered buffers (aabb_mins/maxs) to GPU
             logger.info(
                 "[ClusteredDeform] Batched mode: K=%d, spatial=%s, feat_dim=%d, "
                 "mlp_hidden=%d — grid_sample calls: %d (constant w.r.t. K)",
