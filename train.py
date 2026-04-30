@@ -618,10 +618,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             ast_noise = 0 if dataset.is_blender else torch.randn(1, 1, device='cuda').expand(N, -1) * time_interval * smooth_term(iteration)
 
             if isinstance(deform, ClusteredDeformModel):
-                d_xyz, d_rotation, d_scaling, _parallel_handle = deform.step(
-                    gaussians.get_xyz.detach(), time_input + ast_noise,
-                    return_handoffs=True,
-                )
+                if deform.use_batched_students:
+                    # Batched mode: autograd handles gradients — no ParallelBackwardHandle
+                    d_xyz, d_rotation, d_scaling = deform.step(
+                        gaussians.get_xyz.detach(), time_input + ast_noise,
+                        return_handoffs=False,
+                    )
+                    _parallel_handle = None
+                else:
+                    d_xyz, d_rotation, d_scaling, _parallel_handle = deform.step(
+                        gaussians.get_xyz.detach(), time_input + ast_noise,
+                        return_handoffs=True,
+                    )
             else:
                 d_xyz, d_rotation, d_scaling = deform.step(gaussians.get_xyz.detach(), time_input + ast_noise)
                 _parallel_handle = None
