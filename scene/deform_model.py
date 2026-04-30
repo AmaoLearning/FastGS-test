@@ -3,7 +3,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from utils.time_utils import DeformNetwork
-from utils.hexplane_utils import HexPlaneDeformNetwork
+from utils.hexplane_utils import (
+    HexPlaneDeformNetwork,
+    BatchedHexPlaneDeformNetwork,
+)
 import os
 from typing import Optional, Sequence, Tuple, Dict, List
 from utils.system_utils import searchForMaxIteration
@@ -356,11 +359,14 @@ class ClusteredDeformModel:
         student_mlp_hidden_dim: int = 64,
         student_mlp_num_hidden: int = 2,
         fusion: str = "concat",
+        # ── Batched mode ─────────────────────────────────────────────
+        use_batched_students: bool = False,
     ) -> None:
         self.n_clusters = n_clusters
         self.is_blender = is_blender
         self.is_6dof = is_6dof
         self.fusion = fusion
+        self.use_batched_students = use_batched_students
         
         # Teacher model (original capacity)
         self.teacher = HexPlaneDeformNetwork(
@@ -397,19 +403,62 @@ class ClusteredDeformModel:
             ]
         
         # Create student networks
-        self.students = nn.ModuleList()
-        for cluster_id, config in enumerate(self.student_configs):
-            student = HexPlaneDeformNetwork(
-                spatial_resolutions=config["spatial_resolutions"],
-                time_resolutions=config["time_resolutions"],
-                feat_dim=config["feat_dim"],
-                mlp_hidden_dim=config["mlp_hidden_dim"],
-                mlp_num_hidden=config["mlp_layer_num"],
+        self.students: Optional[nn.ModuleList] = None
+        self.batched_net: Optional[BatchedHexPlaneDeformNetwork] = None
+
+        if use_batched_students:
+            # ── Batched path (Path A + B) ────────────────────────────────
+            # All students must have identical architecture.
+            # Verify uniformity and extract common config.
+            _cfg0 = self.student_configs[0]
+            _uniform = all(
+                c["spatial_resolutions"] == _cfg0["spatial_resolutions"]
+                and c["time_resolutions"] == _cfg0["time_resolutions"]
+                and c["feat_dim"] == _cfg0["feat_dim"]
+                and c["mlp_hidden_dim"] == _cfg0["mlp_hidden_dim"]
+                and c.get("mlp_layer_num", 2) == _cfg0.get("mlp_layer_num", 2)
+                for c in self.student_configs
+            )
+            if not _uniform:
+                raise ValueError(
+                    "use_batched_students=True requires all student_configs to be "
+                    "identical (uniform architecture). Found heterogeneous configs."
+                )
+            self.batched_net = BatchedHexPlaneDeformNetwork(
+                K=n_clusters,
+                spatial_resolutions=_cfg0["spatial_resolutions"],
+                time_resolutions=_cfg0["time_resolutions"],
+                feat_dim=_cfg0["feat_dim"],
+                mlp_hidden_dim=_cfg0["mlp_hidden_dim"],
+                mlp_num_hidden=_cfg0.get("mlp_layer_num", 2),
                 fusion=fusion,
                 is_blender=is_blender,
                 is_6dof=is_6dof,
-            ).cuda()
-            self.students.append(student)
+            )
+            logger.info(
+                "[ClusteredDeform] Batched mode: K=%d, spatial=%s, feat_dim=%d, "
+                "mlp_hidden=%d — grid_sample calls: %d (constant w.r.t. K)",
+                n_clusters,
+                _cfg0["spatial_resolutions"],
+                _cfg0["feat_dim"],
+                _cfg0["mlp_hidden_dim"],
+                len(_cfg0["spatial_resolutions"]) * 6,
+            )
+        else:
+            # ── Sequential path (original behaviour) ────────────────────
+            self.students = nn.ModuleList()
+            for cluster_id, config in enumerate(self.student_configs):
+                student = HexPlaneDeformNetwork(
+                    spatial_resolutions=config["spatial_resolutions"],
+                    time_resolutions=config["time_resolutions"],
+                    feat_dim=config["feat_dim"],
+                    mlp_hidden_dim=config["mlp_hidden_dim"],
+                    mlp_num_hidden=config["mlp_layer_num"],
+                    fusion=fusion,
+                    is_blender=is_blender,
+                    is_6dof=is_6dof,
+                ).cuda()
+                self.students.append(student)
         
         self.optimizer: Optional[torch.optim.Optimizer] = None
         self.spatial_lr_scale = 5
@@ -418,18 +467,13 @@ class ClusteredDeformModel:
         self._cluster_labels: Optional[torch.Tensor] = None  # (N,) int32
     
     def set_aabb(self, points: torch.Tensor, padding: float = 0.1) -> None:
-        """Set global AABB for all deform models (teacher + all students).
-
-        .. note::
-            This method assigns the **same global AABB** to every student.
-            Prefer :meth:`set_per_cluster_aabb` when cluster labels and
-            displacement statistics are available — it gives each student a
-            tight, displacement-aware bounding box that maximises effective
-            grid resolution.
-        """
+        """Set global AABB for teacher + all students."""
         self.teacher.set_aabb(points, padding=padding)
-        for student in self.students:
-            student.set_aabb(points, padding=padding)
+        if self.use_batched_students:
+            self.batched_net.set_aabb_all(points, padding=padding)
+        else:
+            for student in self.students:
+                student.set_aabb(points, padding=padding)
 
     def set_per_cluster_aabb(
         self,
@@ -488,46 +532,42 @@ class ClusteredDeformModel:
             and deform_max.shape[0] == points.shape[0]
         )
 
-        for k, student in enumerate(self.students):
+        for k in range(self.n_clusters):
             mask = (cluster_labels == k)
             n_pts = int(mask.sum().item())
 
             if n_pts < 4:
-                # Degenerate cluster — fall back to global AABB so the
-                # student can still learn from teacher supervision.
-                student.set_aabb(points, padding=padding)
+                if self.use_batched_students:
+                    self.batched_net.set_aabb_single(k, points, padding=padding)
+                else:
+                    self.students[k].set_aabb(points, padding=padding)
                 logger.warning(
                     "[ClusteredDeform] Cluster %d has only %d Gaussians — "
                     "using global AABB as fallback.", k, n_pts
                 )
                 continue
 
-            pts_k = points[mask]  # (M, 3)
-
-            # Static cluster extent — used ONLY to scale the padding margin.
-            # Using the displacement-expanded extent would inflate the safety
-            # margin in high-motion scenes, wasting grid resolution.
+            pts_k = points[mask]
             static_min_k = pts_k.min(dim=0).values
             static_max_k = pts_k.max(dim=0).values
             static_extent_k = (static_max_k - static_min_k).clamp(min=1e-6)
 
             if have_disp:
-                # Worst-case reachable positions per axis:
-                #   upper bound = xyz + deform_max  (deform_max ≥ 0)
-                #   lower bound = xyz + deform_min  (deform_min ≤ 0)
-                pos_max_k = (pts_k + deform_max[mask]).max(dim=0).values  # (3,)
-                pos_min_k = (pts_k + deform_min[mask]).min(dim=0).values  # (3,)
+                pos_max_k = (pts_k + deform_max[mask]).max(dim=0).values
+                pos_min_k = (pts_k + deform_min[mask]).min(dim=0).values
             else:
                 pos_max_k = static_max_k
                 pos_min_k = static_min_k
 
-            # Padding is relative to the cluster's own static footprint so
-            # that tight, high-motion clusters don't get an inflated margin.
             aabb_min = pos_min_k - padding * static_extent_k
             aabb_max = pos_max_k + padding * static_extent_k
 
-            student.aabb_min.copy_(aabb_min)
-            student.aabb_max.copy_(aabb_max)
+            if self.use_batched_students:
+                self.batched_net.aabb_mins[k] = aabb_min
+                self.batched_net.aabb_maxs[k] = aabb_max
+            else:
+                self.students[k].aabb_min.copy_(aabb_min)
+                self.students[k].aabb_max.copy_(aabb_max)
 
             logger.debug(
                 "[ClusteredDeform] Student %d AABB: min=[%.3f,%.3f,%.3f] "
@@ -543,6 +583,84 @@ class ClusteredDeformModel:
         self._cluster_labels = cluster_labels  # (N,) int32, -1 for static
     
     def _step_impl(
+        self,
+        xyz: torch.Tensor,
+        time_emb: torch.Tensor,
+        cluster_ids: Optional[torch.Tensor] = None,
+        return_handoffs: bool = False,
+    ) -> Tuple:
+        """Dispatch to batched or sequential forward pass."""
+        if self.use_batched_students:
+            if return_handoffs:
+                raise ValueError(
+                    "return_handoffs=True is incompatible with use_batched_students=True. "
+                    "Batched autograd handles gradients automatically — "
+                    "ParallelBackwardHandle is not needed."
+                )
+            return self._step_impl_batched(xyz, time_emb, cluster_ids)
+        return self._step_impl_sequential(xyz, time_emb, cluster_ids, return_handoffs)
+
+    def _step_impl_batched(
+        self,
+        xyz: torch.Tensor,
+        time_emb: torch.Tensor,
+        cluster_ids: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Batched forward pass using BatchedHexPlaneDeformNetwork.
+
+        Kernel count is O(1) w.r.t. K (18 grid_sample + 2 bmm), compared to
+        O(K * 18) for the sequential path.
+        """
+        if cluster_ids is None:
+            cluster_ids = self._cluster_labels
+        if cluster_ids is None:
+            raise ValueError("No cluster labels provided. Call set_cluster_labels first.")
+
+        N = xyz.shape[0]
+        device = xyz.device
+        dtype = xyz.dtype
+        use_per_point_time = time_emb.shape[0] == N
+
+        # Gather per-cluster inputs and masks
+        cluster_xyz: List[torch.Tensor] = []
+        cluster_t: List[torch.Tensor] = []
+        cluster_counts: List[int] = []
+        cluster_masks: List[torch.Tensor] = []
+
+        for k in range(self.n_clusters):
+            mask = (cluster_ids == k)
+            count = int(mask.sum().item())
+            cluster_masks.append(mask)
+            cluster_counts.append(count)
+            if count > 0:
+                cluster_xyz.append(xyz[mask])
+                cluster_t.append(
+                    time_emb[mask] if use_per_point_time
+                    else time_emb.expand(count, -1)
+                )
+            else:
+                cluster_xyz.append(xyz.new_empty(0, 3))
+                cluster_t.append(time_emb.new_empty(0, 1))
+
+        # Batched forward → (K, N_max, 10)
+        out = self.batched_net(cluster_xyz, cluster_t, cluster_counts)
+
+        # Unpack into (N, 3), (N, 4), (N, 3)
+        d_xyz = torch.zeros(N, 3, device=device, dtype=dtype)
+        d_rotation = torch.zeros(N, 4, device=device, dtype=dtype)
+        d_scaling = torch.zeros(N, 3, device=device, dtype=dtype)
+
+        for k in range(self.n_clusters):
+            n = cluster_counts[k]
+            if n > 0:
+                mask = cluster_masks[k]
+                d_xyz[mask] = out[k, :n, :3]
+                d_rotation[mask] = out[k, :n, 3:7]
+                d_scaling[mask] = out[k, :n, 7:10]
+
+        return d_xyz, d_rotation, d_scaling
+
+    def _step_impl_sequential(
         self,
         xyz: torch.Tensor,
         time_emb: torch.Tensor,
@@ -706,58 +824,70 @@ class ClusteredDeformModel:
         return self.teacher(xyz, time_emb)
     
     def train_setting(self, training_args, start_iteration: int = 0) -> None:
-        """Initialize optimizers for all student models.
-
-        Args:
-            training_args: OptimizationParams instance.
-            start_iteration: The global iteration at which students are created.
-                LR schedulers are built over the *remaining* steps so that
-                students start from ``lr_init`` and decay to ``lr_final`` by
-                ``deform_lr_max_steps``.
-        """
+        """Initialize optimizers for all student models."""
         self._lr_start_iter = start_iteration
-        param_groups = []
-        
-        for cluster_id, student in enumerate(self.students):
-            plane_params = list(student.hexplane.parameters())
-            mlp_params = list(student.decoder.parameters())
-            pe_params = (
-                list(student.pe_xyz.parameters())
-                + list(student.pe_t.parameters())
-            )
-            
-            _plane_lr_init = training_args.hex_plane_lr_init
-            _plane_lr_final = training_args.hex_plane_lr_final
-            _mlp_lr_init = training_args.hex_mlp_lr_init
-            _mlp_lr_final = training_args.hex_mlp_lr_final
-            
-            param_groups.extend([
-                {"params": plane_params, "lr": _plane_lr_init, "name": f"student_{cluster_id}_planes"},
-                {"params": mlp_params + pe_params, "lr": _mlp_lr_init, "name": f"student_{cluster_id}_mlp"},
-            ])
-        
+        _plane_lr_init = training_args.hex_plane_lr_init
+        _plane_lr_final = training_args.hex_plane_lr_final
+        _mlp_lr_init = training_args.hex_mlp_lr_init
+        _mlp_lr_final = training_args.hex_mlp_lr_final
+
+        if self.use_batched_students:
+            # Batched path: 2 param groups total (planes + mlp), not 2*K
+            param_groups = [
+                {
+                    "params": list(self.batched_net.hexplane.parameters()),
+                    "lr": _plane_lr_init,
+                    "name": "students_planes",
+                },
+                {
+                    "params": (
+                        list(self.batched_net.decoder.parameters())
+                        + list(self.batched_net.pe_xyz.parameters())
+                        + list(self.batched_net.pe_t.parameters())
+                    ),
+                    "lr": _mlp_lr_init,
+                    "name": "students_mlp",
+                },
+            ]
+        else:
+            # Sequential path: 2 param groups per student (original behaviour)
+            param_groups = []
+            for cluster_id, student in enumerate(self.students):
+                param_groups.extend([
+                    {
+                        "params": list(student.hexplane.parameters()),
+                        "lr": _plane_lr_init,
+                        "name": f"student_{cluster_id}_planes",
+                    },
+                    {
+                        "params": (
+                            list(student.decoder.parameters())
+                            + list(student.pe_xyz.parameters())
+                            + list(student.pe_t.parameters())
+                        ),
+                        "lr": _mlp_lr_init,
+                        "name": f"student_{cluster_id}_mlp",
+                    },
+                ])
+
         self.optimizer = torch.optim.Adam(param_groups, lr=0.0, eps=1e-15)
-        
-        # LR schedulers — use *remaining* steps so students start from lr_init.
+
         _remaining_steps = max(training_args.deform_lr_max_steps - start_iteration, 1)
         self._plane_lr_func = get_expon_lr_func(
-            lr_init=training_args.hex_plane_lr_init,
-            lr_final=training_args.hex_plane_lr_final,
-            lr_delay_mult=0.01,
-            max_steps=_remaining_steps,
+            lr_init=_plane_lr_init, lr_final=_plane_lr_final,
+            lr_delay_mult=0.01, max_steps=_remaining_steps,
         )
         self._mlp_lr_func = get_expon_lr_func(
-            lr_init=training_args.hex_mlp_lr_init,
-            lr_final=training_args.hex_mlp_lr_final,
-            lr_delay_mult=0.01,
-            max_steps=_remaining_steps,
+            lr_init=_mlp_lr_init, lr_final=_mlp_lr_final,
+            lr_delay_mult=0.01, max_steps=_remaining_steps,
         )
         logger.info(
             "[ClusteredDeform] LR scheduler: start_iter=%d, remaining_steps=%d, "
-            "plane_lr_init=%.4f→%.4f, mlp_lr_init=%.6f→%.6f",
+            "plane_lr=%.4f→%.4f, mlp_lr=%.6f→%.6f, batched=%s",
             start_iteration, _remaining_steps,
-            training_args.hex_plane_lr_init, training_args.hex_plane_lr_final,
-            training_args.hex_mlp_lr_init, training_args.hex_mlp_lr_final,
+            _plane_lr_init, _plane_lr_final,
+            _mlp_lr_init, _mlp_lr_final,
+            self.use_batched_students,
         )
     
     def update_learning_rate(self, iteration: int) -> Optional[float]:
@@ -817,113 +947,85 @@ class ClusteredDeformModel:
         return loss_xyz + loss_rot + loss_scale
     
     def save_weights(self, model_path: str, iteration: int) -> None:
-        """Save all student model weights with tier labels from student_configs.
-        
-        Naming convention:
-        - Single-tier (tiered/linear strategy):
-            ``deform_cluster_{tier}_{id}.pth``
-        - Dual-tier (frequency strategy with independent HexPlane/MLP tiers):
-            ``deform_cluster_hex{hex_tier}_mlp{mlp_tier}_{id}.pth``
-        
-        The tier labels are read directly from each student's configuration.
-        
-        Args:
-            model_path: Base model path.
-            iteration: Current iteration number.
-        """
-        deform_dir = os.path.join(model_path, "deform")
-        iter_dir = os.path.join(deform_dir, f"iteration_{iteration}")
+        """Save student model weights."""
+        iter_dir = os.path.join(model_path, "deform", f"iteration_{iteration}")
         os.makedirs(iter_dir, exist_ok=True)
-        
-        # Read tier labels directly from student_configs
+
+        if self.use_batched_students:
+            # Batched path: single file for all K students
+            weights_path = os.path.join(iter_dir, "batched_students.pth")
+            torch.save(self.batched_net.state_dict(), weights_path)
+            print(f"[INFO] Saved batched students (K={self.n_clusters}) → batched_students.pth")
+            return
+
+        # Sequential path: one file per student
         for cluster_id, student in enumerate(self.students):
             if cluster_id < len(self.student_configs):
                 config = self.student_configs[cluster_id]
                 hex_tier = config.get("hex_tier", None)
                 mlp_tier = config.get("mlp_tier", None)
-                
                 if hex_tier is not None and mlp_tier is not None:
-                    # Dual-tier naming for frequency-based allocation
                     fname = f"deform_cluster_hex{hex_tier}_mlp{mlp_tier}_{cluster_id}.pth"
                 else:
-                    # Single-tier naming for tiered/linear allocation
                     tier = config.get("tier", "unknown")
                     fname = f"deform_cluster_{tier}_{cluster_id}.pth"
-                
-                weights_path = os.path.join(iter_dir, fname)
             else:
-                # Fallback to legacy format if config missing
-                weights_path = os.path.join(iter_dir, f"deform_cluster_{cluster_id}.pth")
-                fname = os.path.basename(weights_path)
-            
+                fname = f"deform_cluster_{cluster_id}.pth"
+            weights_path = os.path.join(iter_dir, fname)
             torch.save(student.state_dict(), weights_path)
             print(f"[INFO] Saved cluster {cluster_id} → {fname}")
     
     def load_weights(self, model_path: str, iteration: int = -1) -> None:
-        """Load all student model weights with tier-based naming.
-        
-        Supports two naming conventions:
-        - Single-tier: ``deform_cluster_{tier}_{id}.pth``
-        - Dual-tier:   ``deform_cluster_hex{hex_tier}_mlp{mlp_tier}_{id}.pth``
-        
-        Args:
-            model_path: Base model path.
-            iteration: Iteration to load (-1 for latest).
-        
-        Raises:
-            FileNotFoundError: If no weight files are found.
-        """
+        """Load student model weights."""
         deform_dir = os.path.join(model_path, "deform")
-        
-        # Find iteration directory
+
         if iteration == -1:
-            # Search for max iteration
             import re
             iter_pattern = re.compile(r"iteration_(\d+)")
             max_iter = -1
             if os.path.isdir(deform_dir):
                 for dirname in os.listdir(deform_dir):
-                    match = iter_pattern.match(dirname)
-                    if match:
-                        iter_num = int(match.group(1))
-                        if iter_num > max_iter:
-                            max_iter = iter_num
+                    m = iter_pattern.match(dirname)
+                    if m:
+                        max_iter = max(max_iter, int(m.group(1)))
             loaded_iter = max_iter if max_iter >= 0 else 0
         else:
             loaded_iter = iteration
-        
+
         iter_dir = os.path.join(deform_dir, f"iteration_{loaded_iter}")
         if not os.path.isdir(iter_dir):
             raise FileNotFoundError(f"Cannot find deform weights directory at {iter_dir}")
-        
-        # Scan directory for weight files (both single-tier and dual-tier)
+
+        if self.use_batched_students:
+            weights_path = os.path.join(iter_dir, "batched_students.pth")
+            if not os.path.isfile(weights_path):
+                raise FileNotFoundError(
+                    f"Batched weights not found: {weights_path}. "
+                    "If loading from a sequential checkpoint, use use_batched_students=False."
+                )
+            self.batched_net.load_state_dict(torch.load(weights_path, map_location="cuda"))
+            print(f"[INFO] Loaded batched students (K={self.n_clusters}) from {weights_path}")
+            return
+
+        # Sequential path
         import re
-        # Dual-tier: deform_cluster_hex{H}_mlp{M}_{id}.pth
         dual_pattern = re.compile(
             r"deform_cluster_hex(?P<hex_tier>high|medium|low)_mlp(?P<mlp_tier>high|medium|low)_(?P<cluster_id>\d+)\.pth"
         )
-        # Single-tier: deform_cluster_{tier}_{id}.pth
         single_pattern = re.compile(
             r"deform_cluster_(?P<tier>high|medium|low)_(?P<cluster_id>\d+)\.pth"
         )
-        
-        tier_files: Dict[int, Dict] = {}  # {cluster_id: {"filepath": ..., ...}}
-        
-        print(f"[INFO] Scanning {iter_dir} for student model weights...")
-        
+
+        tier_files: Dict[int, Dict] = {}
         for filename in sorted(os.listdir(iter_dir)):
-            # Try dual-tier first (more specific pattern)
             m = dual_pattern.match(filename)
             if m:
                 cid = int(m.group("cluster_id"))
                 tier_files[cid] = {
                     "filepath": os.path.join(iter_dir, filename),
-                    "hex_tier": m.group("hex_tier"),
-                    "mlp_tier": m.group("mlp_tier"),
+                    "hex_tier": m.group("hex_tier"), "mlp_tier": m.group("mlp_tier"),
                 }
-                print(f"[INFO] Found: {filename} (cluster {cid}, hex={m.group('hex_tier')}, mlp={m.group('mlp_tier')})")
                 continue
-            # Fall back to single-tier
             m = single_pattern.match(filename)
             if m:
                 cid = int(m.group("cluster_id"))
@@ -931,37 +1033,25 @@ class ClusteredDeformModel:
                     "filepath": os.path.join(iter_dir, filename),
                     "tier": m.group("tier"),
                 }
-                print(f"[INFO] Found: {filename} (cluster {cid}, tier={m.group('tier')})")
-        
+
         if not tier_files:
-            raise FileNotFoundError(
-                f"No student weight files found in {iter_dir}. "
-                f"Expected: deform_cluster_{{tier}}_{{id}}.pth or "
-                f"deform_cluster_hex{{H}}_mlp{{M}}_{{id}}.pth"
-            )
-        
-        # Load weights into student models
-        print(f"[INFO] Loading {len(tier_files)} student models...")
+            raise FileNotFoundError(f"No student weight files found in {iter_dir}")
+
         loaded_count = 0
-        
         for cluster_id in sorted(tier_files.keys()):
             if cluster_id >= len(self.students):
-                print(f"[WARNING] Cluster {cluster_id} exceeds student count ({len(self.students)}), skipping")
+                print(f"[WARNING] Cluster {cluster_id} exceeds student count, skipping")
                 continue
-            
             info = tier_files[cluster_id]
-            filepath = info["filepath"]
-            self.students[cluster_id].load_state_dict(torch.load(filepath))
+            self.students[cluster_id].load_state_dict(torch.load(info["filepath"]))
             loaded_count += 1
-            
             if "hex_tier" in info:
                 print(f"[INFO] Loaded cluster {cluster_id} (hex={info['hex_tier']}, mlp={info['mlp_tier']})")
             else:
                 print(f"[INFO] Loaded cluster {cluster_id} (tier={info['tier']})")
-        
+
         if loaded_count == 0:
             raise FileNotFoundError(f"Failed to load any student models from {iter_dir}")
-        
         print(f"[INFO] Successfully loaded {loaded_count} student models")
     
     def initialize_students_with_warm_init(
@@ -969,27 +1059,16 @@ class ClusteredDeformModel:
         warm_init_cfg,
         noise_std_per_student: Optional[List[float]] = None,
     ) -> None:
-        """
-        使用热启动初始化所有学生网络。
-        
-        在第 15000 轮聚类完成后调用，将教师 HexPlane 参数降采样迁移到学生。
-        
-        Args:
-            warm_init_cfg: WarmInitConfig 实例，包含热启动配置。
-            noise_std_per_student: 可选，每个学生的噪声标准差 (打破对称性)。
-                若为 None，则使用 warm_init_cfg.noise_std 统一值。
-        """
+        """Initialize student networks from teacher via warm-init."""
         if not warm_init_cfg.enabled:
-            logger.info("WarmInit 已禁用，跳过学生初始化。")
+            logger.info("WarmInit disabled, skipping student initialization.")
             return
-        
-        # 确保教师处于 eval 模式且参数冻结
+
         self.teacher.eval()
         for p in self.teacher.parameters():
             p.requires_grad_(False)
-        
-        # 为不同学生设置递增噪声 (打破对称性)
-        n = len(self.students)
+
+        n = self.n_clusters
         if noise_std_per_student is None:
             base_noise = warm_init_cfg.noise_std
             noise_std_per_student = [
@@ -997,9 +1076,50 @@ class ClusteredDeformModel:
                 for i in range(n)
             ]
 
+        if self.use_batched_students:
+            # Transfer teacher planes into each student's slice of the batched grid.
+            # warm_init_all_students operates on HexPlaneDeformNetwork instances, so
+            # we reconstruct temporary single-student networks, warm-init them, then
+            # copy their plane parameters back into self.batched_net.
+            from utils.warm_init_utils import warm_init_all_students
+
+            _cfg0 = self.student_configs[0]
+            tmp_students: List[HexPlaneDeformNetwork] = []
+            for _ in range(n):
+                s = HexPlaneDeformNetwork(
+                    spatial_resolutions=_cfg0["spatial_resolutions"],
+                    time_resolutions=_cfg0["time_resolutions"],
+                    feat_dim=_cfg0["feat_dim"],
+                    mlp_hidden_dim=_cfg0["mlp_hidden_dim"],
+                    mlp_num_hidden=_cfg0.get("mlp_layer_num", 2),
+                    fusion=self.fusion,
+                    is_blender=self.is_blender,
+                    is_6dof=self.is_6dof,
+                ).cuda()
+                tmp_students.append(s)
+
+            warm_init_all_students(
+                teacher_network=self.teacher,
+                student_networks=tmp_students,
+                student_configs=self.student_configs,
+                cfg=warm_init_cfg,
+                noise_std_per_student=noise_std_per_student,
+            )
+
+            # Copy plane parameters from tmp_students → batched_net slices
+            with torch.no_grad():
+                for lvl_idx, lvl_planes in enumerate(self.batched_net.hexplane.planes):
+                    for pidx, param in enumerate(lvl_planes):
+                        for k, s in enumerate(tmp_students):
+                            param.data[k] = s.hexplane.planes[lvl_idx][pidx].data.squeeze(0)
+
+            del tmp_students
+            logger.info("[ClusteredDeform] Warm-init: copied teacher planes into %d student slices (batched).", n)
+            return
+
+        # Sequential path: delegate to warm_init_all_students as before
         from utils.warm_init_utils import warm_init_all_students
-        
-        # 执行热启动初始化
+
         warm_init_all_students(
             teacher_network=self.teacher,
             student_networks=list(self.students),
@@ -1007,19 +1127,22 @@ class ClusteredDeformModel:
             cfg=warm_init_cfg,
             noise_std_per_student=noise_std_per_student,
         )
-        
-        logger.info(f"所有 {n} 个学生网络热启动初始化完成。")
+        logger.info("[ClusteredDeform] Warm-init completed for %d students (sequential).", n)
     
     def get_regularization_loss(
         self, tv_temporal_weight: Optional[float] = None
     ) -> torch.Tensor:
-        """Get TV and L1 regularization from all student models.
-
-        Parameters
-        ----------
-        tv_temporal_weight : float or None
-            When not None, temporal axes of XT/YT/ZT planes use this weight.
-        """
+        """Get TV and L1 regularization from all student models."""
+        if self.use_batched_students:
+            if tv_temporal_weight is not None:
+                s_tv, t_tv = self.batched_net.get_plane_tv_loss_split()
+                l1 = self.batched_net.get_plane_l1_loss()
+                return 1e-3 * s_tv + tv_temporal_weight * t_tv + 1e-4 * l1
+            return (
+                1e-3 * self.batched_net.get_plane_tv_loss()
+                + 1e-4 * self.batched_net.get_plane_l1_loss()
+            )
+        # Sequential path
         if tv_temporal_weight is not None:
             spatial_tv = sum(s.get_plane_tv_loss_split()[0] for s in self.students)
             temporal_tv = sum(s.get_plane_tv_loss_split()[1] for s in self.students)
@@ -1034,15 +1157,12 @@ class ClusteredDeformModel:
     ) -> List[torch.Tensor]:
         """Return per-student regularization losses for parallel backward.
 
-        Each element is the regularization loss for student *k*.
-        The losses are **not** summed so callers can backward them on
-        independent CUDA streams.
-
-        Parameters
-        ----------
-        tv_temporal_weight : float or None
-            When not None, temporal axes of XT/YT/ZT planes use this weight.
+        For the batched mode this returns a single-element list so the
+        parallel-stream code in train.py works unchanged (1 stream, no overhead).
         """
+        if self.use_batched_students:
+            return [self.get_regularization_loss(tv_temporal_weight=tv_temporal_weight)]
+        # Sequential path
         losses: List[torch.Tensor] = []
         for student in self.students:
             if tv_temporal_weight is not None:
@@ -1095,25 +1215,55 @@ class ClusteredDeformModel:
 
         use_per_point_time = time_emb.shape[0] == xyz.shape[0]
 
+        if self.use_batched_students:
+            # Vectorised over K: normalise all cluster points at once
+            # aabb_mins/maxs: (K, 3)
+            for k in range(self.n_clusters):
+                mask = (cluster_ids == k)
+                if mask.sum() == 0:
+                    continue
+                pts_k = xyz[mask]
+                aabb_min_k = self.batched_net.aabb_mins[k]
+                aabb_max_k = self.batched_net.aabb_maxs[k]
+                xyz_norm = (
+                    2.0 * (pts_k - aabb_min_k) /
+                    (aabb_max_k - aabb_min_k + 1e-8) - 1.0
+                )
+                near_boundary = (xyz_norm.abs() > (1.0 - margin)).any(dim=-1)
+                n_border = int(near_boundary.sum().item())
+                if n_border == 0:
+                    continue
+                pts_border = pts_k[near_boundary]
+                t_border = (
+                    time_emb[mask][near_boundary] if use_per_point_time
+                    else time_emb.expand(n_border, -1)
+                )
+                # Single-cluster forward through the batched net
+                out = self.batched_net(
+                    [pts_border], [t_border], [n_border]
+                )  # (1, n_border, 10)
+                total = total + out[0, :n_border, :3].pow(2).mean()
+            return total.squeeze(0)
+
+        # Sequential path
         for k, student in enumerate(self.students):
             mask = (cluster_ids == k)
             if mask.sum() == 0:
                 continue
 
-            pts_k = xyz[mask]  # (M, 3)
+            pts_k = xyz[mask]
 
-            # Normalised coords in student AABB
             xyz_norm = (
                 2.0 * (pts_k - student.aabb_min) /
                 (student.aabb_max - student.aabb_min + 1e-8) - 1.0
-            )  # (M, 3)
+            )
 
-            near_boundary = (xyz_norm.abs() > (1.0 - margin)).any(dim=-1)  # (M,)
+            near_boundary = (xyz_norm.abs() > (1.0 - margin)).any(dim=-1)
             n_border = int(near_boundary.sum().item())
             if n_border == 0:
                 continue
 
-            pts_border = pts_k[near_boundary]  # (B, 3)
+            pts_border = pts_k[near_boundary]
             if use_per_point_time:
                 t_border = time_emb[mask][near_boundary]
             else:
@@ -1153,8 +1303,15 @@ class ClusteredDeformModel:
             (self.teacher.aabb_max - self.teacher.aabb_min).clamp(min=1e-6).prod()
         )
 
-        for k, student in enumerate(self.students):
-            extent_k = (student.aabb_max - student.aabb_min).clamp(min=1e-6)
+        for k in range(self.n_clusters):
+            if self.use_batched_students:
+                extent_k = (
+                    self.batched_net.aabb_maxs[k] - self.batched_net.aabb_mins[k]
+                ).clamp(min=1e-6)
+            else:
+                extent_k = (
+                    self.students[k].aabb_max - self.students[k].aabb_min
+                ).clamp(min=1e-6)
             vol_k = extent_k.prod()
             ratio = (teacher_vol / vol_k).item()
 

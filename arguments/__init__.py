@@ -96,6 +96,7 @@ class ModelParams(ParamGroup):
         # Clustered multi-deform model (teacher-student distillation)
         self.clustered_deform_start_iter = 15000  # 多形变场训练起始轮次
         self.teacher_checkpoint_path = ""  # 外部预训练教师模型权重路径（可选；为空则使用当前训练中的形变场作为教师）
+        self.use_batched_students = False  # 使用 BatchedHexPlaneDeformNetwork (Path A+B 并行化) — 适用于均匀高tier配置的scaling实验
         
         # Student model architecture parameters (for clustered deform model)
         self.student_feat_dim = 8  # Student HexPlane feature dimension (default: 8)

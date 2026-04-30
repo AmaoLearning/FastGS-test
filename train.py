@@ -328,8 +328,9 @@ def run_clustering_at_iteration(
         teacher_feat_dim=dataset.hex_feat_dim,
         teacher_mlp_hidden_dim=dataset.hex_mlp_hidden,
         teacher_mlp_num_hidden=dataset.hex_mlp_layers,
-        student_configs=student_configs,  # Use pre-computed per-cluster configs
+        student_configs=student_configs,
         fusion=dataset.hex_fusion,
+        use_batched_students=dataset.use_batched_students,
     )
     
     # Load teacher weights — prefer external checkpoint if provided,
