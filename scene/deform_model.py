@@ -616,8 +616,12 @@ class ClusteredDeformModel:
         if cluster_ids is None:
             raise ValueError("No cluster labels provided. Call set_cluster_labels first.")
 
-        N = xyz.shape[0]
+        # _cluster_labels is typically stored on CPU; move to xyz's device so
+        # boolean masks derived from it are on the same device as d_xyz/d_rotation/d_scaling.
         device = xyz.device
+        cluster_ids = cluster_ids.to(device)
+
+        N = xyz.shape[0]
         dtype = xyz.dtype
         use_per_point_time = time_emb.shape[0] == N
 
