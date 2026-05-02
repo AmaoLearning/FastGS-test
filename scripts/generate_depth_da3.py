@@ -55,13 +55,31 @@ def main() -> None:
         "--num_frames", type=int, default=300,
         help="Max number of frames per camera to process.",
     )
+    parser.add_argument(
+        "--fp16", action="store_true", default=True,
+        help="Use fp16 autocast for faster GPU inference (default: True).",
+    )
+    parser.add_argument(
+        "--no_fp16", dest="fp16", action="store_false",
+        help="Disable fp16 autocast.",
+    )
     args = parser.parse_args()
 
     from depth_anything_3.api import DepthAnything3
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if not torch.cuda.is_available():
+        print("[WARN] CUDA not available, running on CPU — this will be very slow!")
+        device = torch.device("cpu")
+    else:
+        device = torch.device("cuda")
+        print(f"[DA3] Using GPU: {torch.cuda.get_device_name(device)} "
+              f"(cuda:{torch.cuda.current_device()}, "
+              f"VRAM {torch.cuda.get_device_properties(device).total_memory // 1024**3} GB)")
+
     print(f"[DA3] Loading model: {args.model_name}")
     model = DepthAnything3.from_pretrained(args.model_name).to(device)
+    model.eval()  # 关闭 BatchNorm/Dropout 的训练模式，避免无效统计计算
+    print(f"[DA3] Model ready (fp16={args.fp16 and device.type == 'cuda'})")
 
     cam_dirs = sorted(glob.glob(os.path.join(args.data_dir, "cam*")))
     if not cam_dirs:
@@ -107,11 +125,14 @@ def main() -> None:
         # 分批处理以控制显存
         for start in range(0, len(remaining_paths), args.batch_size):
             batch = remaining_paths[start:start + args.batch_size]
-            prediction = model.inference(
-                image=batch,
-                process_res=args.process_res,
-                ref_view_strategy="middle",
-            )
+
+            use_amp = args.fp16 and device.type == "cuda"
+            with torch.no_grad(), torch.autocast(device_type="cuda", enabled=use_amp):
+                prediction = model.inference(
+                    image=batch,
+                    process_res=args.process_res,
+                    ref_view_strategy="middle",
+                )
 
             for i, path in enumerate(batch):
                 stem = os.path.splitext(os.path.basename(path))[0]
