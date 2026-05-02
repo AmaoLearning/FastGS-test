@@ -79,6 +79,10 @@ class ModelParams(ParamGroup):
 
         # soft dynamic-static separation
         self.use_dynamic_sep = True   # 启用动静分离：积累形变统计、执行聚类（默认启用）
+        # When True, skip clustering entirely and train the 4DGS teacher field end-to-end.
+        # use_dynamic_sep can remain True (deform stats are still accumulated for analysis),
+        # but the switch to ClusteredDeformModel is suppressed.
+        self.teacher_only = False
         self.log_deform_hist = False   # 每隔3000轮记录全局形变分布柱状图
 
         # Dynamic Gaussian clustering (run at 15000 to assign deform fields, labels persist with Gaussians)

@@ -978,7 +978,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                     print(f"[PROFILE] Profiler stopped at iteration {iteration}. Trace saved to {trace_dir}")
 
             # ── Run clustering at configurable iterations (decoupled from training loop) ──
-            if dataset.use_dynamic_sep and iteration in dataset.clustering_iterations:
+            # Skipped when teacher_only=True: the 4DGS teacher is trained end-to-end.
+            if dataset.use_dynamic_sep and not dataset.teacher_only and iteration in dataset.clustering_iterations:
                 cluster_result, deform = run_clustering_at_iteration(
                     gaussians=gaussians,
                     scene=scene,
