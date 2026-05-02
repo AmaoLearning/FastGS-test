@@ -204,11 +204,18 @@ class OptimizationParams(ParamGroup):
         self.dynamic_grad_abs_thresh = -1.0    # split gradient threshold for dynamic Gaussians
         self.dynamic_importance_thresh = -1.0  # multi-view importance threshold for dynamic Gaussians
 
-        # Ablation: extend densification window for dynamic Gaussians only.
-        # When >= 0, dynamic Gaussians (cluster_label >= 0) continue densifying
-        # until this iteration, while static Gaussians stop at densify_until_iter.
-        # When < 0 (default), all Gaussians share the same densify_until_iter.
-        self.densify_dynamic_until_iter = -1
+        # Student phase densification: an independent densification window that runs
+        # exclusively for dynamic Gaussians (cluster_label >= 0) after clustering.
+        # This window is separate from — and runs after — the global densification
+        # window.  Static Gaussians (cluster_label == -1) are never touched here.
+        #
+        # To enable: set student_densify_until_iter >= 0.
+        # student_densify_from_iter = -1 means "start as soon as cluster labels are
+        # available", i.e. immediately after the clustering iteration.
+        # When student_densify_until_iter < 0 (default), the window is disabled.
+        self.student_densify_from_iter = -1     # start of student densification window
+        self.student_densify_until_iter = -1    # end of student densification window (master switch: -1 = off)
+        self.student_densification_interval = 500  # densification interval (iters) for student phase
 
         # Ablation: dynamic opacity regularisation.
         # Penalises low opacity on dynamic Gaussians (cluster_label >= 0) after

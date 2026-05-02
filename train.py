@@ -858,20 +858,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                     out_student = os.path.join(dataset.model_path, f"fft_student_{iteration//1000}k.png")
                     plot_deformation_fft(gaussians, deform, out_student, use_teacher=False)
 
-            # Densification — dual-window: global window for all Gaussians,
-            # extended window for dynamic Gaussians only.
-            _dynamic_densify_until = (
-                opt.densify_dynamic_until_iter
-                if opt.densify_dynamic_until_iter >= 0
-                else opt.densify_until_iter
-            )
+            # Densification — dual-window logic:
+            #  1. Global window  [densify_from_iter, densify_until_iter): all Gaussians
+            #  2. Student window [student_densify_from_iter, student_densify_until_iter):
+            #                    dynamic Gaussians only, independent interval
             _in_global_window = iteration < opt.densify_until_iter
-            _in_dynamic_window = (
-                iteration < _dynamic_densify_until
+            # Student window: enabled only when student_densify_until_iter >= 0 (master switch).
+            # student_densify_from_iter = -1 means "start immediately once cluster labels exist".
+            _in_student_window = (
+                opt.student_densify_until_iter >= 0
+                and iteration > opt.student_densify_from_iter
+                and iteration < opt.student_densify_until_iter
                 and gaussians._cluster_labels is not None
             )
-            if _in_global_window or _in_dynamic_window:
-                _dynamic_only = not _in_global_window and _in_dynamic_window
+            if _in_global_window:
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     my_viewpoint_stack = scene.getTrainCameras().copy()
@@ -888,7 +888,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                                                 args = opt,
                                                 importance_score = importance_score,
                                                 pruning_score = pruning_score,
-                                                dynamic_only = _dynamic_only)
+                                                dynamic_only = False)
 
                     # Sync cluster labels to clustered deform model after pruning
                     if isinstance(deform, ClusteredDeformModel) and gaussians._cluster_labels is not None:
@@ -896,7 +896,37 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
 
                 if iteration % opt.opacity_reset_interval == 0 or (
                         dataset.white_background and iteration == opt.densify_from_iter):
-                    gaussians.reset_opacity(dynamic_only=_dynamic_only)
+                    gaussians.reset_opacity()
+            elif _in_student_window:
+                # Student phase: densify ONLY dynamic Gaussians (cluster_label >= 0).
+                # Uses its own interval, independent from the global densification window.
+                # Static Gaussians (cluster_label == -1) are never touched here.
+                if iteration % opt.student_densification_interval == 0:
+                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                    my_viewpoint_stack = scene.getTrainCameras().copy()
+                    camlist = sampling_cameras(my_viewpoint_stack)
+
+                    scene.ensure_cameras_loaded(camlist)
+                    importance_score, pruning_score = compute_gaussian_score_fastgs(
+                        camlist, gaussians, pipe, background, opt,
+                        d_xyz, d_rotation, d_scaling, dataset.is_6dof, DENSIFY=True)
+                    scene.release_cameras(camlist)
+
+                    logger.debug("[Student Densify] iter=%d dynamic_only=True", iteration)
+                    gaussians.densify_and_prune_fastgs(
+                        max_screen_size=size_threshold,
+                        min_opacity=0.005,
+                        extent=scene.cameras_extent,
+                        radii=radii,
+                        args=opt,
+                        importance_score=importance_score,
+                        pruning_score=pruning_score,
+                        dynamic_only=True,
+                    )
+
+                    # Sync cluster labels to clustered deform model after pruning
+                    if isinstance(deform, ClusteredDeformModel) and gaussians._cluster_labels is not None:
+                        deform.set_cluster_labels(gaussians._cluster_labels)
             else:
                 if iteration % opt.densification_interval == 0:
                     gaussians.zero_accums()
