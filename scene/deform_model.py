@@ -322,7 +322,7 @@ class ClusteredDeformModel:
     """Multi-deform model for clustered dynamic Gaussians.
     
     This class manages multiple deformation fields, each responsible for a cluster
-    of dynamic Gaussians. Implements teacher-student distillation from a single
+    of dynamic Gaussians. Uses per-cluster student HexPlane networks initialized
     teacher model to multiple student models.
     
     Architecture:
@@ -332,7 +332,6 @@ class ClusteredDeformModel:
     
     Training objectives:
     1. Visual quality loss (L1 + SSIM) - same as original
-    2. Knowledge distillation loss - student predictions match teacher
     
     Capacity Allocation:
     - Supports per-cluster capacity configuration via student_configs list
@@ -819,14 +818,6 @@ class ClusteredDeformModel:
         """
         return self._step_impl(xyz, time_emb, cluster_ids=cluster_ids, return_handoffs=return_handoffs)
 
-    def step_teacher(
-        self,
-        xyz: torch.Tensor,
-        time_emb: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Forward pass through teacher model (for distillation target)."""
-        return self.teacher(xyz, time_emb)
-    
     def train_setting(self, training_args, start_iteration: int = 0) -> None:
         """Initialize optimizers for all student models."""
         self._lr_start_iter = start_iteration
@@ -912,43 +903,6 @@ class ClusteredDeformModel:
                 param_group["lr"] = mlp_lr
         
         return plane_lr
-    
-    def get_distillation_loss(
-        self,
-        xyz: torch.Tensor,
-        time_emb: torch.Tensor,
-        cluster_ids: torch.Tensor,
-        student_d_xyz: Optional[torch.Tensor] = None,
-        student_d_rot: Optional[torch.Tensor] = None,
-        student_d_scale: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Compute knowledge distillation loss: student vs teacher predictions.
-        
-        Args:
-            xyz: Gaussian positions (N, 3)
-            time_emb: Time embeddings (N, 1)
-            cluster_ids: Cluster assignments (N,)
-            student_d_xyz: Pre-computed student deformation (N, 3). If None, recomputes.
-            student_d_rot: Pre-computed student rotation (N, 4). If None, recomputes.
-            student_d_scale: Pre-computed student scaling (N, 3). If None, recomputes.
-        
-        Returns:
-            Distillation loss (scalar)
-        """
-        # Teacher prediction (no_grad, frozen)
-        with torch.no_grad():
-            teacher_d_xyz, teacher_d_rot, teacher_d_scale = self.step_teacher(xyz, time_emb)
-        
-        # Reuse pre-computed student predictions if provided, otherwise compute fresh
-        if student_d_xyz is None or student_d_rot is None or student_d_scale is None:
-            student_d_xyz, student_d_rot, student_d_scale = self.step(xyz, time_emb, cluster_ids)
-        
-        # L2 loss between teacher and student predictions
-        loss_xyz = F.mse_loss(student_d_xyz, teacher_d_xyz)
-        loss_rot = F.mse_loss(student_d_rot, teacher_d_rot)
-        loss_scale = F.mse_loss(student_d_scale, teacher_d_scale)
-        
-        return loss_xyz + loss_rot + loss_scale
     
     def save_weights(self, model_path: str, iteration: int) -> None:
         """Save student model weights."""

@@ -15,7 +15,7 @@ import logging
 import traceback
 import torch
 from random import randint
-from utils.loss_utils import (l1_loss, ssim, kl_divergence, l2_loss,
+from utils.loss_utils import (l1_loss, ssim, l2_loss,
                               dynamic_opacity_reg_loss)
 from gaussian_renderer import render_fastgs, network_gui
 import sys
@@ -740,32 +740,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                     tb_writer.add_scalar('train_loss_patches/tv_temporal_weight',
                                          _tv_temporal_weight, iteration)
         
-        # ── Knowledge distillation loss for clustered deform model ──
-        # Compute distillation loss sparsely (every 5 iterations) to reduce overhead
-        # Student models are already supervised by rendering loss every iteration
-        _distill_interval = opt.distill_loss_interval
-        if (isinstance(deform, ClusteredDeformModel) 
-                and iteration > dataset.clustered_deform_start_iter
-                and iteration % _distill_interval == 0):
-            N = gaussians.get_xyz.shape[0]
-            time_input = fid.unsqueeze(0).expand(N, -1)
-            
-            kl_weight = opt.kl_distill_weight
-            
-            # Pass pre-computed student deformations (from rendering step) to avoid recomputation
-            distill_loss = deform.get_distillation_loss(
-                gaussians.get_xyz.detach(),
-                time_input + ast_noise if iteration >= opt.warm_up else time_input,
-                gaussians._cluster_labels,
-                student_d_xyz=_d_xyz_raw,
-                student_d_rot=d_rotation,
-                student_d_scale=d_scaling,
-            )
-            loss = loss + kl_weight * distill_loss
-            
-            if tb_writer and iteration % 100 == 0:
-                tb_writer.add_scalar('train_loss_patches/distillation_loss', distill_loss.item(), iteration)
-
         # ── Module C: Boundary regularization for clustered deform model ──
         # Penalises deformation magnitude near/beyond cluster AABB edges.
         # Run every `boundary_reg_interval` iterations to amortise the extra forward pass.
@@ -813,9 +787,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
         # ── Backward pass ──
         # Plan A: when using ClusteredDeformModel, per-student regularization
         # losses have independent computation graphs (no shared tensors with the
-        # render / distillation losses).  We backward them on separate CUDA
-        # streams so their gradient computations overlap with each other and
-        # (partially) with the main loss backward on the default stream.
+        # render loss).  We backward them on separate CUDA streams so their
+        # gradient computations overlap with each other and (partially) with
+        # the main loss backward on the default stream.
         if _per_student_reg_losses is not None:
             # Phase 1: launch per-student reg backward on parallel streams
             _n_reg = len(_per_student_reg_losses)
@@ -824,7 +798,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 with torch.cuda.stream(_reg_streams[_k]):
                     _per_student_reg_losses[_k].backward()
 
-            # Phase 2: main loss backward on default stream (render + distill)
+            # Phase 2: main loss backward on default stream
             loss.backward()
 
             # Phase 3: ensure all reg streams finished before optimizer.step()

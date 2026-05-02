@@ -197,12 +197,6 @@ class OptimizationParams(ParamGroup):
         self.hex_mlp_lr_init = 0.001
         self.hex_mlp_lr_final = 0.00001
         
-        # Clustered deform model
-        self.distill_loss_interval = 5  # Compute distillation loss every N iterations
-        
-        # Knowledge distillation
-        self.kl_distill_weight = 1.0  # Weight for distillation loss
-
         # Ablation: differentiated densification thresholds for dynamic Gaussians
         # When >= 0, override the default threshold for dynamic Gaussians (cluster_label >= 0).
         # When < 0 (default), fall back to the global grad_thresh / grad_abs_thresh / importance=5.
