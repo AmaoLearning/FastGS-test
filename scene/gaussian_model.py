@@ -789,6 +789,15 @@ class GaussianModel:
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
 
+        # When dynamic_only, restrict pruning to dynamic Gaussians only.
+        # Without this guard, static Gaussians (whose opacity has drifted low
+        # due to the lack of opacity resets in the student window) would consume
+        # the entire remove_budget, causing net Gaussian count to decrease even
+        # though ~3k dynamic Gaussians were just added above.
+        if dynamic_only and self._cluster_labels is not None:
+            static_mask = self._cluster_labels < 0
+            prune_mask[static_mask] = False
+
         scores = 1 - pruning_score 
         to_remove = torch.sum(prune_mask)
         remove_budget = int(0.5 * to_remove)  # single GPU→CPU sync
