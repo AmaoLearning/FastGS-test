@@ -667,6 +667,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                 _per_student_reg_losses = deform.get_per_student_regularization_losses(
                     tv_temporal_weight=_tv_temporal_weight
                 )
+                # Apply student-phase regularization scale after clustering (iter > 15k).
+                _sreg_scale = opt.student_reg_scale
+                if _sreg_scale > 0 and gaussians._cluster_labels is not None:
+                    _per_student_reg_losses = [r * _sreg_scale for r in _per_student_reg_losses]
                 # Compute scalar for logging (detached, no graph)
                 with torch.no_grad():
                     _reg_loss_scalar = sum(r.detach() for r in _per_student_reg_losses)

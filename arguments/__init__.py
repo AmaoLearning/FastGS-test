@@ -239,6 +239,12 @@ class OptimizationParams(ParamGroup):
         self.hex_tv_temporal_anneal_start = 15000    # iteration to begin annealing
         self.hex_tv_temporal_anneal_end = 30000      # iteration when annealing completes
 
+        # Student-phase regularization scale (applies after clustering, i.e. iter > 15k).
+        # Scales both TV loss and L1/sparsity loss for all student HexPlane fields.
+        # -1.0 (default) = disabled (no scaling applied).
+        # E.g. 0.5 halves the student regularization strength relative to the teacher phase.
+        self.student_reg_scale = -1.0           # < 0 = disabled; 0 < v <= 1.0 to weaken
+
         # Boundary regularization (Module C)
         # Penalises deformation magnitude for Gaussians near or beyond the edge of
         # their cluster AABB, preventing grid_sample border-clamping artefacts.
