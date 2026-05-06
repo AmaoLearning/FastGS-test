@@ -482,26 +482,23 @@ class ClusteredDeformModel:
         deform_max: Optional[torch.Tensor] = None,
         deform_min: Optional[torch.Tensor] = None,
     ) -> None:
-        """Set a displacement-aware per-cluster AABB for each student network.
+        """Set per-cluster AABB for each student network based on canonical positions.
 
-        For cluster *k* the AABB is built from the *worst-case reachable
-        positions* of every Gaussian in that cluster:
+        The deformation field is always queried at the Gaussian's **canonical
+        (static) position** — never at the deformed position.  Therefore the
+        AABB only needs to tightly cover the canonical positions of Gaussians
+        belonging to each cluster, plus a proportional padding margin:
 
         .. code-block:: text
 
-            pos_max_k = (xyz + deform_max)[mask_k].max(axis=0)
-            pos_min_k = (xyz + deform_min)[mask_k].min(axis=0)
-            aabb = [pos_min_k − padding × extent_k,
-                    pos_max_k + padding × extent_k]
+            aabb_min_k = static_min_k − padding × extent_k
+            aabb_max_k = static_max_k + padding × extent_k
 
-        This guarantees that any valid deformed position remains inside
-        ``[-1, 1]`` after normalisation, preventing ``grid_sample`` border
-        clamping artefacts at the cost of only a small amount of extra
-        AABB volume compared to a displacement-unaware tight box.
-
-        When ``deform_max`` / ``deform_min`` are unavailable (e.g. tracking
-        not yet started), the method falls back to the static position AABB
-        plus proportional padding.
+        The ``deform_max`` / ``deform_min`` parameters are accepted for
+        backward compatibility but are intentionally **ignored**.
+        Displacement-aware AABB expansion caused adjacent clusters to overlap
+        by 25–50 % in high-displacement scenes, which wasted grid capacity and
+        distorted the TV regularisation's physical-distance semantics.
 
         The teacher always receives the **global** AABB (it handles all
         clusters uniformly).
@@ -509,27 +506,18 @@ class ClusteredDeformModel:
         Parameters
         ----------
         points : Tensor ``(N, 3)``
-            Current Gaussian positions (detached from the compute graph).
+            Current Gaussian canonical positions (detached from the graph).
         cluster_labels : Tensor ``(N,)`` int
             Per-Gaussian cluster index; −1 marks static Gaussians (ignored).
         padding : float
-            Fraction of cluster extent added as a safety margin on each side.
+            Fraction of cluster extent added as safety margin on each side.
         deform_max : Tensor ``(N, 3)`` or None
-            Per-Gaussian maximum d_xyz displacement observed during tracking
-            (``gaussians._deform_max``).
+            Ignored.  Kept for API compatibility.
         deform_min : Tensor ``(N, 3)`` or None
-            Per-Gaussian minimum d_xyz displacement (``gaussians._deform_min``).
+            Ignored.  Kept for API compatibility.
         """
         # Teacher always uses the full-scene AABB.
         self.teacher.set_aabb(points, padding=padding)
-
-        have_disp = (
-            deform_max is not None
-            and deform_min is not None
-            and deform_max.numel() > 0
-            and deform_min.numel() > 0
-            and deform_max.shape[0] == points.shape[0]
-        )
 
         for k in range(self.n_clusters):
             mask = (cluster_labels == k)
@@ -551,15 +539,9 @@ class ClusteredDeformModel:
             static_max_k = pts_k.max(dim=0).values
             static_extent_k = (static_max_k - static_min_k).clamp(min=1e-6)
 
-            if have_disp:
-                pos_max_k = (pts_k + deform_max[mask]).max(dim=0).values
-                pos_min_k = (pts_k + deform_min[mask]).min(dim=0).values
-            else:
-                pos_max_k = static_max_k
-                pos_min_k = static_min_k
-
-            aabb_min = pos_min_k - padding * static_extent_k
-            aabb_max = pos_max_k + padding * static_extent_k
+            # Use canonical (static) positions only — no displacement expansion.
+            aabb_min = static_min_k - padding * static_extent_k
+            aabb_max = static_max_k + padding * static_extent_k
 
             if self.use_batched_students:
                 self.batched_net.aabb_mins[k] = aabb_min
@@ -570,11 +552,11 @@ class ClusteredDeformModel:
 
             logger.debug(
                 "[ClusteredDeform] Student %d AABB: min=[%.3f,%.3f,%.3f] "
-                "max=[%.3f,%.3f,%.3f] (n_pts=%d, disp_aware=%s)",
+                "max=[%.3f,%.3f,%.3f] (n_pts=%d, canonical-only)",
                 k,
                 aabb_min[0].item(), aabb_min[1].item(), aabb_min[2].item(),
                 aabb_max[0].item(), aabb_max[1].item(), aabb_max[2].item(),
-                n_pts, have_disp,
+                n_pts,
             )
     
     def set_cluster_labels(self, cluster_labels: torch.Tensor) -> None:

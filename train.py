@@ -302,26 +302,17 @@ def run_clustering_at_iteration(
     # Each student's AABB is built from the worst-case reachable positions of
     # its cluster's Gaussians:
     #   pos_max_k = (xyz + deform_max)[cluster_k].max(axis=0)
-    #   pos_min_k = (xyz + deform_min)[cluster_k].min(axis=0)
-    # This keeps every deformed position inside [-1, 1] after normalisation,
-    # while still providing cluster-tight spatial coverage.
-    # deform_max / deform_min are tracked from iter 10000; numel()==0 when not yet started.
+    # Per-cluster AABB is based on canonical (static) Gaussian positions only.
+    # The deformation field is queried at canonical coordinates, so the AABB
+    # needs only to cover the static positions — no displacement expansion.
     _pts = gaussians.get_xyz.detach()
-    _deform_max = gaussians._deform_max if gaussians._deform_max.numel() > 0 else None
-    _deform_min = gaussians._deform_min if gaussians._deform_min.numel() > 0 else None
     clustered_deform.set_per_cluster_aabb(
         _pts,
         cluster_labels=gaussians._cluster_labels,
         padding=dataset.cluster_aabb_padding,
-        deform_max=_deform_max,
-        deform_min=_deform_min,
     )
-    if _deform_max is not None:
-        logger.info("[ITER %d] Per-cluster AABB set with displacement-aware expansion (padding=%.2f)",
-                    iteration, dataset.cluster_aabb_padding)
-    else:
-        logger.info("[ITER %d] Per-cluster AABB set with static padding=%.2f (no displacement stats)",
-                    iteration, dataset.cluster_aabb_padding)
+    logger.info("[ITER %d] Per-cluster AABB set from canonical positions (padding=%.2f)",
+                iteration, dataset.cluster_aabb_padding)
 
     # ── Module D: log per-cluster AABB stats to TensorBoard ──────────────────
     clustered_deform.log_cluster_aabb_stats(tb_writer, iteration)
