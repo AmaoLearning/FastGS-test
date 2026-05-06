@@ -576,7 +576,7 @@ class GaussianModel:
         )  # (N, 3)
         return (xyz + prev_disp).detach()
 
-
+    def add_deform_stats(self, d_xyz: torch.Tensor) -> None:
         """Accumulate per-Gaussian deformation for motion history.
         
         When tracking is started (from iter 10000), also tracks max/min displacement.
