@@ -360,12 +360,23 @@ class ClusteredDeformModel:
         fusion: str = "concat",
         # ── Batched mode ─────────────────────────────────────────────
         use_batched_students: bool = False,
+        # ── Flow-mode routing (plan_uneven.md §10) ───────────────────
+        query_mode: str = "canonical",    # "canonical" | "flow"
+        # ── Soft boundary routing (plan_uneven.md §10.7) ─────────────
+        # "hard": single nearest field (default); "soft": IDW blend of top-p fields
+        routing_mode: str = "hard",       # "hard" | "soft"
+        soft_overlap_ratio: float = 1.3,  # d_second/d_first threshold
+        soft_routing_k: int = 2,          # number of fields to blend
     ) -> None:
         self.n_clusters = n_clusters
         self.is_blender = is_blender
         self.is_6dof = is_6dof
         self.fusion = fusion
         self.use_batched_students = use_batched_students
+        self.query_mode = query_mode
+        self.routing_mode = routing_mode
+        self.soft_overlap_ratio = soft_overlap_ratio
+        self.soft_routing_k = soft_routing_k
         
         # Teacher model (original capacity)
         self.teacher = HexPlaneDeformNetwork(
@@ -464,6 +475,9 @@ class ClusteredDeformModel:
         
         # Cluster assignments (updated during training)
         self._cluster_labels: Optional[torch.Tensor] = None  # (N,) int32
+        # Cluster centroid positions — used for flow-mode Voronoi routing.
+        # Set automatically by set_per_cluster_aabb when points are available.
+        self.cluster_centers: Optional[torch.Tensor] = None  # (K, 3) on CUDA
     
     def set_aabb(self, points: torch.Tensor, padding: float = 0.1) -> None:
         """Set global AABB for teacher + all students."""
@@ -482,42 +496,48 @@ class ClusteredDeformModel:
         deform_max: Optional[torch.Tensor] = None,
         deform_min: Optional[torch.Tensor] = None,
     ) -> None:
-        """Set per-cluster AABB for each student network based on canonical positions.
+        """Set per-cluster AABB for each student network.
 
-        The deformation field is always queried at the Gaussian's **canonical
-        (static) position** — never at the deformed position.  Therefore the
-        AABB only needs to tightly cover the canonical positions of Gaussians
-        belonging to each cluster, plus a proportional padding margin:
+        In **canonical** mode (default) the AABB covers only the static
+        canonical positions of each cluster's Gaussians.
+
+        In **flow** mode the AABB is expanded to cover the worst-case
+        *deformed* positions, using ``deform_max``/``deform_min`` when
+        provided and when they have the right shape:
 
         .. code-block:: text
 
-            aabb_min_k = static_min_k − padding × extent_k
-            aabb_max_k = static_max_k + padding × extent_k
+            pos_max_k = max(static_max_k, (xyz + deform_max)[cluster_k].max())
+            pos_min_k = min(static_min_k, (xyz + deform_min)[cluster_k].min())
 
-        The ``deform_max`` / ``deform_min`` parameters are accepted for
-        backward compatibility but are intentionally **ignored**.
-        Displacement-aware AABB expansion caused adjacent clusters to overlap
-        by 25–50 % in high-displacement scenes, which wasted grid capacity and
-        distorted the TV regularisation's physical-distance semantics.
-
-        The teacher always receives the **global** AABB (it handles all
-        clusters uniformly).
+        Additionally, this method computes per-cluster **centroids** and
+        stores them in ``self.cluster_centers`` for flow-mode routing.
 
         Parameters
         ----------
         points : Tensor ``(N, 3)``
-            Current Gaussian canonical positions (detached from the graph).
+            Canonical Gaussian positions (detached).
         cluster_labels : Tensor ``(N,)`` int
             Per-Gaussian cluster index; −1 marks static Gaussians (ignored).
         padding : float
             Fraction of cluster extent added as safety margin on each side.
         deform_max : Tensor ``(N, 3)`` or None
-            Ignored.  Kept for API compatibility.
+            Maximum per-Gaussian displacement.  Used only in flow mode.
         deform_min : Tensor ``(N, 3)`` or None
-            Ignored.  Kept for API compatibility.
+            Minimum per-Gaussian displacement.  Used only in flow mode.
         """
         # Teacher always uses the full-scene AABB.
         self.teacher.set_aabb(points, padding=padding)
+
+        # Decide whether to use displacement-aware expansion
+        use_disp = (
+            self.query_mode == "flow"
+            and deform_max is not None and deform_min is not None
+            and deform_max.shape[0] == points.shape[0]
+        )
+
+        # Accumulate cluster centers for flow-mode routing
+        centers: List[torch.Tensor] = []
 
         for k in range(self.n_clusters):
             mask = (cluster_labels == k)
@@ -528,6 +548,8 @@ class ClusteredDeformModel:
                     self.batched_net.set_aabb_single(k, points, padding=padding)
                 else:
                     self.students[k].set_aabb(points, padding=padding)
+                # Fallback centroid: global mean
+                centers.append(points.mean(dim=0))
                 logger.warning(
                     "[ClusteredDeform] Cluster %d has only %d Gaussians — "
                     "using global AABB as fallback.", k, n_pts
@@ -539,9 +561,22 @@ class ClusteredDeformModel:
             static_max_k = pts_k.max(dim=0).values
             static_extent_k = (static_max_k - static_min_k).clamp(min=1e-6)
 
-            # Use canonical (static) positions only — no displacement expansion.
-            aabb_min = static_min_k - padding * static_extent_k
-            aabb_max = static_max_k + padding * static_extent_k
+            # Cluster centroid for flow-mode routing
+            centers.append(pts_k.mean(dim=0))
+
+            if use_disp:
+                # Displacement-aware bounds for flow-mode AABB
+                deformed_max_k = (pts_k + deform_max[mask]).max(dim=0).values
+                deformed_min_k = (pts_k + deform_min[mask]).min(dim=0).values
+                pos_max_k = torch.max(static_max_k, deformed_max_k)
+                pos_min_k = torch.min(static_min_k, deformed_min_k)
+                extent_k = (pos_max_k - pos_min_k).clamp(min=1e-6)
+                aabb_min = pos_min_k - padding * extent_k
+                aabb_max = pos_max_k + padding * extent_k
+            else:
+                # Canonical-only (default)
+                aabb_min = static_min_k - padding * static_extent_k
+                aabb_max = static_max_k + padding * static_extent_k
 
             if self.use_batched_students:
                 self.batched_net.aabb_mins[k] = aabb_min
@@ -552,12 +587,17 @@ class ClusteredDeformModel:
 
             logger.debug(
                 "[ClusteredDeform] Student %d AABB: min=[%.3f,%.3f,%.3f] "
-                "max=[%.3f,%.3f,%.3f] (n_pts=%d, canonical-only)",
+                "max=[%.3f,%.3f,%.3f] (n_pts=%d, mode=%s, use_disp=%s)",
                 k,
                 aabb_min[0].item(), aabb_min[1].item(), aabb_min[2].item(),
                 aabb_max[0].item(), aabb_max[1].item(), aabb_max[2].item(),
                 n_pts,
+                self.query_mode,
+                use_disp,
             )
+
+        # Store cluster centers as (K, 3) CUDA tensor
+        self.cluster_centers = torch.stack(centers, dim=0)  # (K, 3)
     
     def set_cluster_labels(self, cluster_labels: torch.Tensor) -> None:
         """Set cluster labels for Gaussian assignment."""
@@ -569,6 +609,7 @@ class ClusteredDeformModel:
         time_emb: torch.Tensor,
         cluster_ids: Optional[torch.Tensor] = None,
         return_handoffs: bool = False,
+        prev_xyz: Optional[torch.Tensor] = None,
     ) -> Tuple:
         """Dispatch to batched or sequential forward pass."""
         if self.use_batched_students:
@@ -578,14 +619,15 @@ class ClusteredDeformModel:
                     "Batched autograd handles gradients automatically — "
                     "ParallelBackwardHandle is not needed."
                 )
-            return self._step_impl_batched(xyz, time_emb, cluster_ids)
-        return self._step_impl_sequential(xyz, time_emb, cluster_ids, return_handoffs)
+            return self._step_impl_batched(xyz, time_emb, cluster_ids, prev_xyz=prev_xyz)
+        return self._step_impl_sequential(xyz, time_emb, cluster_ids, return_handoffs, prev_xyz=prev_xyz)
 
     def _step_impl_batched(
         self,
         xyz: torch.Tensor,
         time_emb: torch.Tensor,
         cluster_ids: Optional[torch.Tensor] = None,
+        prev_xyz: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Batched forward pass using BatchedHexPlaneDeformNetwork.
 
@@ -597,13 +639,29 @@ class ClusteredDeformModel:
         if cluster_ids is None:
             raise ValueError("No cluster labels provided. Call set_cluster_labels first.")
 
-        # _cluster_labels is typically stored on CPU; move to xyz's device so
-        # boolean masks derived from it are on the same device as d_xyz/d_rotation/d_scaling.
         device = xyz.device
-        cluster_ids = cluster_ids.to(device)
+        dtype = xyz.dtype
+
+        # ── Flow-mode: re-route Gaussians by nearest cluster center ──────────
+        # In flow mode we use the *previous-frame* deformed position to decide
+        # which student handles each Gaussian.  This keeps high-motion splats
+        # in the correct student even when they stray outside their canonical
+        # cluster boundary.
+        if (
+            self.query_mode == "flow"
+            and prev_xyz is not None
+            and self.cluster_centers is not None
+        ):
+            route_xyz = prev_xyz.detach().to(device)  # (N, 3)
+            centers = self.cluster_centers.to(device)  # (K, 3)
+            dists = torch.cdist(route_xyz, centers)     # (N, K)
+            cluster_ids = dists.argmin(dim=-1).to(cluster_ids.dtype)  # (N,)
+        else:
+            # _cluster_labels is typically stored on CPU; move to xyz's device so
+            # boolean masks derived from it are on the same device as d_xyz/d_rotation/d_scaling.
+            cluster_ids = cluster_ids.to(device)
 
         N = xyz.shape[0]
-        dtype = xyz.dtype
         use_per_point_time = time_emb.shape[0] == N
 
         # Gather per-cluster inputs and masks
@@ -643,6 +701,70 @@ class ClusteredDeformModel:
                 d_rotation[mask] = out[k, :n, 3:7]
                 d_scaling[mask] = out[k, :n, 7:10]
 
+        # ── Soft routing: IDW blend for overlap-region Gaussians ─────────────
+        # For each Gaussian whose second-nearest cluster is closer than
+        # `soft_overlap_ratio * d_first` we query that second cluster as well
+        # and blend d_xyz with harmonic (IDW) weights.
+        # d_rotation and d_scaling keep the hard-route (primary) result.
+        if self.routing_mode == "soft" and self.cluster_centers is not None:
+            centers_soft = self.cluster_centers.to(device)           # (K, 3)
+            all_dists = torch.cdist(xyz.detach(), centers_soft)      # (N, K)
+            p = min(self.soft_routing_k, self.n_clusters)
+            topk_dists, topk_ids = all_dists.topk(
+                p, dim=-1, largest=False
+            )                                                         # (N, p) ascending
+            overlap_mask = (
+                topk_dists[:, 1] / topk_dists[:, 0].clamp(min=1e-8)
+                < self.soft_overlap_ratio
+            )                                                         # (N,)
+            n_soft = int(overlap_mask.sum())
+            if n_soft > 0:
+                soft_xyz = xyz[overlap_mask]                          # (n_soft, 3)
+                soft_time = (
+                    time_emb[overlap_mask] if use_per_point_time
+                    else time_emb.expand(n_soft, -1)
+                )                                                     # (n_soft, 1)
+                soft_k2_ids = topk_ids[overlap_mask, 1]              # (n_soft,)
+
+                # Build per-cluster lists for the second-nearest cluster pass
+                s_cluster_xyz: List[torch.Tensor] = []
+                s_cluster_t: List[torch.Tensor] = []
+                s_cluster_counts: List[int] = []
+                s_cluster_masks: List[torch.Tensor] = []
+                for k in range(self.n_clusters):
+                    sub_mask = (soft_k2_ids == k)                    # (n_soft,)
+                    n_k = int(sub_mask.sum())
+                    s_cluster_masks.append(sub_mask)
+                    s_cluster_counts.append(n_k)
+                    if n_k > 0:
+                        s_cluster_xyz.append(soft_xyz[sub_mask])
+                        s_cluster_t.append(
+                            soft_time[sub_mask] if use_per_point_time
+                            else soft_time[:1].expand(n_k, -1)
+                        )
+                    else:
+                        s_cluster_xyz.append(xyz.new_empty(0, 3))
+                        s_cluster_t.append(time_emb.new_empty(0, 1))
+
+                # Secondary batched forward → (K, N_max2, 10)
+                out2 = self.batched_net(s_cluster_xyz, s_cluster_t, s_cluster_counts)
+
+                # Gather d_xyz from secondary pass
+                d_xyz2 = xyz.new_zeros(n_soft, 3)
+                for k in range(self.n_clusters):
+                    n_k = s_cluster_counts[k]
+                    if n_k > 0:
+                        d_xyz2[s_cluster_masks[k]] = out2[k, :n_k, :3]
+
+                # IDW (harmonic) blend weights  w_i = (1/d_i) / Σ(1/d_j)
+                d1 = topk_dists[overlap_mask, 0:1].clamp(min=1e-8)  # (n_soft, 1)
+                d2 = topk_dists[overlap_mask, 1:2].clamp(min=1e-8)  # (n_soft, 1)
+                w1 = (1.0 / d1) / (1.0 / d1 + 1.0 / d2)
+                w2 = 1.0 - w1
+                # Clone before in-place assignment to preserve autograd history
+                d_xyz = d_xyz.clone()
+                d_xyz[overlap_mask] = w1 * d_xyz[overlap_mask] + w2 * d_xyz2
+
         return d_xyz, d_rotation, d_scaling
 
     def _step_impl_sequential(
@@ -651,6 +773,7 @@ class ClusteredDeformModel:
         time_emb: torch.Tensor,
         cluster_ids: Optional[torch.Tensor] = None,
         return_handoffs: bool = False,
+        prev_xyz: Optional[torch.Tensor] = None,
     ) -> Tuple:
         """Forward pass for clustered deformation (parallel inference).
         
@@ -667,6 +790,7 @@ class ClusteredDeformModel:
                 so that loss.backward() stops at the handoff boundary (shallow/fast).
                 Call handle.backward_parallel() after loss.backward() to propagate
                 gradients into student parameters concurrently on separate CUDA streams.
+            prev_xyz: Previous-frame deformed positions (N, 3), used for routing in flow mode.
         
         Returns:
             (d_xyz, d_rotation, d_scaling) when return_handoffs=False (default).
@@ -677,11 +801,32 @@ class ClusteredDeformModel:
         
         if cluster_ids is None:
             raise ValueError("No cluster labels provided. Set cluster_labels first.")
+
+        if return_handoffs and self.routing_mode == "soft":
+            raise ValueError(
+                "return_handoffs=True is incompatible with routing_mode='soft'. "
+                "The parallel-backward handoff mechanism manages leaf-tensor boundaries "
+                "that cannot be extended to cover the secondary IDW student call. "
+                "Use routing_mode='hard' (default) when return_handoffs=True."
+            )
         
         N = xyz.shape[0]
         device = xyz.device
         dtype = xyz.dtype
-        
+
+        # ── Flow-mode: re-route Gaussians by nearest cluster center ──────────
+        if (
+            self.query_mode == "flow"
+            and prev_xyz is not None
+            and self.cluster_centers is not None
+        ):
+            route_xyz = prev_xyz.detach().to(device)   # (N, 3)
+            centers = self.cluster_centers.to(device)  # (K, 3)
+            dists = torch.cdist(route_xyz, centers)    # (N, K)
+            cluster_ids = dists.argmin(dim=-1).to(cluster_ids.dtype)  # (N,)
+        else:
+            cluster_ids = cluster_ids.to(device)
+
         # Determine if time_emb needs per-point indexing
         use_per_point_time = time_emb.shape[0] == N
         
@@ -740,6 +885,44 @@ class ClusteredDeformModel:
                 d_xyz[mask] = d_xyz_c
                 d_rotation[mask] = d_rotation_c
                 d_scaling[mask] = d_scaling_c
+
+            # ── Soft routing post-processing ─────────────────────────────────
+            if self.routing_mode == "soft" and self.cluster_centers is not None:
+                centers_soft = self.cluster_centers.to(device)           # (K, 3)
+                all_dists = torch.cdist(xyz.detach(), centers_soft)      # (N, K)
+                p = min(self.soft_routing_k, self.n_clusters)
+                topk_dists, topk_ids = all_dists.topk(
+                    p, dim=-1, largest=False
+                )
+                overlap_mask = (
+                    topk_dists[:, 1] / topk_dists[:, 0].clamp(min=1e-8)
+                    < self.soft_overlap_ratio
+                )
+                n_soft = int(overlap_mask.sum())
+                if n_soft > 0:
+                    soft_xyz = xyz[overlap_mask]
+                    soft_time = (
+                        time_emb[overlap_mask] if use_per_point_time
+                        else time_emb.expand(n_soft, -1)
+                    )
+                    soft_k2_ids = topk_ids[overlap_mask, 1]
+
+                    # Query second-nearest student for each overlap Gaussian
+                    d_xyz2 = xyz.new_zeros(n_soft, 3)
+                    for k in range(self.n_clusters):
+                        sub_mask = (soft_k2_ids == k)
+                        if not sub_mask.any():
+                            continue
+                        d_k2, _, _ = self.students[k](soft_xyz[sub_mask], soft_time[sub_mask])
+                        d_xyz2[sub_mask] = d_k2
+
+                    # IDW blend weights
+                    d1 = topk_dists[overlap_mask, 0:1].clamp(min=1e-8)
+                    d2 = topk_dists[overlap_mask, 1:2].clamp(min=1e-8)
+                    w1 = (1.0 / d1) / (1.0 / d1 + 1.0 / d2)
+                    d_xyz = d_xyz.clone()
+                    d_xyz[overlap_mask] = w1 * d_xyz[overlap_mask] + (1.0 - w1) * d_xyz2
+
             return d_xyz, d_rotation, d_scaling
 
         # ── Handoff path: assemble from *leaf* tensors ─────────────────────────
@@ -793,12 +976,20 @@ class ClusteredDeformModel:
         time_emb: torch.Tensor,
         cluster_ids: Optional[torch.Tensor] = None,
         return_handoffs: bool = False,
+        prev_xyz: Optional[torch.Tensor] = None,
     ) -> Tuple:
         """Forward pass for clustered deformation.
 
         Delegates to :meth:`_step_impl`.  See that method for full docs.
+
+        Parameters
+        ----------
+        prev_xyz : Tensor ``(N, 3)`` or None
+            Previous-frame deformed positions for flow-mode routing.
+            Ignored when ``query_mode="canonical"`` (default).
         """
-        return self._step_impl(xyz, time_emb, cluster_ids=cluster_ids, return_handoffs=return_handoffs)
+        return self._step_impl(xyz, time_emb, cluster_ids=cluster_ids,
+                               return_handoffs=return_handoffs, prev_xyz=prev_xyz)
 
     def train_setting(self, training_args, start_iteration: int = 0) -> None:
         """Initialize optimizers for all student models."""

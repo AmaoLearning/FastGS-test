@@ -51,6 +51,10 @@ class GaussianModel:
         self._deform_max = torch.empty(0)    # (N, 3) max d_xyz per Gaussian
         self._deform_min = torch.empty(0)    # (N, 3) min d_xyz per Gaussian
         self._deform_tracking_started = False  # flag to start tracking from iter 10000
+        # ── Flow-mode routing cache (plan_uneven.md §10) ──────────────────────
+        # Allocated lazily by init_deform_cache(); shape (N, T, 3) CPU pinned.
+        self._deform_cache = None  # (N, T, 3) CPU pinned tensor or None; allocated lazily
+        self._flow_total_frames: int = 0
         self._cluster_labels = None  # (N,) int32 tensor: -1 for static, >=0 for cluster id
 
         self.optimizer = None
@@ -372,6 +376,10 @@ class GaussianModel:
         self._deform_max = self._deform_max[valid_points_mask] if self._deform_max.numel() > 0 else self._deform_max
         self._deform_min = self._deform_min[valid_points_mask] if self._deform_min.numel() > 0 else self._deform_min
         
+        # Prune flow-mode displacement cache if allocated
+        if self._deform_cache is not None:
+            self._deform_cache = self._deform_cache[valid_points_mask.cpu()]
+
         # Prune cluster labels if they exist
         if self._cluster_labels is not None:
             self._cluster_labels = self._cluster_labels[valid_points_mask]
@@ -434,7 +442,17 @@ class GaussianModel:
                                        torch.zeros(_n_new, 3, device="cuda")], dim=0) if self._deform_max.numel() > 0 else self._deform_max
         self._deform_min = torch.cat([self._deform_min,
                                        torch.zeros(_n_new, 3, device="cuda")], dim=0) if self._deform_min.numel() > 0 else self._deform_min
-        
+
+        # Extend flow-mode displacement cache with zeros for newly added Gaussians
+        if self._deform_cache is not None:
+            _T = self._flow_total_frames
+            _zero = torch.zeros(
+                (_n_new, _T, 3),
+                dtype=self._deform_cache.dtype,
+                pin_memory=True,
+            )
+            self._deform_cache = torch.cat([self._deform_cache, _zero], dim=0)
+
         # Extend or initialize cluster labels for newly added Gaussians
         if new_cluster_labels is not None:
             # Inherit cluster labels from parent Gaussians
@@ -468,7 +486,97 @@ class GaussianModel:
         """Start tracking max/min deformation from iteration 10000."""
         self._deform_tracking_started = True
 
-    def add_deform_stats(self, d_xyz: torch.Tensor) -> None:
+    # ─────────────────────────────────────────────────────────────────────────
+    # Flow-mode displacement cache  (plan_uneven.md §10)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def init_deform_cache(
+        self,
+        total_frames: int,
+        dtype: torch.dtype = torch.float16,
+        teacher_fn=None,
+        time_inputs=None,
+    ) -> None:
+        """Allocate and optionally warm-initialise the flow displacement cache.
+
+        Parameters
+        ----------
+        total_frames : int
+            Number of discrete time steps T.
+        dtype : torch.dtype
+            Storage dtype for the cache tensor (float16 recommended to save RAM).
+        teacher_fn : callable, optional
+            ``teacher_fn(xyz, time_emb) -> d_xyz``  called at init time to
+            pre-fill the cache with teacher predictions.  ``xyz`` is
+            ``(N, 3)`` on CUDA; ``time_emb`` is ``(N, 1)`` on CUDA.
+            If *None* the cache starts as zeros.
+        time_inputs : torch.Tensor, optional
+            1-D tensor of normalised time values ``[0, 1]`` with length T
+            (one value per frame), on any device.
+        """
+        N = self.get_xyz.shape[0]
+        self._flow_total_frames = total_frames
+        # Allocate on CPU with pin_memory for fast async H→D copies later.
+        self._deform_cache = torch.zeros(
+            (N, total_frames, 3), dtype=dtype, pin_memory=True
+        )
+        if teacher_fn is not None and time_inputs is not None:
+            assert time_inputs.shape[0] == total_frames, (
+                f"time_inputs length {time_inputs.shape[0]} != total_frames {total_frames}"
+            )
+            xyz_cuda = self.get_xyz.detach()
+            print(
+                f"[INFO] init_deform_cache: warming {total_frames} frames "
+                f"for N={N} Gaussians …"
+            )
+            with torch.no_grad():
+                for t_i, t_val in enumerate(time_inputs):
+                    t_emb = t_val.float().to("cuda").view(1, 1).expand(N, -1)
+                    d_xyz = teacher_fn(xyz_cuda, t_emb)   # (N, 3)
+                    self._deform_cache[:, t_i, :] = d_xyz.detach().cpu().to(dtype)
+            print("[INFO] init_deform_cache: warm-init complete.")
+
+    def update_deform_cache(
+        self,
+        t_idx: int,
+        d_xyz: torch.Tensor,
+        alpha: float = 0.98,
+    ) -> None:
+        """EMA-update the displacement cache for frame *t_idx*.
+
+        ``cache[:, t_idx] = alpha * cache[:, t_idx] + (1-alpha) * d_xyz``
+
+        The write is non-blocking (CUDA→CPU async copy where possible).
+        """
+        if self._deform_cache is None:
+            return
+        if t_idx < 0 or t_idx >= self._flow_total_frames:
+            return
+        # Detach and convert on GPU, then copy to CPU slice
+        new_val = d_xyz.detach().to(self._deform_cache.dtype).cpu()  # (N, 3)
+        self._deform_cache[:, t_idx, :].mul_(alpha).add_(new_val, alpha=1.0 - alpha)
+
+    def get_prev_xyz(self, t_idx: int) -> torch.Tensor:
+        """Return the previous-frame deformed positions ``xyz + d(t_idx - 1)``.
+
+        Falls back to canonical positions when the cache is unavailable or
+        ``t_idx == 0`` (no previous frame).
+
+        Returns a CUDA tensor of shape ``(N, 3)``.
+        """
+        xyz = self.get_xyz  # (N, 3) on CUDA
+        if self._deform_cache is None or t_idx <= 0:
+            return xyz
+        prev_t = t_idx - 1
+        if prev_t >= self._flow_total_frames:
+            return xyz
+        # Non-blocking copy to GPU
+        prev_disp = self._deform_cache[:, prev_t, :].to(
+            device=xyz.device, dtype=xyz.dtype, non_blocking=True
+        )  # (N, 3)
+        return (xyz + prev_disp).detach()
+
+
         """Accumulate per-Gaussian deformation for motion history.
         
         When tracking is started (from iter 10000), also tracks max/min displacement.

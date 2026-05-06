@@ -273,6 +273,10 @@ def run_clustering_at_iteration(
         student_configs=student_configs,
         fusion=dataset.hex_fusion,
         use_batched_students=dataset.use_batched_students,
+        query_mode=opt.query_mode,
+        routing_mode=opt.routing_mode,
+        soft_overlap_ratio=opt.soft_overlap_ratio,
+        soft_routing_k=opt.soft_routing_k,
     )
     
     # Load teacher weights — prefer external checkpoint if provided,
@@ -299,20 +303,57 @@ def run_clustering_at_iteration(
     clustered_deform.set_cluster_labels(gaussians._cluster_labels)
 
     # ── Displacement-aware per-cluster AABB ──────────────────────────────────
-    # Each student's AABB is built from the worst-case reachable positions of
-    # its cluster's Gaussians:
-    #   pos_max_k = (xyz + deform_max)[cluster_k].max(axis=0)
-    # Per-cluster AABB is based on canonical (static) Gaussian positions only.
-    # The deformation field is queried at canonical coordinates, so the AABB
-    # needs only to cover the static positions — no displacement expansion.
+    # canonical mode: AABB covers only static positions (no displacement expansion).
+    # flow mode: AABB also covers worst-case deformed positions when deform stats available.
     _pts = gaussians.get_xyz.detach()
+    _deform_max_for_aabb = (
+        gaussians._deform_max
+        if (opt.query_mode == "flow" and gaussians._deform_max.numel() > 0)
+        else None
+    )
+    _deform_min_for_aabb = (
+        gaussians._deform_min
+        if (opt.query_mode == "flow" and gaussians._deform_min.numel() > 0)
+        else None
+    )
     clustered_deform.set_per_cluster_aabb(
         _pts,
         cluster_labels=gaussians._cluster_labels,
         padding=dataset.cluster_aabb_padding,
+        deform_max=_deform_max_for_aabb,
+        deform_min=_deform_min_for_aabb,
     )
-    logger.info("[ITER %d] Per-cluster AABB set from canonical positions (padding=%.2f)",
-                iteration, dataset.cluster_aabb_padding)
+    logger.info(
+        "[ITER %d] Per-cluster AABB set (mode=%s, displacement_expansion=%s, padding=%.2f)",
+        iteration,
+        opt.query_mode,
+        _deform_max_for_aabb is not None,
+        dataset.cluster_aabb_padding,
+    )
+
+    # ── Flow mode: initialise displacement cache with teacher warm-up ────────
+    if opt.query_mode == "flow" and gaussians._deform_cache is None:
+        _total_frames = dataset.num_images
+        _cache_dtype = torch.float16 if opt.flow_cache_dtype == "float16" else torch.float32
+
+        def _teacher_fn(xyz_t, t_emb):
+            d_xyz_t, _, _ = clustered_deform.teacher.step(xyz_t, t_emb)
+            return d_xyz_t
+
+        _time_inputs = torch.linspace(0.0, 1.0, _total_frames, device="cuda")
+        gaussians.init_deform_cache(
+            total_frames=_total_frames,
+            dtype=_cache_dtype,
+            teacher_fn=_teacher_fn,
+            time_inputs=_time_inputs,
+        )
+        logger.info(
+            "[ITER %d] Flow-mode displacement cache allocated: N=%d, T=%d, dtype=%s",
+            iteration,
+            gaussians.get_xyz.shape[0],
+            _total_frames,
+            _cache_dtype,
+        )
 
     # ── Module D: log per-cluster AABB stats to TensorBoard ──────────────────
     clustered_deform.log_cluster_aabb_stats(tb_writer, iteration)
@@ -553,15 +594,31 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             if isinstance(deform, ClusteredDeformModel):
                 if deform.use_batched_students:
                     # Batched mode: autograd handles gradients — no ParallelBackwardHandle
+                    _prev_xyz = (
+                        gaussians.get_prev_xyz(
+                            t_idx=round(fid.item() * (dataset.num_images - 1))
+                        )
+                        if opt.query_mode == "flow"
+                        else None
+                    )
                     d_xyz, d_rotation, d_scaling = deform.step(
                         gaussians.get_xyz.detach(), time_input + ast_noise,
                         return_handoffs=False,
+                        prev_xyz=_prev_xyz,
                     )
                     _parallel_handle = None
                 else:
+                    _prev_xyz = (
+                        gaussians.get_prev_xyz(
+                            t_idx=round(fid.item() * (dataset.num_images - 1))
+                        )
+                        if opt.query_mode == "flow"
+                        else None
+                    )
                     d_xyz, d_rotation, d_scaling, _parallel_handle = deform.step(
                         gaussians.get_xyz.detach(), time_input + ast_noise,
                         return_handoffs=True,
+                        prev_xyz=_prev_xyz,
                     )
             else:
                 d_xyz, d_rotation, d_scaling = deform.step(gaussians.get_xyz.detach(), time_input + ast_noise)
@@ -570,6 +627,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             # ── Accumulate deformation for dynamic score computation ──
             # Record deformation from iteration 10000-15000 for dynamic score at iteration 15000
             _d_xyz_raw = d_xyz  # (N, 3), unmodified output from deform network
+
+            # ── Flow mode: EMA-update displacement cache ─────────────────────
+            # Non-blocking write: CPU EMA update at 0.98 decay.
+            if opt.query_mode == "flow" and gaussians._deform_cache is not None:
+                _t_idx = round(fid.item() * (dataset.num_images - 1))
+                gaussians.update_deform_cache(_t_idx, d_xyz, alpha=0.98)
             
             # ── Deformation distribution histogram (optional) ──
             if (dataset.log_deform_hist

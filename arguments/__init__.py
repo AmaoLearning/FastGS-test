@@ -245,6 +245,29 @@ class OptimizationParams(ParamGroup):
         # E.g. 0.5 halves the student regularization strength relative to the teacher phase.
         self.student_reg_scale = -1.0           # < 0 = disabled; 0 < v <= 1.0 to weaken
 
+        # ── Flow-mode routing (plan_uneven.md §10) ──────────────────────────
+        # "canonical" (default): deformation field queried at canonical (static)
+        #   positions; AABB covers only static positions; no extra cache needed.
+        # "flow": deformation field routed via previous-frame deformed positions;
+        #   AABB uses displacement-aware expansion; requires (N × T × 3) CPU cache.
+        self.query_mode = "canonical"           # "canonical" | "flow"
+        # CPU cache dtype for flow mode.  float16 halves memory (360 MB for
+        # flame_steak, vs 720 MB for float32) with negligible routing error.
+        self.flow_cache_dtype = "float16"       # "float16" | "float32"
+
+        # ── Soft-routing (plan_uneven.md §10.7) ─────────────────────────────
+        # "hard" (default): each Gaussian queries only its nearest cluster's field.
+        # "soft": Gaussians near cluster boundaries query two fields simultaneously
+        #   and blend outputs with IDW (inverse-distance) harmonic weights.
+        #   Falls back silently to hard routing when no Gaussian is in the overlap zone.
+        self.routing_mode = "hard"              # "hard" | "soft"
+        # Distance-ratio threshold for overlap detection (method B in §10.7.2).
+        # A Gaussian enters the soft zone when d_second / d_first < threshold.
+        # Typical range [1.1, 2.0]; 1.3 ≈ 8 % soft-zone Gaussians for K=8.
+        self.soft_overlap_ratio = 1.3
+        # Number of nearest fields to blend in soft mode (top-p). 2 is sufficient.
+        self.soft_routing_k = 2
+
         # Boundary regularization (Module C)
         # Penalises deformation magnitude for Gaussians near or beyond the edge of
         # their cluster AABB, preventing grid_sample border-clamping artefacts.
