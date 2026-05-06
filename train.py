@@ -27,6 +27,11 @@ from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from fused_ssim import fused_ssim as fast_ssim
+import json
+import matplotlib
+import matplotlib.pyplot as plt
+from torch.profiler import profile as _torch_profile, ProfilerActivity, schedule, tensorboard_trace_handler
+from utils.warm_init_utils import WarmInitConfig
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -109,7 +114,6 @@ def run_clustering_at_iteration(
     capacity_tier_config_path = dataset.capacity_tier_config_path
     capacity_tier_configs = None
     if os.path.exists(capacity_tier_config_path):
-        import json
         with open(capacity_tier_config_path, 'r') as f:
             capacity_tier_configs = json.load(f)
     
@@ -359,8 +363,7 @@ def run_clustering_at_iteration(
     clustered_deform.log_cluster_aabb_stats(tb_writer, iteration)
 
     # ── Warm initialization: teacher → student knowledge transfer ──
-    # Import warm init utilities
-    from utils.warm_init_utils import WarmInitConfig
+    # Initialize students with warm start from teacher
     warm_init_cfg = WarmInitConfig(
         enabled=dataset.warm_init_enabled,
         downsample_planes=dataset.warm_init_downsample_planes,
@@ -385,7 +388,6 @@ def run_clustering_at_iteration(
     # Handle FFT plotting logic
     if 'args' in globals() and args.plot_fft:
         print("[INFO] Setting up tracked points for FFT...")
-        import torch
         labels = gaussians._cluster_labels
         for c in range(n_clusters):
             indices = torch.nonzero(labels == c).squeeze(1)
@@ -528,7 +530,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
     for iteration in range(1, opt.iterations + 1):
         # Start profiler at the designated iteration
         if profile and iteration == profile_start and _profiler_ctx is None:
-            from torch.profiler import profile as _torch_profile, ProfilerActivity, schedule, tensorboard_trace_handler
             _profiler_ctx = _torch_profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
                 schedule=schedule(wait=2, warmup=3, active=profile_steps, repeat=1),
@@ -645,9 +646,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                     tb_writer.add_scalar('deform/mag_mean', _hist_mag.mean().item(), iteration)
                     tb_writer.add_scalar('deform/mag_median', _hist_mag.median().item(), iteration)
                     try:
-                        import matplotlib
                         matplotlib.use('Agg')
-                        import matplotlib.pyplot as plt
                         fig, ax = plt.subplots(1, 1, figsize=(8, 4))
                         ax.hist(_hist_mag.cpu().numpy(), bins=100, color='steelblue', edgecolor='none')
                         ax.set_xlabel('Deformation magnitude')
@@ -657,7 +656,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
                         fig.tight_layout()
                         tb_writer.add_figure('deform/magnitude_hist', fig, iteration)
                         plt.close(fig)
-                    except ImportError:
+                    except (ImportError, RuntimeError, NameError):
                         pass  # matplotlib not available, skip figure
 
             # Accumulate RAW deformation for dynamic score computation.

@@ -24,6 +24,10 @@ from gaussian_renderer import GaussianModel
 import imageio
 import numpy as np
 import time
+import re
+import glob
+import json
+from utils.cluster_utils import infer_student_configs_from_weights
 
 
 def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration, views, gaussians, pipeline, background, args, deform, use_dynamic_sep=False):
@@ -389,14 +393,13 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
         _use_clustered = False
         _use_batched = False
         if _deform_type == "4dgs":
-            import re as _re, glob as _glob
             _deform_dir = os.path.join(dataset.model_path, "deform")
             if os.path.isdir(_deform_dir):
                 for _dname in os.listdir(_deform_dir):
                     _iter_dir = os.path.join(_deform_dir, _dname)
                     if not os.path.isdir(_iter_dir):
                         continue
-                    if _glob.glob(os.path.join(_iter_dir, "deform_cluster_*.pth")):
+                    if glob.glob(os.path.join(_iter_dir, "deform_cluster_*.pth")):
                         _use_clustered = True
                         break
                     if os.path.isfile(os.path.join(_iter_dir, "batched_students.pth")):
@@ -410,22 +413,17 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
             
             if _use_clustered:
                 # Load ClusteredDeformModel
-                from scene import ClusteredDeformModel
-                from utils.cluster_utils import infer_student_configs_from_weights
-                
                 n_clusters = dataset.cluster_n_clusters
                 
                 # Load capacity tier configs
                 capacity_tier_config_path = dataset.capacity_tier_config_path
                 capacity_tier_configs = None
                 if os.path.exists(capacity_tier_config_path):
-                    import json
                     with open(capacity_tier_config_path, 'r') as f:
                         capacity_tier_configs = json.load(f)
                 
                 # Infer student configs from weight files
                 deform_dir = os.path.join(dataset.model_path, "deform")
-                import re
 
                 if _use_batched:
                     # Batched mode: infer uniform architecture from the saved state dict shapes.

@@ -8,10 +8,12 @@ from utils.hexplane_utils import (
     BatchedHexPlaneDeformNetwork,
 )
 import os
+import re
 from typing import Optional, Sequence, Tuple, Dict, List
 from utils.system_utils import searchForMaxIteration
 from utils.general_utils import get_expon_lr_func
 import logging
+from utils.warm_init_utils import warm_init_all_students
 
 logger = logging.getLogger(__name__)
 
@@ -1111,7 +1113,6 @@ class ClusteredDeformModel:
         deform_dir = os.path.join(model_path, "deform")
 
         if iteration == -1:
-            import re
             iter_pattern = re.compile(r"iteration_(\d+)")
             max_iter = -1
             if os.path.isdir(deform_dir):
@@ -1139,7 +1140,6 @@ class ClusteredDeformModel:
             return
 
         # Sequential path
-        import re
         dual_pattern = re.compile(
             r"deform_cluster_hex(?P<hex_tier>high|medium|low)_mlp(?P<mlp_tier>high|medium|low)_(?P<cluster_id>\d+)\.pth"
         )
@@ -1212,8 +1212,6 @@ class ClusteredDeformModel:
             # warm_init_all_students operates on HexPlaneDeformNetwork instances, so
             # we reconstruct temporary single-student networks, warm-init them, then
             # copy their plane parameters back into self.batched_net.
-            from utils.warm_init_utils import warm_init_all_students
-
             _cfg0 = self.student_configs[0]
             tmp_students: List[HexPlaneDeformNetwork] = []
             for _ in range(n):
@@ -1274,8 +1272,6 @@ class ClusteredDeformModel:
             return
 
         # Sequential path: delegate to warm_init_all_students as before
-        from utils.warm_init_utils import warm_init_all_students
-
         warm_init_all_students(
             teacher_network=self.teacher,
             student_networks=list(self.students),
