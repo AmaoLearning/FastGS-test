@@ -341,7 +341,7 @@ def run_clustering_at_iteration(
         _cache_dtype = torch.float16 if opt.flow_cache_dtype == "float16" else torch.float32
 
         def _teacher_fn(xyz_t, t_emb):
-            d_xyz_t, _, _ = clustered_deform.teacher.step(xyz_t, t_emb)
+            d_xyz_t, _, _ = clustered_deform.teacher(xyz_t, t_emb)
             return d_xyz_t
 
         _time_inputs = torch.linspace(0.0, 1.0, _total_frames, device="cuda")
