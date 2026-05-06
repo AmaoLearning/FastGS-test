@@ -1229,6 +1229,31 @@ class ClusteredDeformModel:
                 ).cuda()
                 tmp_students.append(s)
 
+            # ── CRITICAL: copy per-cluster AABB into tmp_students before warm-init ──
+            # set_per_cluster_aabb() writes cluster AABBs into batched_net.aabb_mins/maxs,
+            # not into per-student HexPlaneDeformNetwork objects.  The temporary students
+            # created above start with default aabb=[-1,1]³, so warm_init would remap
+            # all students identically (global scene features), defeating localization.
+            # We must propagate the correct AABB before calling warm_init_all_students.
+            if (
+                warm_init_cfg.use_aabb_remap
+                and hasattr(self.batched_net, "aabb_mins")
+                and hasattr(self.batched_net, "aabb_maxs")
+            ):
+                with torch.no_grad():
+                    for k, s in enumerate(tmp_students):
+                        s.aabb_min.copy_(self.batched_net.aabb_mins[k])
+                        s.aabb_max.copy_(self.batched_net.aabb_maxs[k])
+                logger.info(
+                    "[ClusteredDeform] Warm-init: propagated per-cluster AABB "
+                    "from batched_net into %d tmp_students for AABB-aware remap.", n
+                )
+            else:
+                logger.warning(
+                    "[ClusteredDeform] Warm-init: batched_net.aabb_mins not available "
+                    "— warm-init will use default global AABB (suboptimal)."
+                )
+
             warm_init_all_students(
                 teacher_network=self.teacher,
                 student_networks=tmp_students,
