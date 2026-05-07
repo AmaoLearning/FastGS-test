@@ -83,6 +83,48 @@ def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration, views,
     print(f"[{name}] Rendered {num_frames} frames in {total_time:.2f} seconds. Average FPS: {fps:.2f}")
 
 
+@torch.no_grad()
+def _build_render_flow_cache(
+    gaussians,
+    deform,
+    num_frames: int,
+    dtype: torch.dtype = torch.float16,
+) -> None:
+    """Pre-populate ``gaussians._deform_cache`` for flow-mode rendering.
+
+    Runs a canonical-routing forward pass (``prev_xyz=None``) over all T
+    discrete time steps using the **final trained students**.  The resulting
+    cache is then used as ``prev_xyz`` in the subsequent render pass so that
+    flow-mode cluster routing at render time matches the training behaviour.
+
+    Parameters
+    ----------
+    gaussians : GaussianModel
+    deform    : ClusteredDeformModel
+    num_frames: int  – total number of discrete time steps T
+    dtype     : storage dtype for the cache (float16 saves RAM)
+    """
+    time_inputs = torch.linspace(0.0, 1.0, num_frames, device="cuda")
+
+    def _student_canonical_fn(xyz: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
+        # canonical routing: prev_xyz=None → hard argmin on canonical positions
+        d_xyz, _, _ = deform.step(
+            xyz, time_emb, gaussians._cluster_labels, prev_xyz=None
+        )
+        return d_xyz
+
+    gaussians.init_deform_cache(
+        total_frames=num_frames,
+        dtype=dtype,
+        teacher_fn=_student_canonical_fn,
+        time_inputs=time_inputs,
+    )
+    print(
+        f"[INFO] _build_render_flow_cache: built {num_frames}-frame flow cache "
+        f"(N={gaussians.get_xyz.shape[0]}, dtype={dtype})."
+    )
+
+
 def render_set_with_clustered_deform(
     model_path,
     load2gpu_on_the_fly,
@@ -132,12 +174,25 @@ def render_set_with_clustered_deform(
         xyz = gaussians.get_xyz
         time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
 
+        # Resolve prev_xyz for flow-mode routing.
+        # When query_mode=="flow" and the displacement cache is available,
+        # we look up the previous frame's deformed positions so that cluster
+        # routing at render time matches the training-time behaviour.
+        if deform.query_mode == "flow" and gaussians._deform_cache is not None:
+            _T = gaussians._flow_total_frames
+            t_idx = int(round(fid.item() * (_T - 1))) if _T > 1 else 0
+            prev_xyz = gaussians.get_prev_xyz(t_idx)
+        else:
+            prev_xyz = None
+
         # ---- timing starts (deform + render only, excludes I/O) ----
         torch.cuda.synchronize()
         t_start = time.time()
 
         # Student models forward (clustered)
-        d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input, gaussians._cluster_labels)
+        d_xyz, d_rotation, d_scaling = deform.step(
+            xyz.detach(), time_input, gaussians._cluster_labels, prev_xyz=prev_xyz
+        )
         results = render_fastgs(view, gaussians, pipeline, background, args.mult, d_xyz, d_rotation, d_scaling, is_6dof)
 
         torch.cuda.synchronize()
@@ -521,6 +576,10 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
                     is_6dof=dataset.is_6dof,
                     student_configs=student_configs,
                     use_batched_students=_use_batched,
+                    query_mode=getattr(args, 'query_mode', 'canonical'),
+                    routing_mode=getattr(args, 'routing_mode', 'hard'),
+                    soft_overlap_ratio=getattr(args, 'soft_overlap_ratio', 1.3),
+                    soft_routing_k=getattr(args, 'soft_routing_k', 2),
                 )
                 deform.load_weights(dataset.model_path, iteration if iteration >= 0 else -1)
                 print(f"[INFO] Loaded clustered deform model with {n_clusters} student models (batched={_use_batched})")
@@ -531,6 +590,37 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
                     print(f"[INFO] Loaded cluster labels: {gaussians._cluster_labels.shape[0]} Gaussians")
                 else:
                     print("[WARNING] No cluster labels found in loaded point cloud!")
+
+                # ---- flow-mode setup (cluster_centers + displacement cache) ----
+                if (
+                    isinstance(deform, ClusteredDeformModel)
+                    and deform.query_mode == "flow"
+                    and hasattr(gaussians, '_cluster_labels')
+                    and gaussians._cluster_labels is not None
+                ):
+                    # cluster_centers are required for flow routing; they are NOT
+                    # saved in the checkpoint, so we recompute them from canonical positions.
+                    # At render time there are no deform stats → canonical AABB only.
+                    _aabb_pad = getattr(dataset, 'cluster_aabb_padding', 0.15)
+                    deform.set_per_cluster_aabb(
+                        gaussians.get_xyz.detach(),
+                        cluster_labels=gaussians._cluster_labels,
+                        padding=_aabb_pad,
+                    )
+                    print(f"[INFO] Flow mode: cluster_centers set for {deform.n_clusters} clusters.")
+
+                    # Build the per-frame displacement cache using trained students
+                    # in canonical mode, so render pass can look up prev_xyz.
+                    _flow_dtype = torch.float16
+                    if getattr(args, 'flow_cache_dtype', 'float16') == 'float32':
+                        _flow_dtype = torch.float32
+                    _n_frames = getattr(dataset, 'num_images', 300)
+                    _build_render_flow_cache(
+                        gaussians, deform,
+                        num_frames=_n_frames,
+                        dtype=_flow_dtype,
+                    )
+                # ---- end flow-mode setup ----
             else:
                 # Load standard DeformModel_4DGS
                 deform = DeformModel_4DGS(
