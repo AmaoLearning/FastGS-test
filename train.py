@@ -630,10 +630,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, quiet: b
             _d_xyz_raw = d_xyz  # (N, 3), unmodified output from deform network
 
             # ── Flow mode: EMA-update displacement cache ─────────────────────
-            # Non-blocking write: CPU EMA update at 0.98 decay.
+            # Non-blocking write: CPU EMA update with configurable decay.
             if opt.query_mode == "flow" and gaussians._deform_cache is not None:
                 _t_idx = round(fid.item() * (dataset.num_images - 1))
-                gaussians.update_deform_cache(_t_idx, d_xyz, alpha=0.98)
+                gaussians.update_deform_cache(_t_idx, d_xyz, alpha=opt.flow_cache_ema_alpha)
             
             # ── Deformation distribution histogram (optional) ──
             if (dataset.log_deform_hist

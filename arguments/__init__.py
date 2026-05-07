@@ -254,6 +254,12 @@ class OptimizationParams(ParamGroup):
         # CPU cache dtype for flow mode.  float16 halves memory (360 MB for
         # flame_steak, vs 720 MB for float32) with negligible routing error.
         self.flow_cache_dtype = "float16"       # "float16" | "float32"
+        # EMA decay for flow-mode displacement cache updates.
+        # cache[t] = alpha * cache[t] + (1-alpha) * d_xyz_current
+        # Higher alpha → slower adaptation (more stable routing, less responsive to
+        # student-field changes); lower alpha → faster adaptation (more noisy routing).
+        # Recommended range: [0.95, 0.999].  0.98 ≈ 50-step half-life.
+        self.flow_cache_ema_alpha = 0.98
 
         # ── Soft-routing (plan_uneven.md §10.7) ─────────────────────────────
         # "hard" (default): each Gaussian queries only its nearest cluster's field.
