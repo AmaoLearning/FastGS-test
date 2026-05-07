@@ -708,9 +708,19 @@ class ClusteredDeformModel:
         # `soft_overlap_ratio * d_first` we query that second cluster as well
         # and blend d_xyz with harmonic (IDW) weights.
         # d_rotation and d_scaling keep the hard-route (primary) result.
+        #
+        # CRITICAL: use the same coordinate space as the hard routing above.
+        # In flow mode the primary cluster was chosen via prev_xyz; the secondary
+        # cluster for soft blending must also use prev_xyz, otherwise the two
+        # passes operate in incompatible spaces and predict contradictory motions.
         if self.routing_mode == "soft" and self.cluster_centers is not None:
             centers_soft = self.cluster_centers.to(device)           # (K, 3)
-            all_dists = torch.cdist(xyz.detach(), centers_soft)      # (N, K)
+            soft_route_xyz = (
+                prev_xyz.detach().to(device)
+                if (self.query_mode == "flow" and prev_xyz is not None)
+                else xyz.detach()
+            )                                                         # (N, 3)
+            all_dists = torch.cdist(soft_route_xyz, centers_soft)    # (N, K)
             p = min(self.soft_routing_k, self.n_clusters)
             topk_dists, topk_ids = all_dists.topk(
                 p, dim=-1, largest=False
@@ -889,9 +899,17 @@ class ClusteredDeformModel:
                 d_scaling[mask] = d_scaling_c
 
             # ── Soft routing post-processing ─────────────────────────────────
+            # Use the same coordinate space as hard routing: prev_xyz in flow
+            # mode, canonical xyz otherwise.  Mixing spaces causes the primary
+            # and secondary fields to operate on incompatible positions.
             if self.routing_mode == "soft" and self.cluster_centers is not None:
                 centers_soft = self.cluster_centers.to(device)           # (K, 3)
-                all_dists = torch.cdist(xyz.detach(), centers_soft)      # (N, K)
+                soft_route_xyz = (
+                    prev_xyz.detach().to(device)
+                    if (self.query_mode == "flow" and prev_xyz is not None)
+                    else xyz.detach()
+                )                                                         # (N, 3)
+                all_dists = torch.cdist(soft_route_xyz, centers_soft)    # (N, K)
                 p = min(self.soft_routing_k, self.n_clusters)
                 topk_dists, topk_ids = all_dists.topk(
                     p, dim=-1, largest=False
