@@ -28,9 +28,10 @@ import re
 import glob
 import json
 from utils.cluster_utils import infer_student_configs_from_weights
+from utils.grid_util_tracker import GridUtilizationTracker
 
 
-def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration, views, gaussians, pipeline, background, args, deform, use_dynamic_sep=False):
+def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration, views, gaussians, pipeline, background, args, deform, use_dynamic_sep=False, analyze_grid_util=False):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
     depth_path = os.path.join(model_path, name, "ours_{}".format(iteration), "depth")
@@ -41,41 +42,62 @@ def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration, views,
 
     total_time = 0.0
 
-    for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
-        if load2gpu_on_the_fly:
-            view.load2device()
+    _track_teacher = getattr(args, 'grid_util_track_teacher', False)
+    _tracker_ctx = (
+        GridUtilizationTracker(deform, track_teacher=_track_teacher)
+        if analyze_grid_util else None
+    )
 
-        # LazyCamera: image starts as None; load from disk on demand
-        if view.original_image is None and hasattr(view, 'load_image_to_gpu'):
-            view.load_image_to_gpu('cuda')
+    def _render_loop():
+        nonlocal total_time
+        for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
+            if load2gpu_on_the_fly:
+                view.load2device()
 
-        fid = view.fid
-        xyz = gaussians.get_xyz
-        time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
+            # LazyCamera: image starts as None; load from disk on demand
+            if view.original_image is None and hasattr(view, 'load_image_to_gpu'):
+                view.load_image_to_gpu('cuda')
 
-        # ---- timing starts (deform + render only, excludes I/O) ----
-        torch.cuda.synchronize()
-        t_start = time.time()
+            fid = view.fid
+            xyz = gaussians.get_xyz
+            time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
 
-        d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input)
-        results = render_fastgs(view, gaussians, pipeline, background, args.mult, d_xyz, d_rotation, d_scaling, is_6dof)
+            # ---- timing starts (deform + render only, excludes I/O) ----
+            torch.cuda.synchronize()
+            t_start = time.time()
 
-        torch.cuda.synchronize()
-        total_time += time.time() - t_start
-        # ---- timing ends ----
+            d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input)
+            results = render_fastgs(view, gaussians, pipeline, background, args.mult, d_xyz, d_rotation, d_scaling, is_6dof)
 
-        rendering = results["render"]
-        depth = results["depth"]
-        depth = depth / (depth.max() + 1e-5)
+            torch.cuda.synchronize()
+            total_time += time.time() - t_start
+            # ---- timing ends ----
 
-        gt = view.original_image[0:3, :, :]
-        torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
-        torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
-        torchvision.utils.save_image(depth, os.path.join(depth_path, '{0:05d}'.format(idx) + ".png"))
+            rendering = results["render"]
+            depth = results["depth"]
+            depth = depth / (depth.max() + 1e-5)
 
-        # Free image VRAM — thousands of cameras cannot all stay resident
-        if hasattr(view, 'unload_image'):
-            view.unload_image()
+            gt = view.original_image[0:3, :, :]
+            torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
+            torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
+            torchvision.utils.save_image(depth, os.path.join(depth_path, '{0:05d}'.format(idx) + ".png"))
+
+            # Free image VRAM — thousands of cameras cannot all stay resident
+            if hasattr(view, 'unload_image'):
+                view.unload_image()
+
+    if _tracker_ctx is not None:
+        with _tracker_ctx as tracker:
+            _render_loop()
+        cluster_dir = os.path.join(model_path, "cluster")
+        hist_path = os.path.join(
+            cluster_dir,
+            f"grid_utilization_{name}_iter{iteration}.png",
+        )
+        tracker.print_summary()
+        tracker.plot_and_save(hist_path, iteration)
+    else:
+        _render_loop()
 
     num_frames = len(views)
     avg_time = total_time / num_frames if num_frames > 0 else 0
@@ -138,6 +160,7 @@ def render_set_with_clustered_deform(
     args,
     deform,
     use_dynamic_sep=False,
+    analyze_grid_util=False,
 ):
     """Render with clustered deform model (student models only).
     
@@ -148,10 +171,10 @@ def render_set_with_clustered_deform(
         render_set(
             model_path, load2gpu_on_the_fly, is_6dof, name, iteration,
             views, gaussians, pipeline, background, args, deform,
-            use_dynamic_sep
+            use_dynamic_sep, analyze_grid_util=analyze_grid_util
         )
         return
-    
+
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
     depth_path = os.path.join(model_path, name, "ours_{}".format(iteration), "depth")
@@ -162,55 +185,76 @@ def render_set_with_clustered_deform(
 
     total_time = 0.0
 
-    for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
-        if load2gpu_on_the_fly:
-            view.load2device()
+    _track_teacher = getattr(args, 'grid_util_track_teacher', False)
+    _tracker_ctx = (
+        GridUtilizationTracker(deform, track_teacher=_track_teacher)
+        if analyze_grid_util else None
+    )
 
-        # LazyCamera: image starts as None; load from disk on demand
-        if view.original_image is None and hasattr(view, 'load_image_to_gpu'):
-            view.load_image_to_gpu('cuda')
+    def _render_loop_clustered():
+        nonlocal total_time
+        for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
+            if load2gpu_on_the_fly:
+                view.load2device()
 
-        fid = view.fid
-        xyz = gaussians.get_xyz
-        time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
+            # LazyCamera: image starts as None; load from disk on demand
+            if view.original_image is None and hasattr(view, 'load_image_to_gpu'):
+                view.load_image_to_gpu('cuda')
 
-        # Resolve prev_xyz for flow-mode routing.
-        # When query_mode=="flow" and the displacement cache is available,
-        # we look up the previous frame's deformed positions so that cluster
-        # routing at render time matches the training-time behaviour.
-        if deform.query_mode == "flow" and gaussians._deform_cache is not None:
-            _T = gaussians._flow_total_frames
-            t_idx = int(round(fid.item() * (_T - 1))) if _T > 1 else 0
-            prev_xyz = gaussians.get_prev_xyz(t_idx)
-        else:
-            prev_xyz = None
+            fid = view.fid
+            xyz = gaussians.get_xyz
+            time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
 
-        # ---- timing starts (deform + render only, excludes I/O) ----
-        torch.cuda.synchronize()
-        t_start = time.time()
+            # Resolve prev_xyz for flow-mode routing.
+            # When query_mode=="flow" and the displacement cache is available,
+            # we look up the previous frame's deformed positions so that cluster
+            # routing at render time matches the training-time behaviour.
+            if deform.query_mode == "flow" and gaussians._deform_cache is not None:
+                _T = gaussians._flow_total_frames
+                t_idx = int(round(fid.item() * (_T - 1))) if _T > 1 else 0
+                prev_xyz = gaussians.get_prev_xyz(t_idx)
+            else:
+                prev_xyz = None
 
-        # Student models forward (clustered)
-        d_xyz, d_rotation, d_scaling = deform.step(
-            xyz.detach(), time_input, gaussians._cluster_labels, prev_xyz=prev_xyz
+            # ---- timing starts (deform + render only, excludes I/O) ----
+            torch.cuda.synchronize()
+            t_start = time.time()
+
+            # Student models forward (clustered)
+            d_xyz, d_rotation, d_scaling = deform.step(
+                xyz.detach(), time_input, gaussians._cluster_labels, prev_xyz=prev_xyz
+            )
+            results = render_fastgs(view, gaussians, pipeline, background, args.mult, d_xyz, d_rotation, d_scaling, is_6dof)
+
+            torch.cuda.synchronize()
+            total_time += time.time() - t_start
+            # ---- timing ends ----
+
+            rendering = results["render"]
+            depth = results["depth"]
+            depth = depth / (depth.max() + 1e-5)
+
+            gt = view.original_image[0:3, :, :]
+            torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
+            torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
+            torchvision.utils.save_image(depth, os.path.join(depth_path, '{0:05d}'.format(idx) + ".png"))
+
+            # Free image VRAM — thousands of cameras cannot all stay resident
+            if hasattr(view, 'unload_image'):
+                view.unload_image()
+
+    if _tracker_ctx is not None:
+        with _tracker_ctx as tracker:
+            _render_loop_clustered()
+        cluster_dir = os.path.join(model_path, "cluster")
+        hist_path = os.path.join(
+            cluster_dir,
+            f"grid_utilization_{name}_iter{iteration}.png",
         )
-        results = render_fastgs(view, gaussians, pipeline, background, args.mult, d_xyz, d_rotation, d_scaling, is_6dof)
-
-        torch.cuda.synchronize()
-        total_time += time.time() - t_start
-        # ---- timing ends ----
-
-        rendering = results["render"]
-        depth = results["depth"]
-        depth = depth / (depth.max() + 1e-5)
-
-        gt = view.original_image[0:3, :, :]
-        torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
-        torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
-        torchvision.utils.save_image(depth, os.path.join(depth_path, '{0:05d}'.format(idx) + ".png"))
-
-        # Free image VRAM — thousands of cameras cannot all stay resident
-        if hasattr(view, 'unload_image'):
-            view.unload_image()
+        tracker.print_summary()
+        tracker.plot_and_save(hist_path, iteration)
+    else:
+        _render_loop_clustered()
 
     num_frames = len(views)
     avg_time = total_time / num_frames if num_frames > 0 else 0
@@ -660,15 +704,19 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
         else:
             render_func = interpolate_all
 
+        _analyze = getattr(args, 'analyze_grid_util', False)
+
         if not skip_train:
             render_func(dataset.model_path, dataset.load2gpu_on_the_fly, dataset.is_6dof, "train", scene.loaded_iter,
                         scene.getTrainCameras(), gaussians, pipeline,
-                        background, args, deform, use_dynamic_sep=_use_dynamic_sep)
+                        background, args, deform, use_dynamic_sep=_use_dynamic_sep,
+                        analyze_grid_util=_analyze)
 
         if not skip_test:
             render_func(dataset.model_path, dataset.load2gpu_on_the_fly, dataset.is_6dof, "test", scene.loaded_iter,
                         scene.getTestCameras(), gaussians, pipeline,
-                        background, args, deform, use_dynamic_sep=_use_dynamic_sep)
+                        background, args, deform, use_dynamic_sep=_use_dynamic_sep,
+                        analyze_grid_util=_analyze)
 
 
 if __name__ == "__main__":
@@ -682,6 +730,18 @@ if __name__ == "__main__":
     parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--mode", default='render', choices=['render', 'time', 'view', 'all', 'pose', 'original'])
+    parser.add_argument(
+        "--analyze_grid_util",
+        action="store_true",
+        default=False,
+        help="统计测试集渲染中 HexPlane 网格点利用率并输出直方图到 cluster/ 目录",
+    )
+    parser.add_argument(
+        "--grid_util_track_teacher",
+        action="store_true",
+        default=False,
+        help="同时统计教师场的网格利用率（--analyze_grid_util 生效时才有效）",
+    )
     args = get_combined_args(parser)
 
     # Backfill defaults if missing from cfg_args
