@@ -112,10 +112,10 @@ class GridUtilizationTracker:
 
             # batched 学生场（use_batched_students=True）
             if deform.batched_net is not None:
-                # BatchedHexPlaneDeformNetwork 内部的 hexplane 是 BatchedHexPlaneField
-                # 退化为单一 "batched_students" 实体统计
-                h = deform.batched_net.hexplane.register_forward_pre_hook(
-                    self._make_batched_hexplane_hook(deform.n_clusters)
+                # 在 BatchedHexPlaneDeformNetwork 上挂 hook，才能拿到真实的
+                # cluster_counts，避免把 padding 行误统计进去。
+                h = deform.batched_net.register_forward_pre_hook(
+                    self._make_batched_net_hook()
                 )
                 self._hooks.append(h)
 
@@ -162,27 +162,44 @@ class GridUtilizationTracker:
 
         return hook
 
-    def _make_batched_hexplane_hook(self, n_clusters: int):
-        """对 BatchedHexPlaneField 注册 hook，退化为统一追踪（不分 student）。
+    def _make_batched_net_hook(self):
+        """对 BatchedHexPlaneDeformNetwork 注册 hook，按真实 cluster_counts 追踪。
 
-        BatchedHexPlaneField.forward 接收的 args[0] 形状为 (N, 4)（单个查询批次），
-        整体标记为 "batched_students" 实体。
+        hook 输入为 ``(cluster_xyz, cluster_t, cluster_counts)``，其中：
+        - cluster_xyz: List[Tensor(N_k, 3)]
+        - cluster_t: List[Tensor(N_k, 1)]
+        - cluster_counts: List[int]
+
+        这里复现 batched forward 的 AABB 归一化逻辑，但只处理真实样本，
+        不处理 padding，因此统计不会被虚假的 padded rows 污染。
         """
 
         def hook(module: nn.Module, args: tuple) -> None:
-            if not args:
+            if len(args) < 3:
                 return
-            xyzt = args[0].detach()
-            N = xyzt.shape[0]
-            if N == 0:
+
+            cluster_xyz, cluster_t, cluster_counts = args[:3]
+            if not cluster_counts or max(cluster_counts) <= 0:
                 return
 
             entity_key = "batched_students"
+            device = module.aabb_mins.device
             if entity_key not in self._used_flat:
-                self._init_entity_bitmaps(entity_key, module, xyzt.device)
+                self._init_entity_bitmaps(entity_key, module.hexplane, device)
 
             with torch.no_grad():
-                self._mark_visited(entity_key, module, xyzt)
+                for k, count in enumerate(cluster_counts):
+                    if count <= 0:
+                        continue
+
+                    xyz_k = cluster_xyz[k].detach()
+                    t_k = cluster_t[k].detach()
+                    extent_k = (module.aabb_maxs[k] - module.aabb_mins[k]).clamp(min=1e-8)
+                    xyz_norm = 2.0 * (xyz_k - module.aabb_mins[k]) / extent_k - 1.0
+                    xyz_norm = ((xyz_norm + 1.0) % 2.0) - 1.0
+                    t_norm = 2.0 * t_k - 1.0
+                    xyzt_k = torch.cat([xyz_norm, t_norm], dim=-1)
+                    self._mark_visited(entity_key, module.hexplane, xyzt_k)
 
         return hook
 
@@ -229,10 +246,6 @@ class GridUtilizationTracker:
         num_levels = len(hexplane_module.planes)
         N = xyzt.shape[0]
 
-        # 预先在 GPU 上分配全 1 bool 张量（4N 个，用于 index_put_）
-        # 懒惰分配：在循环外分配最大尺寸，避免重复 alloc
-        ones_4n = torch.ones(4 * N, dtype=torch.bool, device=xyzt.device)
-
         for lvl in range(num_levels):
             for pidx, (di, dj) in enumerate(_PLANE_PAIRS):
                 H, W = self._plane_shapes[entity_key][lvl][pidx]
@@ -259,10 +272,8 @@ class GridUtilizationTracker:
                     row1 * W + col1,
                 ])  # (4N,)
 
-                # OR 标记到位图（index_put_ 比 scatter_ 更高效）
-                self._used_flat[entity_key][lvl][pidx].index_put_(
-                    (flat,), ones_4n, accumulate=False
-                )
+                # 布尔位图直接按索引置 True，避免 value/index 形状广播问题。
+                self._used_flat[entity_key][lvl][pidx][flat] = True
 
     # ── 统计汇总 ─────────────────────────────────────────────────────
 
